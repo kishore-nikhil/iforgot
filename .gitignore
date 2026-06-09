@@ -1,0 +1,8 @@
+/target
+*.sqlite3
+*.sqlite3-journal
+*.sqlite3-wal
+*.sqlite3-shm
+forgetfuldb.toml
+!forgetfuldb.example.toml
+.DS_Store

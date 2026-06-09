@@ -1,0 +1,39 @@
+# ForgetfulDB configuration. Copy to forgetfuldb.toml and edit.
+# Every field is optional; missing fields use these defaults.
+
+sqlite_path = "forgetfuldb.sqlite3"
+
+# v1 ships "hashed_bow" (deterministic, model-free).
+# Roadmap: fastembed, candle, llama_cpp, coreml.
+embedding_backend = "hashed_bow"
+embedding_dim = 256
+
+# Exponential decay constants (per day). Higher = forgets faster.
+decay_lambda_raw = 0.35        # raw events: half-life ~2 days
+decay_lambda_episodic = 0.08   # episodes:   half-life ~9 days
+decay_lambda_semantic = 0.01   # facts:      half-life ~70 days
+decay_lambda_procedural = 0.01
+decay_lambda_preference = 0.02
+
+# Raw events older than this (days) become archive memories.
+archive_after_days = 14.0
+# Archived, unpinned memories older than this (days) are deleted.
+delete_after_days = 90.0
+
+# Never talk to the network. The HTTP server binds 127.0.0.1 when true.
+local_only = true
+
+[retrieval_weights]
+semantic = 0.45
+importance = 0.20
+recurrence = 0.15
+recency = 0.10
+pinned_boost = 0.10
+staleness_penalty = 0.20
+
+[consolidation_thresholds]
+duplicate_similarity = 0.92      # cosine at/above which memories merge
+cluster_min_size = 3             # topic cluster size that earns a summary
+promote_min_access_count = 3     # accesses before episodic -> semantic
+archive_max_decay = 0.05         # decay score below which raw events archive
+prune_sample_size = 5            # reservoir sample kept when pruning

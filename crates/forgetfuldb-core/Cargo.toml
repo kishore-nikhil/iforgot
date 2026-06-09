@@ -1,0 +1,13 @@
+[package]
+name = "forgetfuldb-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Core memory schema, scoring, decay and ingest heuristics for ForgetfulDB"
+
+[dependencies]
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+sha2 = { workspace = true }

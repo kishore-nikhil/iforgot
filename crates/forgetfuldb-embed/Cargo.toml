@@ -1,0 +1,10 @@
+[package]
+name = "forgetfuldb-embed"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Pluggable embedding providers for ForgetfulDB (deterministic hashed bag-of-words in v1)"
+
+[dependencies]
+anyhow = { workspace = true }
+forgetfuldb-core = { workspace = true }

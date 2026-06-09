@@ -1,0 +1,41 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/forgetfuldb-core",
+    "crates/forgetfuldb-prob",
+    "crates/forgetfuldb-embed",
+    "crates/forgetfuldb-store",
+    "crates/forgetfuldb-retrieve",
+    "crates/forgetfuldb-consolidate",
+    "crates/forgetfuldb-cli",
+    "crates/forgetfuldb-server",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/kishore-nikhil/iforgot"
+
+[workspace.dependencies]
+anyhow = "1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+sha2 = "0.10"
+rusqlite = { version = "0.32", features = ["bundled"] }
+clap = { version = "4", features = ["derive"] }
+axum = "0.7"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+
+forgetfuldb-core = { path = "crates/forgetfuldb-core" }
+forgetfuldb-prob = { path = "crates/forgetfuldb-prob" }
+forgetfuldb-embed = { path = "crates/forgetfuldb-embed" }
+forgetfuldb-store = { path = "crates/forgetfuldb-store" }
+forgetfuldb-retrieve = { path = "crates/forgetfuldb-retrieve" }
+forgetfuldb-consolidate = { path = "crates/forgetfuldb-consolidate" }
+forgetfuldb-server = { path = "crates/forgetfuldb-server" }
+
+[profile.release]
+lto = "thin"

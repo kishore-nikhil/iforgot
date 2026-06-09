@@ -1,0 +1,8 @@
+[package]
+name = "forgetfuldb-prob"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Probabilistic data structures (Bloom, Count-Min Sketch, HyperLogLog, reservoir sampling) for ForgetfulDB"
+
+[dependencies]

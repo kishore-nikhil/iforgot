@@ -1,0 +1,19 @@
+[package]
+name = "forgetfuldb-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Optional local HTTP API (axum) for ForgetfulDB"
+
+[dependencies]
+anyhow = { workspace = true }
+axum = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+forgetfuldb-core = { workspace = true }
+forgetfuldb-embed = { workspace = true }
+forgetfuldb-prob = { workspace = true }
+forgetfuldb-store = { workspace = true }
+forgetfuldb-retrieve = { workspace = true }
+forgetfuldb-consolidate = { workspace = true }
