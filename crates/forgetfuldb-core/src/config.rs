@@ -4,12 +4,18 @@
 use crate::decay::DecayLambdas;
 use crate::scoring::RetrievalWeights;
 use serde::{Deserialize, Serialize};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
-    /// Path to the SQLite database file.
+    /// Friendly name for this memory database, shown in banners and
+    /// stats so it's always clear which store a session is talking to
+    /// (e.g. "main" for the global store, a project name for local ones).
+    pub name: String,
+    /// Path to the SQLite database file. Relative paths are resolved
+    /// against the directory containing the config file, never the
+    /// process working directory.
     pub sqlite_path: String,
     /// Embedding backend name. v1 ships `hashed_bow` (deterministic,
     /// model-free). Future: `fastembed`, `candle`, `llama_cpp`, `coreml`.
@@ -110,6 +116,7 @@ impl Default for Config {
     fn default() -> Self {
         let lambdas = DecayLambdas::default();
         Config {
+            name: "main".to_string(),
             sqlite_path: "forgetfuldb.sqlite3".to_string(),
             embedding_backend: "hashed_bow".to_string(),
             embedding_dim: 256,
@@ -161,9 +168,180 @@ impl Config {
     }
 }
 
+pub const CONFIG_FILE: &str = "forgetfuldb.toml";
+pub const DB_FILE: &str = "forgetfuldb.sqlite3";
+
+/// Where a resolved config came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigScope {
+    /// `--config <path>` on the command line.
+    Explicit,
+    /// `./forgetfuldb.toml` in the working directory — a deliberate
+    /// project-local memory store.
+    Local,
+    /// `~/.forgetfuldb/` — the shared store every session defaults to,
+    /// so memories stay intact no matter where you launch from.
+    Global,
+}
+
+impl ConfigScope {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ConfigScope::Explicit => "explicit",
+            ConfigScope::Local => "local",
+            ConfigScope::Global => "global",
+        }
+    }
+}
+
+/// A config plus where it lives and how it was found.
+pub struct ResolvedConfig {
+    pub config: Config,
+    pub path: PathBuf,
+    pub scope: ConfigScope,
+    /// True when the global store is in use but a stray
+    /// `forgetfuldb.sqlite3` sits in the working directory — likely
+    /// orphaned memories from an older cwd-relative session worth
+    /// telling the user about.
+    pub stray_local_db: bool,
+}
+
+pub fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+}
+
+/// Resolve the active config: `--config` flag, else `./forgetfuldb.toml`
+/// if present, else the global `~/.forgetfuldb/` store (created on first
+/// use). See [`resolve_from`] for the testable core.
+pub fn resolve(explicit: Option<&Path>) -> anyhow::Result<ResolvedConfig> {
+    let cwd = std::env::current_dir()?;
+    let home = home_dir().ok_or_else(|| anyhow::anyhow!("cannot determine home directory (HOME unset)"))?;
+    resolve_from(explicit, &cwd, &home)
+}
+
+pub fn resolve_from(explicit: Option<&Path>, cwd: &Path, home: &Path) -> anyhow::Result<ResolvedConfig> {
+    if let Some(path) = explicit {
+        let mut config = Config::load_or_default(path)?;
+        anchor_sqlite_path(&mut config, path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(cwd));
+        return Ok(ResolvedConfig {
+            config,
+            path: path.to_path_buf(),
+            scope: ConfigScope::Explicit,
+            stray_local_db: false,
+        });
+    }
+
+    let local = cwd.join(CONFIG_FILE);
+    if local.exists() {
+        let mut config = Config::load(&local)?;
+        anchor_sqlite_path(&mut config, cwd);
+        return Ok(ResolvedConfig { config, path: local, scope: ConfigScope::Local, stray_local_db: false });
+    }
+
+    let dir = home.join(".forgetfuldb");
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join(CONFIG_FILE);
+    let mut config = if path.exists() {
+        Config::load(&path)?
+    } else {
+        // First use: write the global config with an ABSOLUTE database
+        // path, so the store never depends on where a session starts.
+        let c = Config {
+            name: "main".to_string(),
+            sqlite_path: dir.join(DB_FILE).display().to_string(),
+            ..Config::default()
+        };
+        c.save(&path)?;
+        c
+    };
+    anchor_sqlite_path(&mut config, &dir);
+    Ok(ResolvedConfig {
+        config,
+        path,
+        scope: ConfigScope::Global,
+        stray_local_db: cwd.join(DB_FILE).exists(),
+    })
+}
+
+/// Make a relative `sqlite_path` absolute against the config's own
+/// directory, so the same config means the same database from any cwd.
+fn anchor_sqlite_path(config: &mut Config, base: &Path) {
+    let p = Path::new(&config.sqlite_path);
+    if p.is_relative() {
+        config.sqlite_path = base.join(p).display().to_string();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "forgetfuldb-cfg-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn global_store_is_created_with_absolute_db_path_and_name() {
+        let cwd = temp_dir("cwd");
+        let home = temp_dir("home");
+        let resolved = resolve_from(None, &cwd, &home).unwrap();
+        assert_eq!(resolved.scope, ConfigScope::Global);
+        assert_eq!(resolved.config.name, "main");
+        assert!(Path::new(&resolved.config.sqlite_path).is_absolute());
+        assert!(resolved.config.sqlite_path.starts_with(home.join(".forgetfuldb").to_str().unwrap()));
+        assert!(resolved.path.exists(), "global config persisted");
+        assert!(!resolved.stray_local_db);
+
+        // Second resolution loads the same store rather than recreating.
+        let again = resolve_from(None, &cwd, &home).unwrap();
+        assert_eq!(again.config.sqlite_path, resolved.config.sqlite_path);
+    }
+
+    #[test]
+    fn local_config_wins_over_global_and_anchors_relative_db() {
+        let cwd = temp_dir("cwd-local");
+        let home = temp_dir("home-local");
+        let local = Config { name: "myproject".to_string(), ..Config::default() };
+        local.save(&cwd.join(CONFIG_FILE)).unwrap();
+
+        let resolved = resolve_from(None, &cwd, &home).unwrap();
+        assert_eq!(resolved.scope, ConfigScope::Local);
+        assert_eq!(resolved.config.name, "myproject");
+        // Relative sqlite_path anchored to the config's directory.
+        assert_eq!(resolved.config.sqlite_path, cwd.join(DB_FILE).display().to_string());
+    }
+
+    #[test]
+    fn stray_local_database_is_flagged() {
+        let cwd = temp_dir("cwd-stray");
+        let home = temp_dir("home-stray");
+        std::fs::write(cwd.join(DB_FILE), b"old memories").unwrap();
+        let resolved = resolve_from(None, &cwd, &home).unwrap();
+        assert_eq!(resolved.scope, ConfigScope::Global);
+        assert!(resolved.stray_local_db);
+    }
+
+    #[test]
+    fn explicit_config_path_wins() {
+        let cwd = temp_dir("cwd-exp");
+        let home = temp_dir("home-exp");
+        let path = cwd.join("custom.toml");
+        let cfg = Config { name: "custom".to_string(), ..Config::default() };
+        cfg.save(&path).unwrap();
+
+        let resolved = resolve_from(Some(&path), &cwd, &home).unwrap();
+        assert_eq!(resolved.scope, ConfigScope::Explicit);
+        assert_eq!(resolved.config.name, "custom");
+        assert!(!home.join(".forgetfuldb").exists(), "global store untouched");
+    }
 
     #[test]
     fn default_config_roundtrips_through_toml() {

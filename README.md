@@ -300,12 +300,33 @@ embeddings via fastembed/candle/Core ML — without touching the rest of
 the system. Run `forgetfuldb consolidate` nightly (launchd/cron) either
 way.
 
+## Where memories live
+
+By default every session — no matter which directory you launch from —
+uses the **shared global store** at `~/.forgetfuldb/` (created
+automatically, named `"main"`, with an absolute database path). That's
+what keeps memories intact across sessions. Resolution order:
+
+1. `--config <path>` — explicit store
+2. `./forgetfuldb.toml` in the working directory — a deliberate
+   **project-local** store (create one with `forgetfuldb init`, which
+   names it after the directory; `--name` overrides)
+3. `~/.forgetfuldb/forgetfuldb.toml` — the global `"main"` store
+
+Every store has a friendly `name` shown in the `iforgot` banner and
+`forgetfuldb stats` (`memory "main" (global) | db ~/.forgetfuldb/...`),
+so it's always clear which memory a session is talking to. If a stray
+`forgetfuldb.sqlite3` from an older cwd-relative session is found in the
+working directory while the global store is active, a note tells you so
+those memories aren't silently orphaned. Relative `sqlite_path` values
+resolve against the config file's directory, never the cwd.
+
 ## Configuration
 
-`forgetfuldb init` writes `forgetfuldb.toml` next to the database. See
-[`forgetfuldb.example.toml`](forgetfuldb.example.toml) for every knob:
-decay lambdas per memory type, retrieval weights, consolidation
-thresholds, archive/delete windows, and `local_only`.
+See [`forgetfuldb.example.toml`](forgetfuldb.example.toml) for every
+knob: store name, decay lambdas per memory type, retrieval weights,
+consolidation thresholds, archive/delete windows, `[chat]` settings, and
+`local_only`.
 
 ## Testing
 

@@ -6,7 +6,6 @@
 use anyhow::Result;
 use forgetfuldb_agent::{Agent, TurnResult};
 use forgetfuldb_consolidate::ExtractiveSummarizer;
-use forgetfuldb_core::config::Config;
 use rustyline::error::ReadlineError;
 use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
@@ -32,16 +31,39 @@ fn arg_value(flag: &str) -> Option<String> {
 }
 
 fn main() -> Result<()> {
-    let config_path = arg_value("--config").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("forgetfuldb.toml"));
-    let cfg = Config::load_or_default(&config_path)?;
+    let explicit = arg_value("--config").map(PathBuf::from);
+    let resolved = forgetfuldb_core::config::resolve(explicit.as_deref())?;
+    let config_path = resolved.path.clone();
+    let scope = resolved.scope;
+    let stray_local_db = resolved.stray_local_db;
 
     let runtime = tokio::runtime::Runtime::new()?;
-    let mut agent = Agent::new(cfg)?;
+    let mut agent = Agent::new(resolved.config)?;
 
     let color = std::io::stdout().is_terminal();
     let paint = move |code: &'static str| -> &'static str { if color { code } else { "" } };
 
     println!("{}{}{}", paint(CYAN), LOGO, paint(RESET));
+    println!(
+        "{}  memory \"{}\" ({}) | db {}{}",
+        paint(DIM),
+        agent.cfg.name,
+        scope.as_str(),
+        agent.cfg.sqlite_path,
+        paint(RESET)
+    );
+    if stray_local_db {
+        println!(
+            "{}  note: a {} exists in this directory from an earlier session, but the {} memory \
+             \"{}\" is in use. To revive those memories run `forgetfuldb init` here and use --config, \
+             or re-ingest what matters.{}",
+            paint(MAGENTA),
+            forgetfuldb_core::config::DB_FILE,
+            scope.as_str(),
+            agent.cfg.name,
+            paint(RESET)
+        );
+    }
 
     let mut editor = rustyline::DefaultEditor::new()?;
 
@@ -92,12 +114,11 @@ fn main() -> Result<()> {
     }
 
     println!(
-        "{}  model {} via {} at {} | db {} | /help for commands{}",
+        "{}  model {} via {} at {} | /help for commands{}",
         paint(DIM),
         agent.backend.model(),
         agent.backend.name(),
         agent.backend.base_url(),
-        agent.cfg.sqlite_path,
         paint(RESET)
     );
     println!();
@@ -149,7 +170,13 @@ fn main() -> Result<()> {
         }
     }
     agent.flush(); // drain background memory writes before claiming safety
-    println!("{}bye — your memories are safe in {}{}", paint(DIM), agent.cfg.sqlite_path, paint(RESET));
+    println!(
+        "{}bye — your memories are safe in \"{}\" ({}){}",
+        paint(DIM),
+        agent.cfg.name,
+        agent.cfg.sqlite_path,
+        paint(RESET)
+    );
     Ok(())
 }
 

@@ -1,6 +1,15 @@
 # ForgetfulDB configuration. Copy to forgetfuldb.toml and edit.
 # Every field is optional; missing fields use these defaults.
+#
+# Config resolution: --config flag > ./forgetfuldb.toml (project-local
+# store) > ~/.forgetfuldb/forgetfuldb.toml (the shared global store,
+# created automatically so memories persist across all sessions).
 
+# Friendly name shown in banners and stats, so it's always clear which
+# memory database a session is talking to.
+name = "main"
+
+# Relative paths resolve against this file's directory (never the cwd).
 sqlite_path = "forgetfuldb.sqlite3"
 
 # v1 ships "hashed_bow" (deterministic, model-free).

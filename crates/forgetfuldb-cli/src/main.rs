@@ -14,9 +14,10 @@ use std::str::FromStr;
 #[derive(Parser)]
 #[command(name = "forgetfuldb", version, about = "Local-first AI memory database with human-like forgetting")]
 struct Cli {
-    /// Path to forgetfuldb.toml (default: ./forgetfuldb.toml)
-    #[arg(long, global = true, default_value = "forgetfuldb.toml")]
-    config: PathBuf,
+    /// Path to forgetfuldb.toml. Default: ./forgetfuldb.toml if present,
+    /// otherwise the shared global store in ~/.forgetfuldb/
+    #[arg(long, global = true)]
+    config: Option<PathBuf>,
 
     #[command(subcommand)]
     command: Command,
@@ -24,8 +25,18 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Create the config file (if missing) and initialize the database
-    Init,
+    /// Create a config file and initialize its database.
+    /// Default: project-local in the current directory; --global targets
+    /// the shared ~/.forgetfuldb/ store every session uses by default.
+    Init {
+        /// Friendly name for this memory database (default: the
+        /// directory name, or "main" for --global)
+        #[arg(long)]
+        name: Option<String>,
+        /// Initialize the global store instead of a local one
+        #[arg(long)]
+        global: bool,
+    },
     /// Store a new memory
     Ingest {
         #[arg(long)]
@@ -85,10 +96,25 @@ enum Command {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let cfg = Config::load_or_default(&cli.config)?;
+
+    if let Command::Init { name, global } = &cli.command {
+        return init(cli.config.as_deref(), name.clone(), *global);
+    }
+
+    let resolved = forgetfuldb_core::config::resolve(cli.config.as_deref())?;
+    if resolved.stray_local_db {
+        eprintln!(
+            "note: a {} exists in this directory, but the {} memory \"{}\" is in use \
+             (run `forgetfuldb init` here to adopt the local one)",
+            forgetfuldb_core::config::DB_FILE,
+            resolved.scope.as_str(),
+            resolved.config.name
+        );
+    }
+    let cfg = resolved.config;
 
     match cli.command {
-        Command::Init => init(&cli.config, &cfg),
+        Command::Init { .. } => unreachable!("handled above"),
         Command::Ingest { text, source, tags, memory_type, session, role } => {
             let store = open_store(&cfg)?;
             let mut bloom = warm_bloom(&store)?;
@@ -127,6 +153,8 @@ fn main() -> Result<()> {
         Command::Stats => {
             let store = open_store(&cfg)?;
             let stats = store.stats()?;
+            println!("memory name    : {}", cfg.name);
+            println!("database       : {}", cfg.sqlite_path);
             println!("total memories : {}", stats.total_memories);
             for (mt, count) in &stats.by_type {
                 println!("  {mt:<11}: {count}");
@@ -184,14 +212,62 @@ fn open_store(cfg: &Config) -> Result<Store> {
         .with_context(|| "is the database initialized? run `forgetfuldb init` first")
 }
 
-fn init(config_path: &Path, cfg: &Config) -> Result<()> {
-    if !config_path.exists() {
-        cfg.save(config_path)?;
-        println!("wrote {}", config_path.display());
+fn init(explicit: Option<&Path>, name: Option<String>, global: bool) -> Result<()> {
+    use forgetfuldb_core::config::{home_dir, CONFIG_FILE, DB_FILE};
+
+    let (config_path, default_name, absolute_db) = if let Some(path) = explicit {
+        let parent = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(|p| p.to_path_buf())
+            .unwrap_or(std::env::current_dir()?);
+        (path.to_path_buf(), dir_name(&parent), false)
+    } else if global {
+        let dir = home_dir()
+            .context("cannot determine home directory (HOME unset)")?
+            .join(".forgetfuldb");
+        std::fs::create_dir_all(&dir)?;
+        (dir.join(CONFIG_FILE), "main".to_string(), true)
     } else {
-        println!("config exists at {}", config_path.display());
+        let cwd = std::env::current_dir()?;
+        (cwd.join(CONFIG_FILE), dir_name(&cwd), false)
+    };
+
+    if config_path.exists() {
+        let mut cfg = Config::load(&config_path)?;
+        if let Some(name) = name {
+            cfg.name = name;
+            cfg.save(&config_path)?;
+            println!("renamed memory to \"{}\" in {}", cfg.name, config_path.display());
+        } else {
+            println!("config exists at {} (memory \"{}\")", config_path.display(), cfg.name);
+        }
+    } else {
+        let mut cfg = Config { name: name.unwrap_or(default_name), ..Config::default() };
+        if absolute_db {
+            // The global store must never depend on the launch directory.
+            cfg.sqlite_path = config_path
+                .parent()
+                .expect("global config has a parent dir")
+                .join(DB_FILE)
+                .display()
+                .to_string();
+        }
+        cfg.save(&config_path)?;
+        println!("wrote {} (memory \"{}\")", config_path.display(), cfg.name);
     }
-    Store::open(Path::new(&cfg.sqlite_path))?;
-    println!("database ready at {}", cfg.sqlite_path);
+
+    // Re-resolve through the normal path so the database lands exactly
+    // where every other command will look for it.
+    let resolved = forgetfuldb_core::config::resolve(Some(&config_path))?;
+    Store::open(Path::new(&resolved.config.sqlite_path))?;
+    println!("database ready at {}", resolved.config.sqlite_path);
     Ok(())
+}
+
+fn dir_name(path: &Path) -> String {
+    path.file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| "main".to_string())
 }
