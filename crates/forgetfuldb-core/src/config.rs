@@ -52,6 +52,10 @@ pub struct ChatConfig {
     pub top_k: usize,
     /// How many past user/assistant exchanges to keep in the prompt.
     pub history_turns: usize,
+    /// How long Ollama keeps the model loaded after a request (e.g.
+    /// "30m", "1h", "-1" for forever). Avoids paying a full model reload
+    /// after idle pauses. Ignored by openai_compat backends.
+    pub keep_alive: String,
     /// Base system prompt; retrieved memories are appended to it.
     pub system_prompt: String,
 }
@@ -64,6 +68,7 @@ impl Default for ChatConfig {
             model: String::new(),
             top_k: 6,
             history_turns: 8,
+            keep_alive: "30m".to_string(),
             system_prompt: "You are iForgot, a local AI assistant with long-term memory. \
                 Use the memories below when they are relevant, and say so plainly when \
                 you don't know something."

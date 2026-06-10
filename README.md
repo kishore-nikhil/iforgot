@@ -257,6 +257,31 @@ Streaming (`"stream": true`) is passed through verbatim (in that mode the
 reply isn't captured for ingestion and token usage isn't recorded;
 context metrics still are).
 
+### Latency design
+
+Memory adds almost nothing to conversation latency, by construction:
+
+- **Replies stream** token-by-token in the terminal and through the proxy.
+- **Cache-friendly prompts.** The system prompt and history stay
+  byte-identical across turns; retrieved memories are attached to the
+  *current user message* (and, in the proxy, injected just before it).
+  Everything before the new message therefore hits the LLM server's
+  prefix KV-cache, so each turn only evaluates new tokens — with a 12B
+  model that's the difference between milliseconds and seconds before
+  the first token.
+- **Async memory writes.** Only retrieval (a few ms) runs on the
+  conversation path. Ingest and metrics are queued to a background
+  writer thread with its own SQLite connection (WAL); the user-message
+  write happens while the model generates, and each turn flushes the
+  (in practice already-empty) queue first so retrieval always sees
+  prior turns.
+- **`keep_alive`** (default `"30m"`, under `[chat]`) keeps the model
+  loaded in Ollama between turns, avoiding a full model reload after an
+  idle pause.
+
+If the first token is still slow, shrink the prompt: lower `top_k` and
+`history_turns`, and check `/metrics` for the context share.
+
 ### Token & context metrics
 
 Every chat turn (terminal or proxy) records a row in `chat_turns`:

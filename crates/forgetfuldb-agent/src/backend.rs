@@ -45,7 +45,7 @@ pub struct ChatUsage {
 }
 
 pub enum ChatBackend {
-    Ollama { base_url: String, model: String, client: reqwest::Client },
+    Ollama { base_url: String, model: String, keep_alive: String, client: reqwest::Client },
     OpenAiCompat { base_url: String, model: String, client: reqwest::Client },
 }
 
@@ -74,11 +74,16 @@ pub fn ensure_local_url(cfg: &Config) -> Result<()> {
 impl ChatBackend {
     pub fn from_config(cfg: &Config) -> Result<ChatBackend> {
         ensure_local_url(cfg)?;
-        let ChatConfig { backend, base_url, model, .. } = &cfg.chat;
+        let ChatConfig { backend, base_url, model, keep_alive, .. } = &cfg.chat;
         let base_url = base_url.trim_end_matches('/').to_string();
         let client = reqwest::Client::new();
         match backend.as_str() {
-            "ollama" => Ok(ChatBackend::Ollama { base_url, model: model.clone(), client }),
+            "ollama" => Ok(ChatBackend::Ollama {
+                base_url,
+                model: model.clone(),
+                keep_alive: keep_alive.clone(),
+                client,
+            }),
             "openai_compat" => Ok(ChatBackend::OpenAiCompat { base_url, model: model.clone(), client }),
             other => anyhow::bail!("unknown chat backend '{other}' (available: ollama, openai_compat)"),
         }
@@ -163,8 +168,15 @@ impl ChatBackend {
         on_token: &mut dyn FnMut(&str),
     ) -> Result<(String, ChatUsage)> {
         match self {
-            ChatBackend::Ollama { base_url, model, client } => {
-                let body = json!({ "model": model, "messages": messages, "stream": true });
+            ChatBackend::Ollama { base_url, model, keep_alive, client } => {
+                // keep_alive holds the model in memory between turns so an
+                // idle pause doesn't cost a full model reload.
+                let body = json!({
+                    "model": model,
+                    "messages": messages,
+                    "stream": true,
+                    "keep_alive": keep_alive,
+                });
                 let resp = client
                     .post(format!("{base_url}/api/chat"))
                     .json(&body)

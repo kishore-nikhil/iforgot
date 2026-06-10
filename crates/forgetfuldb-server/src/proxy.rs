@@ -25,7 +25,7 @@ use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use forgetfuldb_agent::backend::ChatUsage;
-use forgetfuldb_agent::{finish_turn, prepare_turn, PreparedTurn};
+use forgetfuldb_agent::{finish_turn, memory_context_block, prepare_turn, PreparedTurn};
 use serde_json::{json, Value};
 
 /// Last `"role": "user"` message with string content, if any.
@@ -47,16 +47,14 @@ pub(crate) async fn chat_completions(
     let stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
     let user_text = last_user_content(&body);
 
-    // Phase 1 (sync, under lock): ingest the user message and build the
-    // memory system message. The lock is released before the LLM call so
-    // generation never blocks other API requests.
+    // Phase 1 (sync, under lock): retrieve memories for the user message.
+    // Read-only — ingestion happens in `record` after the LLM responds.
+    // The lock is released before the LLM call so generation never blocks
+    // other API requests.
     let (prepared, base_url, default_model, client) = {
-        let mut app = state.lock().expect("state mutex poisoned");
+        let app = state.lock().expect("state mutex poisoned");
         let prepared = match &user_text {
-            Some(text) => {
-                let crate::AppState { store, bloom, provider, cfg, .. } = &mut *app;
-                Some(prepare_turn(store, bloom, provider.as_ref(), cfg, "proxy", &[], text)?)
-            }
+            Some(text) => Some(prepare_turn(&app.store, app.provider.as_ref(), &app.cfg, &[], text)?),
             None => None,
         };
         (
@@ -67,14 +65,19 @@ pub(crate) async fn chat_completions(
         )
     };
 
-    // Inject our memory system message ahead of the client's messages and
-    // default the model if the client didn't pick one.
+    // Inject the memory block as a system message just BEFORE the last
+    // user message (not at position 0): everything earlier in the
+    // conversation stays byte-identical across requests, so the LLM
+    // server's prefix KV-cache stays valid. Also default the model if the
+    // client didn't pick one.
     if let Some(prepared) = &prepared {
-        // prepare_turn builds [system, user]; we only want its system part —
-        // the client's own message list is forwarded as-is after it.
-        let system = json!({ "role": "system", "content": prepared.messages[0].content });
+        let system = json!({ "role": "system", "content": memory_context_block(&prepared.pack) });
         if let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) {
-            messages.insert(0, system);
+            let idx = messages
+                .iter()
+                .rposition(|m| m.get("role").and_then(Value::as_str) == Some("user"))
+                .unwrap_or(messages.len());
+            messages.insert(idx, system);
         }
     }
     if body.get("model").and_then(Value::as_str).is_none_or(str::is_empty) {
@@ -134,7 +137,7 @@ pub(crate) async fn chat_completions(
     Ok((status, Json(reply_json)).into_response())
 }
 
-/// Phase 2 (sync, re-lock): ingest the reply and persist the metrics row.
+/// Phase 2 (sync, re-lock): ingest both messages and persist metrics.
 fn record(
     state: &SharedState,
     prepared: &PreparedTurn,

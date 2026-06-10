@@ -148,6 +148,7 @@ fn main() -> Result<()> {
             Err(e) => println!("{}  error: {e:#}{}\n", paint(MAGENTA), paint(RESET)),
         }
     }
+    agent.flush(); // drain background memory writes before claiming safety
     println!("{}bye — your memories are safe in {}{}", paint(DIM), agent.cfg.sqlite_path, paint(RESET));
     Ok(())
 }
@@ -199,6 +200,9 @@ fn handle_command(
     editor: &mut rustyline::DefaultEditor,
     paint: impl Fn(&'static str) -> &'static str + Copy,
 ) -> Result<bool> {
+    // Slash commands inspect the database, so settle any memory writes
+    // still queued on the background writer first (milliseconds).
+    agent.flush();
     let mut parts = cmd.split_whitespace();
     match (parts.next().unwrap_or(""), parts.next()) {
         ("quit", _) | ("exit", _) => return Ok(false),

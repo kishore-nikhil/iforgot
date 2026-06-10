@@ -39,6 +39,10 @@ impl Store {
             .with_context(|| format!("opening sqlite db at {}", path.display()))?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
+        // Multiple connections may share the file (e.g. the chat thread
+        // reads while the background memory writer writes); wait briefly
+        // instead of failing on transient lock contention.
+        conn.pragma_update(None, "busy_timeout", 5000)?;
         let store = Store { conn };
         store.migrate()?;
         Ok(store)
