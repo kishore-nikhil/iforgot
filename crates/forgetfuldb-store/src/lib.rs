@@ -17,7 +17,10 @@ use std::str::FromStr;
 
 /// Embedded, ordered migrations. Add new `(name, sql)` pairs at the end;
 /// applied ones are skipped via the `schema_migrations` table.
-const MIGRATIONS: &[(&str, &str)] = &[("0001_init", include_str!("../migrations/0001_init.sql"))];
+const MIGRATIONS: &[(&str, &str)] = &[
+    ("0001_init", include_str!("../migrations/0001_init.sql")),
+    ("0002_chat_turns", include_str!("../migrations/0002_chat_turns.sql")),
+];
 
 pub struct Store {
     conn: Connection,
@@ -344,6 +347,64 @@ impl Store {
         Ok(())
     }
 
+    // ---- chat turn metrics ------------------------------------------------
+
+    pub fn insert_chat_turn(&self, t: &ChatTurn) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO chat_turns (
+                 id, session_id, created_at, user_text, assistant_text, model, backend,
+                 prompt_tokens, completion_tokens, total_duration_ms, llm_duration_ms,
+                 retrieve_duration_ms, context_memory_count, context_chars, memory_ids
+             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
+            params![
+                t.id,
+                t.session_id,
+                t.created_at,
+                t.user_text,
+                t.assistant_text,
+                t.model,
+                t.backend,
+                t.prompt_tokens,
+                t.completion_tokens,
+                t.total_duration_ms,
+                t.llm_duration_ms,
+                t.retrieve_duration_ms,
+                t.context_memory_count,
+                t.context_chars,
+                serde_json::to_string(&t.memory_ids)?,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Aggregate chat metrics: the raw material for context optimization.
+    pub fn chat_metrics_summary(&self) -> Result<ChatMetricsSummary> {
+        self.conn
+            .query_row(
+                "SELECT COUNT(*),
+                        AVG(prompt_tokens), AVG(completion_tokens),
+                        SUM(prompt_tokens), SUM(completion_tokens),
+                        AVG(context_chars), AVG(context_memory_count),
+                        AVG(retrieve_duration_ms), AVG(llm_duration_ms)
+                 FROM chat_turns",
+                [],
+                |r| {
+                    Ok(ChatMetricsSummary {
+                        turns: r.get(0)?,
+                        avg_prompt_tokens: r.get(1)?,
+                        avg_completion_tokens: r.get(2)?,
+                        total_prompt_tokens: r.get::<_, Option<i64>>(3)?.unwrap_or(0),
+                        total_completion_tokens: r.get::<_, Option<i64>>(4)?.unwrap_or(0),
+                        avg_context_chars: r.get(5)?,
+                        avg_context_memories: r.get(6)?,
+                        avg_retrieve_ms: r.get(7)?,
+                        avg_llm_ms: r.get(8)?,
+                    })
+                },
+            )
+            .map_err(Into::into)
+    }
+
     // ---- stats -----------------------------------------------------------
 
     pub fn stats(&self) -> Result<StoreStats> {
@@ -368,6 +429,41 @@ impl Store {
         let sessions: i64 = self.conn.query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0))?;
         Ok(StoreStats { total_memories: total, by_type, stale, pinned, raw_events, links, sessions })
     }
+}
+
+/// One row of the `chat_turns` metrics table.
+#[derive(Debug, Clone)]
+pub struct ChatTurn {
+    pub id: String,
+    pub session_id: Option<String>,
+    pub created_at: i64,
+    pub user_text: String,
+    pub assistant_text: String,
+    pub model: String,
+    pub backend: String,
+    /// None when the backend didn't report token usage (estimates are the
+    /// caller's job; NULLs keep the data honest).
+    pub prompt_tokens: Option<i64>,
+    pub completion_tokens: Option<i64>,
+    pub total_duration_ms: Option<i64>,
+    pub llm_duration_ms: Option<i64>,
+    pub retrieve_duration_ms: i64,
+    pub context_memory_count: i64,
+    pub context_chars: i64,
+    pub memory_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ChatMetricsSummary {
+    pub turns: i64,
+    pub avg_prompt_tokens: Option<f64>,
+    pub avg_completion_tokens: Option<f64>,
+    pub total_prompt_tokens: i64,
+    pub total_completion_tokens: i64,
+    pub avg_context_chars: Option<f64>,
+    pub avg_context_memories: Option<f64>,
+    pub avg_retrieve_ms: Option<f64>,
+    pub avg_llm_ms: Option<f64>,
 }
 
 #[derive(Debug, Clone)]
@@ -498,6 +594,34 @@ mod tests {
         let back = store.get_memory("mem_1").unwrap().unwrap();
         assert_eq!(back.access_count, 1);
         assert_eq!(back.last_accessed_at, Some(12345));
+    }
+
+    #[test]
+    fn chat_turn_metrics_roundtrip() {
+        let store = Store::open_in_memory().unwrap();
+        let turn = ChatTurn {
+            id: "turn_1".into(),
+            session_id: Some("s1".into()),
+            created_at: 1000,
+            user_text: "hello".into(),
+            assistant_text: "hi".into(),
+            model: "gemma3:12b".into(),
+            backend: "ollama".into(),
+            prompt_tokens: Some(120),
+            completion_tokens: Some(30),
+            total_duration_ms: Some(900),
+            llm_duration_ms: Some(800),
+            retrieve_duration_ms: 4,
+            context_memory_count: 3,
+            context_chars: 250,
+            memory_ids: vec!["mem_a".into()],
+        };
+        store.insert_chat_turn(&turn).unwrap();
+        let summary = store.chat_metrics_summary().unwrap();
+        assert_eq!(summary.turns, 1);
+        assert_eq!(summary.total_prompt_tokens, 120);
+        assert_eq!(summary.avg_completion_tokens, Some(30.0));
+        assert_eq!(summary.avg_context_memories, Some(3.0));
     }
 
     #[test]

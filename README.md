@@ -47,7 +47,9 @@ flowchart TD
 | `forgetfuldb-retrieve` | Hybrid ranking: vector + keyword/tag + importance + recurrence + recency + decay |
 | `forgetfuldb-consolidate` | The "sleep cycle": merge dups, summarize clusters, promote, archive, prune |
 | `forgetfuldb-cli` | The `forgetfuldb` binary |
-| `forgetfuldb-server` | Optional local HTTP API (axum) |
+| `forgetfuldb-server` | Optional local HTTP API (axum) + OpenAI-compatible memory proxy |
+| `forgetfuldb-agent` | Memory-wrapped chat loop around a local LLM (Ollama / llama-server) |
+| `iforgot-chat` | The `iforgot` binary: casual terminal chat with automatic memory |
 
 > **Why a Bloom filter?** Only for *"have I probably ingested this exact
 > content before?"* checks during dedup. Bloom filters cannot do semantic
@@ -169,6 +171,8 @@ forgetfuldb server --port 8787
 | `POST /consolidate` | `{}` (empty) |
 | `GET /memory/:id` | — |
 | `GET /stats` | — |
+| `GET /metrics` | — (chat token/context metrics) |
+| `POST /v1/chat/completions` | OpenAI-compatible memory proxy (see below) |
 
 ```bash
 curl -s localhost:8787/ingest -H 'content-type: application/json' \
@@ -177,27 +181,82 @@ curl -s localhost:8787/retrieve -H 'content-type: application/json' \
   -d '{"query": "when is standup", "top_k": 5}'
 ```
 
-### Connecting to a local LLM (e.g. Ollama)
+## iforgot: chat with memory built in
 
-ForgetfulDB is the memory; your assistant loop is the brain. A typical
-loop with Ollama:
-
-1. user says something → `POST /ingest` (or `forgetfuldb ingest`)
-2. before answering → `POST /retrieve` with the user's question and
-   paste the context pack into the system prompt
-3. nightly (launchd/cron) → `POST /consolidate`
+`iforgot` is a terminal chat where memory updates itself. Every message
+you send is ingested (write), every reply is grounded in retrieved
+memories (read — which also counts as rehearsal and slows decay), the
+assistant's replies are stored as fast-decaying raw events, and per-turn
+token metrics are logged for context optimization. The LLM stays
+stateless; ForgetfulDB is the state.
 
 ```bash
-QUERY="what did I decide about plot perfect pricing?"
-CONTEXT=$(forgetfuldb retrieve --query "$QUERY" --top-k 5)
-ollama run llama3.2 "Relevant memories:\n$CONTEXT\n\nQuestion: $QUERY"
+ollama pull gemma3:12b          # or any chat model
+cargo install --path crates/iforgot-chat
+iforgot                         # uses forgetfuldb.toml in the cwd
 ```
 
+```text
+   _ _____                          _
+  (_)  ___|__  _ __ __ _  ___  ___ | |_
+  | | |_ / _ \| '__/ _` |/ _ \/ _ \| __|
+  | |  _| (_) | |  | (_| | (_) | (_) | |_
+  |_|_|  \___/|_|   \__, |\___/ \___/ \__|
+                    |___/
+
+you ❯ what editor theme do I like?
+iforgot ❯ You prefer dark mode.
+  ⏺ 1 memories | prompt 123 tok | reply 5 tok | retrieve 3ms | llm 1200ms
+```
+
+In-chat commands: `/memories` (show the context pack behind the last
+answer, with score breakdowns), `/metrics`, `/stats`, `/consolidate`,
+`/pin <id>`, `/unpin <id>`, `/stale <id>`, `/inspect <id>`, `/quit`.
+
+The backend is configured in `forgetfuldb.toml` under `[chat]`:
+`backend = "ollama"` uses Ollama's native API (exact token counts);
+`backend = "openai_compat"` works with llama-server (llama.cpp),
+LM Studio, or anything OpenAI-shaped. When `local_only = true`, only
+localhost URLs are accepted — and the workspace builds reqwest without
+TLS, so remote https endpoints are unreachable by construction.
+
+### The memory proxy: give any chat UI long-term memory
+
+`forgetfuldb server` also exposes **`POST /v1/chat/completions`** — an
+OpenAI-compatible endpoint that ingests the user's message, injects
+retrieved memories as a system message, forwards the request to your
+local LLM, ingests the reply, and records metrics. Point any
+OpenAI-compatible client (Open WebUI, IDE plugins, scripts using an
+OpenAI SDK) at `http://127.0.0.1:8787/v1` and it gains memory with zero
+integration work:
+
+```bash
+forgetfuldb server --port 8787
+curl -s localhost:8787/v1/chat/completions -H 'content-type: application/json' \
+  -d '{"messages":[{"role":"user","content":"what did I decide about pricing?"}]}'
+```
+
+Streaming (`"stream": true`) is passed through verbatim (in that mode the
+reply isn't captured for ingestion and token usage isn't recorded;
+context metrics still are).
+
+### Token & context metrics
+
+Every chat turn (terminal or proxy) records a row in `chat_turns`:
+prompt/completion tokens (exact from Ollama; reported usage or absent
+from OpenAI-compat backends), context share, retrieval vs LLM latency,
+and which memory IDs were injected. View it with `forgetfuldb metrics`,
+`/metrics` in chat, or `GET /metrics` — this is the dataset for tuning
+`top_k`, retrieval weights, and summary sizes against real numbers later.
+
+### Plugging in models elsewhere
+
 The `Summarizer` trait in `forgetfuldb-consolidate` and the
-`EmbeddingProvider` trait in `forgetfuldb-embed` are the two seams where
-local models plug in later — consolidation summaries via Ollama, real
+`EmbeddingProvider` trait in `forgetfuldb-embed` are the remaining seams
+where local models plug in — consolidation summaries via Ollama, real
 embeddings via fastembed/candle/Core ML — without touching the rest of
-the system.
+the system. Run `forgetfuldb consolidate` nightly (launchd/cron) either
+way.
 
 ## Configuration
 

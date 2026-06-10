@@ -20,8 +20,18 @@ archive_after_days = 14.0
 # Archived, unpinned memories older than this (days) are deleted.
 delete_after_days = 90.0
 
-# Never talk to the network. The HTTP server binds 127.0.0.1 when true.
+# Never talk to the network. The HTTP server binds 127.0.0.1 when true,
+# and the chat backend URL must be localhost.
 local_only = true
+
+# Settings for the iforgot terminal chat and the /v1 memory proxy.
+[chat]
+backend = "ollama"                    # "ollama" or "openai_compat" (llama-server, LM Studio, ...)
+base_url = "http://127.0.0.1:11434"
+model = "gemma3:12b"
+top_k = 6                             # memories injected per turn
+history_turns = 8                     # past exchanges kept in the prompt
+system_prompt = "You are iForgot, a local AI assistant with long-term memory. Use the memories below when they are relevant, and say so plainly when you don't know something."
 
 [retrieval_weights]
 semantic = 0.45

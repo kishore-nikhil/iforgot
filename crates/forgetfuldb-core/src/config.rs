@@ -28,7 +28,46 @@ pub struct Config {
     /// Archived, unpinned memories older than this are deleted.
     pub delete_after_days: f64,
     /// ForgetfulDB never talks to the network when true (the default).
+    /// The chat backend URL must be localhost and the HTTP server binds
+    /// 127.0.0.1.
     pub local_only: bool,
+    /// Chat loop settings (used by forgetfuldb-agent / iforgot-chat).
+    pub chat: ChatConfig,
+}
+
+/// Settings for the memory-wrapped chat loop.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ChatConfig {
+    /// "ollama" (native API, exact token metrics) or "openai_compat"
+    /// (works with llama-server, LM Studio, anything OpenAI-shaped).
+    pub backend: String,
+    /// Base URL of the local LLM server.
+    pub base_url: String,
+    /// Model name to request.
+    pub model: String,
+    /// How many memories to inject per turn.
+    pub top_k: usize,
+    /// How many past user/assistant exchanges to keep in the prompt.
+    pub history_turns: usize,
+    /// Base system prompt; retrieved memories are appended to it.
+    pub system_prompt: String,
+}
+
+impl Default for ChatConfig {
+    fn default() -> Self {
+        ChatConfig {
+            backend: "ollama".to_string(),
+            base_url: "http://127.0.0.1:11434".to_string(),
+            model: "gemma3:12b".to_string(),
+            top_k: 6,
+            history_turns: 8,
+            system_prompt: "You are iForgot, a local AI assistant with long-term memory. \
+                Use the memories below when they are relevant, and say so plainly when \
+                you don't know something."
+                .to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -77,6 +116,7 @@ impl Default for Config {
             archive_after_days: 14.0,
             delete_after_days: 90.0,
             local_only: true,
+            chat: ChatConfig::default(),
         }
     }
 }

@@ -9,6 +9,8 @@ members = [
     "crates/forgetfuldb-consolidate",
     "crates/forgetfuldb-cli",
     "crates/forgetfuldb-server",
+    "crates/forgetfuldb-agent",
+    "crates/iforgot-chat",
 ]
 
 [workspace.package]
@@ -28,6 +30,12 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 clap = { version = "4", features = ["derive"] }
 axum = "0.7"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+# No TLS features on purpose: the agent only ever talks plain HTTP to
+# localhost (Ollama / llama-server), which keeps "local-only" enforceable
+# at the dependency level.
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream"] }
+futures-util = "0.3"
+rustyline = "14"
 
 forgetfuldb-core = { path = "crates/forgetfuldb-core" }
 forgetfuldb-prob = { path = "crates/forgetfuldb-prob" }
@@ -36,6 +44,7 @@ forgetfuldb-store = { path = "crates/forgetfuldb-store" }
 forgetfuldb-retrieve = { path = "crates/forgetfuldb-retrieve" }
 forgetfuldb-consolidate = { path = "crates/forgetfuldb-consolidate" }
 forgetfuldb-server = { path = "crates/forgetfuldb-server" }
+forgetfuldb-agent = { path = "crates/forgetfuldb-agent" }
 
 [profile.release]
 lto = "thin"

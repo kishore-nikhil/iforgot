@@ -1,21 +1,18 @@
 [package]
-name = "forgetfuldb-server"
+name = "forgetfuldb-agent"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Optional local HTTP API (axum) for ForgetfulDB"
+description = "Memory-wrapped chat loop: auto ingest/retrieve around a local LLM (Ollama or any OpenAI-compatible server)"
 
 [dependencies]
 anyhow = { workspace = true }
-axum = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-tokio = { workspace = true }
 reqwest = { workspace = true }
+futures-util = { workspace = true }
 forgetfuldb-core = { workspace = true }
 forgetfuldb-embed = { workspace = true }
 forgetfuldb-prob = { workspace = true }
 forgetfuldb-store = { workspace = true }
 forgetfuldb-retrieve = { workspace = true }
-forgetfuldb-consolidate = { workspace = true }
-forgetfuldb-agent = { workspace = true }

@@ -57,6 +57,8 @@ enum Command {
     Consolidate,
     /// Show database statistics
     Stats,
+    /// Show chat token/context metrics (recorded by iforgot chat & the proxy)
+    Metrics,
     /// Show one memory with its score fields and links
     Inspect {
         #[arg(long)]
@@ -134,6 +136,21 @@ fn main() -> Result<()> {
             println!("raw events     : {}", stats.raw_events);
             println!("links          : {}", stats.links);
             println!("sessions       : {}", stats.sessions);
+            Ok(())
+        }
+        Command::Metrics => {
+            let store = open_store(&cfg)?;
+            let m = store.chat_metrics_summary()?;
+            if m.turns == 0 {
+                println!("no chat turns recorded yet (use `iforgot` or the /v1 proxy)");
+                return Ok(());
+            }
+            let fmt = |v: Option<f64>| v.map_or("?".to_string(), |x| format!("{x:.0}"));
+            println!("chat turns      : {}", m.turns);
+            println!("prompt tokens   : avg {} (total {})", fmt(m.avg_prompt_tokens), m.total_prompt_tokens);
+            println!("reply tokens    : avg {} (total {})", fmt(m.avg_completion_tokens), m.total_completion_tokens);
+            println!("context         : avg {} chars, avg {} memories/turn", fmt(m.avg_context_chars), fmt(m.avg_context_memories));
+            println!("latency         : retrieve avg {} ms, llm avg {} ms", fmt(m.avg_retrieve_ms), fmt(m.avg_llm_ms));
             Ok(())
         }
         Command::Inspect { id } => {
