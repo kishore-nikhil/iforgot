@@ -275,7 +275,8 @@ impl Agent {
             .submit(WriteJob::Ingest(chat_ingest_request(&self.session_id, "user", user_text)));
 
         let (reply, usage) = self.stream_and_record(&prepared, on_token).await?;
-        let pending_tool = self.parse_pending_tool(&reply);
+        // User-initiated turn: allow the ```bash code-block fallback.
+        let pending_tool = self.parse_pending_tool(&reply, true);
         let turn = build_chat_turn(&self.session_id, &prepared, &reply, &usage, self.backend.name(), self.backend.model());
 
         Ok(TurnResult { reply, pack: prepared.pack, turn, pending_tool })
@@ -317,7 +318,10 @@ impl Agent {
         )));
 
         let (reply, usage) = self.stream_and_record(&prepared, on_token).await?;
-        let pending_tool = self.parse_pending_tool(&reply);
+        // Follow-up turn: honor an explicit ```tool block (chaining) but
+        // NOT the bash-code-block fallback, so a final answer that quotes a
+        // command doesn't re-prompt the user in a loop.
+        let pending_tool = self.parse_pending_tool(&reply, false);
         let turn = build_chat_turn(&self.session_id, &prepared, &reply, &usage, self.backend.name(), self.backend.model());
         Ok(TurnResult { reply, pack: prepared.pack, turn, pending_tool })
     }
@@ -357,14 +361,31 @@ impl Agent {
         Ok((reply, usage))
     }
 
-    /// Parse a tool call from a reply, but only if tools are registered and
-    /// the named tool actually exists.
-    fn parse_pending_tool(&self, reply: &str) -> Option<ToolCall> {
+    /// Parse a tool call from a reply, if tools are registered.
+    ///
+    /// Two layers: first the structured ```tool block protocol; then, when
+    /// `allow_shell_fallback` is set, a fallback that treats a plain
+    /// ```bash / ```sh code block as a shell command. Small local models
+    /// often ignore the JSON protocol and just *describe* the command in a
+    /// code block, so the fallback is what makes "show my IP" actually
+    /// offer to run something. It's only applied to user-initiated turns,
+    /// not tool follow-ups, so a final answer that happens to quote a
+    /// command can't trigger a re-prompt loop.
+    fn parse_pending_tool(&self, reply: &str, allow_shell_fallback: bool) -> Option<ToolCall> {
         if self.tools.is_empty() {
             return None;
         }
-        let call = forgetfuldb_tools::parse_tool_call(reply)?;
-        self.tools.get(&call.tool).map(|_| call)
+        if let Some(call) = forgetfuldb_tools::parse_tool_call(reply) {
+            if self.tools.get(&call.tool).is_some() {
+                return Some(call);
+            }
+        }
+        if allow_shell_fallback && self.tools.get("shell").is_some() {
+            if let Some(command) = forgetfuldb_tools::extract_shell_command(reply) {
+                return Some(Agent::shell_call(&command));
+            }
+        }
+        None
     }
 
     /// Block until all queued memory writes have been applied.

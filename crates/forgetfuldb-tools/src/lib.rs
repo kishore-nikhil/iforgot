@@ -179,6 +179,58 @@ fn fenced_blocks(text: &str) -> Vec<String> {
     parts.iter().skip(1).step_by(2).map(|s| s.to_string()).collect()
 }
 
+/// Code-fence info strings we treat as runnable shell commands.
+const SHELL_LANGS: &[&str] = &["bash", "sh", "shell", "zsh", "console", "shell-session", "terminal"];
+
+/// Fallback command detection for when a model *describes* a command in a
+/// ```bash / ```sh code block instead of emitting the structured ```tool
+/// block. Returns the first shell-tagged block's contents, cleaned of
+/// prompt markers — so the user still gets a confirmation prompt to run it.
+///
+/// Only explicitly shell-tagged fences match; a bare ``` or a ```json
+/// block is left alone to avoid offering to "run" a config snippet.
+pub fn extract_shell_command(reply: &str) -> Option<String> {
+    for (lang, body) in fenced_blocks_with_lang(reply) {
+        if SHELL_LANGS.contains(&lang.as_str()) {
+            let cmd = clean_shell_block(&body);
+            if !cmd.is_empty() {
+                return Some(cmd);
+            }
+        }
+    }
+    None
+}
+
+/// Yield `(language, body)` for each ``` fenced block. The language is the
+/// info string on the opening fence line, lowercased.
+fn fenced_blocks_with_lang(text: &str) -> Vec<(String, String)> {
+    let parts: Vec<&str> = text.split("```").collect();
+    parts
+        .iter()
+        .skip(1)
+        .step_by(2)
+        .map(|seg| {
+            let mut split = seg.splitn(2, '\n');
+            let lang = split.next().unwrap_or("").trim().to_lowercase();
+            let body = split.next().unwrap_or("").to_string();
+            (lang, body)
+        })
+        .collect()
+}
+
+/// Strip shell prompt markers (`$ `, `% `) and comment/blank lines from a
+/// code block body, leaving the runnable command(s).
+fn clean_shell_block(body: &str) -> String {
+    body.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .map(|l| l.strip_prefix("$ ").or_else(|| l.strip_prefix("% ")).unwrap_or(l))
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_string()
+}
+
 /// Parse the first `{...}` object in `s` and turn it into a ToolCall if it
 /// has a `"tool"` field. Accepts either `{"tool":"x","args":{...}}` or a
 /// flat `{"tool":"x", ...rest as args}` shape.
@@ -210,6 +262,26 @@ mod tests {
     fn ignores_command_merely_mentioned_in_prose() {
         let reply = "You could run `ifconfig` to see your IP, but I won't do it for you.";
         assert!(parse_tool_call(reply).is_none());
+    }
+
+    #[test]
+    fn extracts_command_from_bash_code_block() {
+        let reply = "Here's the command:\n```bash\nifconfig | grep inet\n```\nThat shows your IP.";
+        assert_eq!(extract_shell_command(reply).unwrap(), "ifconfig | grep inet");
+    }
+
+    #[test]
+    fn extracts_strips_prompt_markers() {
+        let reply = "```sh\n$ ls -la\n```";
+        assert_eq!(extract_shell_command(reply).unwrap(), "ls -la");
+    }
+
+    #[test]
+    fn extract_ignores_non_shell_blocks() {
+        let reply = "Config:\n```json\n{\"key\": \"value\"}\n```";
+        assert!(extract_shell_command(reply).is_none());
+        // Prose with inline code is not a runnable block either.
+        assert!(extract_shell_command("run `ls` to list files").is_none());
     }
 
     #[test]

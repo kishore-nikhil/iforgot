@@ -262,6 +262,12 @@ The LLM can only *propose* a command (via a hidden ```` ```tool ```` block
 that never reaches your screen); **nothing runs until you confirm** with
 Enter/y. Run a command yourself without the LLM via `/cmd ls -la`.
 
+Small local models often ignore the structured protocol and just *show* a
+command in a ```` ```bash ```` / ```` ```sh ```` block. iForgot detects
+that too and offers the same confirmation prompt, so "what's my IP?" leads
+to a runnable command regardless of how well the model follows
+instructions.
+
 Tools are a small trait — adding one is a single `impl` plus a line of
 registration in `forgetfuldb-tools` (see the crate docs), so the same
 confirmation flow, `/tools` listing, and server endpoints apply to every
