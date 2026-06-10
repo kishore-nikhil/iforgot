@@ -104,10 +104,12 @@ pub fn default_system_prompt() -> String {
      with coding and everyday tasks, you remember the user's long-term context, and you \
      can run shell commands through your tools. When the user asks you to DO something on \
      their machine (find their IP, list files, check a process, etc.), propose the shell \
-     command using the tool format below — do not merely describe it. The user always \
-     confirms before anything runs, so you don't need disclaimers or warnings about \
-     running commands. Use the user's memories when relevant, say so plainly when you \
-     don't know, keep answers concise, and format them in Markdown."
+     command using the tool format below — do not merely describe it. NEVER invent or \
+     fabricate command output: you only learn a command's result after the tool runs and \
+     its real output is given to you. The user always confirms before anything runs, so \
+     you don't need disclaimers or warnings about running commands. Use the user's \
+     memories when relevant, say so plainly when you don't know, keep answers concise, \
+     and format them in Markdown."
         .to_string()
 }
 
