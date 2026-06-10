@@ -78,6 +78,13 @@ pub(crate) async fn chat_completions(
         }
     }
     if body.get("model").and_then(Value::as_str).is_none_or(str::is_empty) {
+        if default_model.is_empty() {
+            return Err(anyhow::anyhow!(
+                "no model selected: pass \"model\" in the request, or set [chat] model in \
+                 forgetfuldb.toml (run `iforgot` once to pick interactively)"
+            )
+            .into());
+        }
         body["model"] = json!(default_model);
     }
 

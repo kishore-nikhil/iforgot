@@ -97,6 +97,43 @@ impl ChatBackend {
         }
     }
 
+    /// Switch the model for subsequent turns. Callers persist the change
+    /// to the config file separately.
+    pub fn set_model(&mut self, name: &str) {
+        match self {
+            ChatBackend::Ollama { model, .. } | ChatBackend::OpenAiCompat { model, .. } => {
+                *model = name.to_string();
+            }
+        }
+    }
+
+    /// Models installed on the backend server (Ollama `/api/tags` or
+    /// OpenAI-compatible `/v1/models`).
+    pub async fn list_models(&self) -> Result<Vec<String>> {
+        match self {
+            ChatBackend::Ollama { base_url, client, .. } => {
+                let v: Value = client
+                    .get(format!("{base_url}/api/tags"))
+                    .send()
+                    .await?
+                    .error_for_status()?
+                    .json()
+                    .await?;
+                Ok(parse_ollama_tags(&v))
+            }
+            ChatBackend::OpenAiCompat { base_url, client, .. } => {
+                let v: Value = client
+                    .get(format!("{base_url}/v1/models"))
+                    .send()
+                    .await?
+                    .error_for_status()?
+                    .json()
+                    .await?;
+                Ok(parse_openai_models(&v))
+            }
+        }
+    }
+
     pub fn base_url(&self) -> &str {
         match self {
             ChatBackend::Ollama { base_url, .. } | ChatBackend::OpenAiCompat { base_url, .. } => base_url,
@@ -150,6 +187,40 @@ impl ChatBackend {
             }
         }
     }
+}
+
+/// Model names from Ollama's `/api/tags` response.
+pub fn parse_ollama_tags(v: &Value) -> Vec<String> {
+    v.get("models")
+        .and_then(Value::as_array)
+        .map(|models| {
+            models
+                .iter()
+                .filter_map(|m| m.get("name").and_then(Value::as_str).map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Model ids from an OpenAI-compatible `/v1/models` response.
+pub fn parse_openai_models(v: &Value) -> Vec<String> {
+    v.get("data")
+        .and_then(Value::as_array)
+        .map(|models| {
+            models
+                .iter()
+                .filter_map(|m| m.get("id").and_then(Value::as_str).map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Do two model names refer to the same model? Ollama treats `name` and
+/// `name:latest` as equivalent.
+pub fn model_matches(a: &str, b: &str) -> bool {
+    a == b
+        || a.strip_suffix(":latest").map(|s| s == b).unwrap_or(false)
+        || b.strip_suffix(":latest").map(|s| s == a).unwrap_or(false)
 }
 
 /// What one streamed line contributed.
@@ -295,6 +366,23 @@ mod tests {
         let with_usage =
             parse_openai_line(r#"data: {"choices":[],"usage":{"prompt_tokens":99,"completion_tokens":5}}"#).unwrap();
         assert_eq!(with_usage.usage.unwrap().prompt_tokens, Some(99));
+    }
+
+    #[test]
+    fn model_list_parsing() {
+        let tags = serde_json::json!({"models": [{"name": "gemma4:12b"}, {"name": "llama3.2:3b"}]});
+        assert_eq!(parse_ollama_tags(&tags), vec!["gemma4:12b", "llama3.2:3b"]);
+        let models = serde_json::json!({"data": [{"id": "qwen2.5-7b"}]});
+        assert_eq!(parse_openai_models(&models), vec!["qwen2.5-7b"]);
+        assert!(parse_ollama_tags(&serde_json::json!({})).is_empty());
+    }
+
+    #[test]
+    fn model_name_matching_handles_latest_suffix() {
+        assert!(model_matches("gemma4:12b", "gemma4:12b"));
+        assert!(model_matches("llama3.2:latest", "llama3.2"));
+        assert!(model_matches("llama3.2", "llama3.2:latest"));
+        assert!(!model_matches("gemma4:12b", "gemma3:12b"));
     }
 
     #[test]

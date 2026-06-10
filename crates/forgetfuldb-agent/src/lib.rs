@@ -194,6 +194,16 @@ impl Agent {
         Ok(Agent { store, bloom, provider, cfg, backend, session_id, history: Vec::new() })
     }
 
+    /// Switch the chat model for this session and persist the choice to
+    /// `config_path`. The memory database is untouched: the chat model
+    /// only affects generation, never storage or embeddings.
+    pub fn set_model(&mut self, name: &str, config_path: &std::path::Path) -> Result<()> {
+        self.backend.set_model(name);
+        self.cfg.chat.model = name.to_string();
+        self.cfg.save(config_path)?;
+        Ok(())
+    }
+
     /// One full turn: ingest user message, retrieve, stream the reply
     /// (calling `on_token` per token), ingest the reply, record metrics.
     pub async fn chat_turn(&mut self, user_text: &str, on_token: &mut dyn FnMut(&str)) -> Result<TurnResult> {

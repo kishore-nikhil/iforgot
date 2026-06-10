@@ -196,6 +196,22 @@ cargo install --path crates/iforgot-chat
 iforgot                         # uses forgetfuldb.toml in the cwd
 ```
 
+On first run (or whenever the configured model isn't installed) `iforgot`
+lists the models on your backend and saves your pick to the config:
+
+```text
+  no model selected
+  models installed on the backend:
+    1. gemma4:12b
+    2. llama3.2:3b
+  select a model [1-2] ❯ 1
+  model set to gemma4:12b (saved to forgetfuldb.toml)
+```
+
+Switch anytime with `iforgot --model <name>` or `/model [name]` in chat —
+the choice persists, and the memory database is untouched (the chat model
+only affects generation, never storage or embeddings).
+
 ```text
    _ _____                          _
   (_)  ___|__  _ __ __ _  ___  ___ | |_
@@ -209,9 +225,10 @@ iforgot ❯ You prefer dark mode.
   ⏺ 1 memories | prompt 123 tok | reply 5 tok | retrieve 3ms | llm 1200ms
 ```
 
-In-chat commands: `/memories` (show the context pack behind the last
-answer, with score breakdowns), `/metrics`, `/stats`, `/consolidate`,
-`/pin <id>`, `/unpin <id>`, `/stale <id>`, `/inspect <id>`, `/quit`.
+In-chat commands: `/model [name]` (list installed models or switch),
+`/memories` (show the context pack behind the last answer, with score
+breakdowns), `/metrics`, `/stats`, `/consolidate`, `/pin <id>`,
+`/unpin <id>`, `/stale <id>`, `/inspect <id>`, `/quit`.
 
 The backend is configured in `forgetfuldb.toml` under `[chat]`:
 `backend = "ollama"` uses Ollama's native API (exact token counts);

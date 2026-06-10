@@ -28,7 +28,9 @@ local_only = true
 [chat]
 backend = "ollama"                    # "ollama" or "openai_compat" (llama-server, LM Studio, ...)
 base_url = "http://127.0.0.1:11434"
-model = "gemma3:12b"
+# Leave empty to pick interactively on first `iforgot` run (the choice is
+# saved here). Change anytime with `iforgot --model <name>` or `/model`.
+model = ""
 top_k = 6                             # memories injected per turn
 history_turns = 8                     # past exchanges kept in the prompt
 system_prompt = "You are iForgot, a local AI assistant with long-term memory. Use the memories below when they are relevant, and say so plainly when you don't know something."

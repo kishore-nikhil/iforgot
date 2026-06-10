@@ -44,7 +44,9 @@ pub struct ChatConfig {
     pub backend: String,
     /// Base URL of the local LLM server.
     pub base_url: String,
-    /// Model name to request.
+    /// Model name to request. Empty means "not selected yet": the
+    /// `iforgot` chat then lists the models installed on the backend and
+    /// persists your choice here.
     pub model: String,
     /// How many memories to inject per turn.
     pub top_k: usize,
@@ -59,7 +61,7 @@ impl Default for ChatConfig {
         ChatConfig {
             backend: "ollama".to_string(),
             base_url: "http://127.0.0.1:11434".to_string(),
-            model: "gemma3:12b".to_string(),
+            model: String::new(),
             top_k: 6,
             history_turns: 8,
             system_prompt: "You are iForgot, a local AI assistant with long-term memory. \
