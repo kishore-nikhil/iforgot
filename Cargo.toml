@@ -7,6 +7,7 @@ members = [
     "crates/forgetfuldb-store",
     "crates/forgetfuldb-retrieve",
     "crates/forgetfuldb-consolidate",
+    "crates/forgetfuldb-tools",
     "crates/forgetfuldb-cli",
     "crates/forgetfuldb-server",
     "crates/forgetfuldb-agent",
@@ -43,6 +44,7 @@ forgetfuldb-embed = { path = "crates/forgetfuldb-embed" }
 forgetfuldb-store = { path = "crates/forgetfuldb-store" }
 forgetfuldb-retrieve = { path = "crates/forgetfuldb-retrieve" }
 forgetfuldb-consolidate = { path = "crates/forgetfuldb-consolidate" }
+forgetfuldb-tools = { path = "crates/forgetfuldb-tools" }
 forgetfuldb-server = { path = "crates/forgetfuldb-server" }
 forgetfuldb-agent = { path = "crates/forgetfuldb-agent" }
 

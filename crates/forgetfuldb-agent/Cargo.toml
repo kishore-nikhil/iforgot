@@ -16,3 +16,4 @@ forgetfuldb-embed = { workspace = true }
 forgetfuldb-prob = { workspace = true }
 forgetfuldb-store = { workspace = true }
 forgetfuldb-retrieve = { workspace = true }
+forgetfuldb-tools = { workspace = true }

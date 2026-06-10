@@ -359,6 +359,7 @@ dependencies = [
  "forgetfuldb-prob",
  "forgetfuldb-retrieve",
  "forgetfuldb-store",
+ "forgetfuldb-tools",
  "futures-util",
  "reqwest",
  "serde",
@@ -442,6 +443,7 @@ dependencies = [
  "forgetfuldb-prob",
  "forgetfuldb-retrieve",
  "forgetfuldb-store",
+ "forgetfuldb-tools",
  "reqwest",
  "serde",
  "serde_json",
@@ -457,6 +459,16 @@ dependencies = [
  "forgetfuldb-embed",
  "forgetfuldb-prob",
  "rusqlite",
+ "serde_json",
+]
+
+[[package]]
+name = "forgetfuldb-tools"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "forgetfuldb-core",
+ "serde",
  "serde_json",
 ]
 

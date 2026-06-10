@@ -42,7 +42,22 @@ base_url = "http://127.0.0.1:11434"
 model = ""
 top_k = 6                             # memories injected per turn
 history_turns = 8                     # past exchanges kept in the prompt
-system_prompt = "You are iForgot, a local AI assistant with long-term memory. Use the memories below when they are relevant, and say so plainly when you don't know something."
+keep_alive = "30m"                    # how long Ollama keeps the model loaded
+# The assistant's persona. Default: a developer's assistant that remembers,
+# runs AI-assisted shell commands via tools, and is extensible for private
+# tasks. Replace with your own to repurpose iForgot.
+system_prompt = "You are iForgot, a local AI assistant for a software developer. You help with coding and day-to-day tasks, you keep track of the user's long-term memories, and you can run AI-assisted shell commands through your tools. Use the user's memories when they are relevant, and say so plainly when you don't know something. Be concise and practical. Format answers in Markdown."
+
+# Tool integration. The assistant can propose actions (e.g. shell commands);
+# in the `iforgot` CLI nothing runs until you confirm with Enter/y.
+[tools]
+enabled = true                        # may the assistant use tools at all?
+shell_enabled = true                  # allow the built-in shell tool
+shell_timeout_secs = 30               # kill a command that runs longer
+# Let the HTTP server's /tools/execute actually run tools. OFF by default:
+# an HTTP endpoint can't ask a human to confirm, so this is a remote shell.
+# Enable only on a trusted local machine.
+allow_server_execute = false
 
 [retrieval_weights]
 semantic = 0.45

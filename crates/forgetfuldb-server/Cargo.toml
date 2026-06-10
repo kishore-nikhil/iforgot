@@ -18,4 +18,5 @@ forgetfuldb-prob = { workspace = true }
 forgetfuldb-store = { workspace = true }
 forgetfuldb-retrieve = { workspace = true }
 forgetfuldb-consolidate = { workspace = true }
+forgetfuldb-tools = { workspace = true }
 forgetfuldb-agent = { workspace = true }

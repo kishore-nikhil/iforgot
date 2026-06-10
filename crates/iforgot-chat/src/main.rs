@@ -3,9 +3,12 @@
 //! grounded in retrieved memories, and per-turn token metrics are logged
 //! for context optimization.
 
+mod markdown;
+
 use anyhow::Result;
 use forgetfuldb_agent::{Agent, TurnResult};
 use forgetfuldb_consolidate::ExtractiveSummarizer;
+use markdown::MarkdownStream;
 use rustyline::error::ReadlineError;
 use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
@@ -114,11 +117,12 @@ fn main() -> Result<()> {
     }
 
     println!(
-        "{}  model {} via {} at {} | /help for commands{}",
+        "{}  model {} via {} at {} | tools: {} | /help for commands{}",
         paint(DIM),
         agent.backend.model(),
         agent.backend.name(),
         agent.backend.base_url(),
+        if agent.tool_list().is_empty() { "off" } else { "on" },
         paint(RESET)
     );
     println!();
@@ -137,35 +141,14 @@ fn main() -> Result<()> {
         let _ = editor.add_history_entry(input);
 
         if let Some(cmd) = input.strip_prefix('/') {
-            if !handle_command(cmd, &mut agent, &last_turn, &runtime, &config_path, &mut editor, paint)? {
+            if !handle_command(cmd, &mut agent, &last_turn, &runtime, &config_path, &mut editor, color, paint)? {
                 break;
             }
             continue;
         }
 
-        print!("{}iforgot ❯ {}", paint(MAGENTA), paint(RESET));
-        std::io::stdout().flush()?;
-        let result = runtime.block_on(agent.chat_turn(input, &mut |tok: &str| {
-            print!("{tok}");
-            let _ = std::io::stdout().flush();
-        }));
-        println!();
-        match result {
-            Ok(turn) => {
-                let t = &turn.turn;
-                println!(
-                    "{}  ⏺ {} memories | prompt {} tok | reply {} tok | retrieve {}ms | llm {}ms{}",
-                    paint(DIM),
-                    t.context_memory_count,
-                    t.prompt_tokens.map_or("?".into(), |v| v.to_string()),
-                    t.completion_tokens.map_or("?".into(), |v| v.to_string()),
-                    t.retrieve_duration_ms,
-                    t.llm_duration_ms.map_or("?".into(), |v| v.to_string()),
-                    paint(RESET)
-                );
-                println!();
-                last_turn = Some(turn);
-            }
+        match run_turn(&mut agent, &runtime, &mut editor, input, color, paint) {
+            Ok(turn) => last_turn = Some(turn),
             Err(e) => println!("{}  error: {e:#}{}\n", paint(MAGENTA), paint(RESET)),
         }
     }
@@ -178,6 +161,102 @@ fn main() -> Result<()> {
         paint(RESET)
     );
     Ok(())
+}
+
+/// Run a full conversational turn: stream the reply with live Markdown
+/// formatting, then drive any tool calls the model proposes — showing the
+/// command and running it only on confirmation, feeding the output back
+/// for a follow-up answer, and repeating if the model chains another tool.
+fn run_turn(
+    agent: &mut Agent,
+    runtime: &tokio::runtime::Runtime,
+    editor: &mut rustyline::DefaultEditor,
+    input: &str,
+    color: bool,
+    paint: impl Fn(&'static str) -> &'static str + Copy,
+) -> Result<TurnResult> {
+    let mut result = stream_reply(color, paint, |on_token| runtime.block_on(agent.chat_turn(input, on_token)))?;
+    print_metrics(&result.turn, paint);
+
+    while let Some(call) = result.pending_tool.clone() {
+        let preview = agent.tool_preview(&call).unwrap_or_else(|| call.tool.clone());
+        let approved = if agent.tool_requires_confirmation(&call) {
+            println!(
+                "{}  ⚙ {} wants to run:{}\n    {}{}{}",
+                paint(MAGENTA),
+                call.tool,
+                paint(RESET),
+                paint(CYAN),
+                preview,
+                paint(RESET)
+            );
+            let answer = editor.readline("  run it? [Enter/y = run, anything else = cancel] ❯ ")?;
+            let a = answer.trim().to_lowercase();
+            a.is_empty() || a == "y" || a == "yes"
+        } else {
+            true
+        };
+
+        let feedback = if approved {
+            match agent.execute_tool(&call) {
+                Ok(output) => {
+                    println!("{}{}{}", paint(DIM), indent(&output), paint(RESET));
+                    output
+                }
+                Err(e) => {
+                    println!("{}  tool error: {e}{}", paint(MAGENTA), paint(RESET));
+                    format!("error: {e}")
+                }
+            }
+        } else {
+            println!("{}  cancelled{}", paint(DIM), paint(RESET));
+            "(the user declined to run this command)".to_string()
+        };
+
+        result = stream_reply(color, paint, |on_token| {
+            runtime.block_on(agent.respond_to_tool(&call, &feedback, on_token))
+        })?;
+        print_metrics(&result.turn, paint);
+    }
+    Ok(result)
+}
+
+/// Print the assistant prefix, stream tokens through the Markdown
+/// formatter, and flush the trailing partial line.
+fn stream_reply(
+    color: bool,
+    paint: impl Fn(&'static str) -> &'static str,
+    run: impl FnOnce(&mut dyn FnMut(&str)) -> Result<TurnResult>,
+) -> Result<TurnResult> {
+    print!("{}iforgot ❯ {}", paint(MAGENTA), paint(RESET));
+    let _ = std::io::stdout().flush();
+    let mut md = MarkdownStream::new(color);
+    let result = run(&mut |tok: &str| {
+        print!("{}", md.push(tok));
+        let _ = std::io::stdout().flush();
+    });
+    print!("{}", md.finish());
+    println!();
+    result
+}
+
+fn print_metrics(t: &forgetfuldb_store::ChatTurn, paint: impl Fn(&'static str) -> &'static str) {
+    println!(
+        "{}  ⏺ {} memories | prompt {} tok | reply {} tok | retrieve {}ms | llm {}ms{}",
+        paint(DIM),
+        t.context_memory_count,
+        t.prompt_tokens.map_or("?".into(), |v| v.to_string()),
+        t.completion_tokens.map_or("?".into(), |v| v.to_string()),
+        t.retrieve_duration_ms,
+        t.llm_duration_ms.map_or("?".into(), |v| v.to_string()),
+        paint(RESET)
+    );
+    println!();
+}
+
+/// Indent multi-line tool output so it reads as a block.
+fn indent(text: &str) -> String {
+    text.lines().map(|l| format!("    {l}")).collect::<Vec<_>>().join("\n")
 }
 
 /// Numbered model picker. Returns None on empty list or EOF.
@@ -225,15 +304,24 @@ fn handle_command(
     runtime: &tokio::runtime::Runtime,
     config_path: &std::path::Path,
     editor: &mut rustyline::DefaultEditor,
+    color: bool,
     paint: impl Fn(&'static str) -> &'static str + Copy,
 ) -> Result<bool> {
     // Slash commands inspect the database, so settle any memory writes
     // still queued on the background writer first (milliseconds).
     agent.flush();
-    let mut parts = cmd.split_whitespace();
-    match (parts.next().unwrap_or(""), parts.next()) {
+    // Split into command word + raw remainder, so `/cmd` keeps spaces.
+    let (head, rest) = match cmd.split_once(char::is_whitespace) {
+        Some((h, r)) => (h, r.trim()),
+        None => (cmd, ""),
+    };
+    let arg = if rest.is_empty() { None } else { Some(rest) };
+    match (head, arg) {
         ("quit", _) | ("exit", _) => return Ok(false),
         ("help", _) => {
+            println!("  /cmd <command>   run a shell command directly (e.g. /cmd ls -la)");
+            println!("  /tools           list tools the assistant can request");
+            println!("  /prompt          show the active system prompt");
             println!("  /model [name]    list installed models, or switch (and save) the model");
             println!("  /memories        show the memories behind the last answer (with scores)");
             println!("  /stats           memory database statistics");
@@ -244,6 +332,36 @@ fn handle_command(
             println!("  /stale <id>      mark a memory stale (hidden from retrieval)");
             println!("  /inspect <id>    dump one memory as JSON");
             println!("  /quit            leave (history stays in the database)");
+            println!();
+            println!("  {}Tip: just ask in plain English (\"show my IP\") and the assistant", paint(DIM));
+            println!("  will propose a command you can approve.{}", paint(RESET));
+        }
+        ("cmd", Some(command)) | ("sh", Some(command)) | ("run", Some(command)) => {
+            // You typed it explicitly, so it runs without a confirm prompt.
+            match agent.execute_tool(&Agent::shell_call(command)) {
+                Ok(output) => println!("{}{}{}", paint(DIM), indent(&output), paint(RESET)),
+                Err(e) => println!("{}  {e}{}", paint(MAGENTA), paint(RESET)),
+            }
+        }
+        ("cmd", None) | ("sh", None) | ("run", None) => {
+            println!("  usage: /cmd <shell command>");
+        }
+        ("tools", _) => {
+            let tools = agent.tool_list();
+            if tools.is_empty() {
+                println!("  tools are disabled (set tools.enabled = true in the config)");
+            } else {
+                for t in tools {
+                    let confirm = if t.requires_confirmation { " (asks before running)" } else { "" };
+                    println!("  {}{}{}: {} — args {}{confirm}", paint(CYAN), t.name, paint(RESET), t.description, t.usage);
+                }
+            }
+        }
+        ("prompt", _) => {
+            let mut md = MarkdownStream::new(color);
+            print!("{}", md.push(agent.cfg.chat.system_prompt.trim()));
+            print!("{}", md.finish());
+            println!();
         }
         ("model", arg) => {
             let installed = runtime.block_on(agent.backend.list_models()).unwrap_or_default();

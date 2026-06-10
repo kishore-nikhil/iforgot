@@ -34,6 +34,7 @@ use forgetfuldb_prob::BloomFilter;
 use forgetfuldb_retrieve::{ContextPack, RetrieveOptions};
 use forgetfuldb_store::pipeline::{ingest, IngestRequest};
 use forgetfuldb_store::{ChatTurn, Store};
+use forgetfuldb_tools::{ToolCall, ToolRegistry};
 use std::time::Instant;
 
 /// Rough token estimate (~4 chars/token) used only when the backend
@@ -85,6 +86,7 @@ pub fn prepare_turn(
     store: &Store,
     provider: &dyn EmbeddingProvider,
     cfg: &Config,
+    system_prompt: &str,
     history: &[ChatMessage],
     user_text: &str,
 ) -> Result<PreparedTurn> {
@@ -99,7 +101,7 @@ pub fn prepare_turn(
     // the previous request, keeping the model's prefix KV-cache valid so
     // each turn only evaluates new tokens.
     let mut messages = Vec::with_capacity(history.len() + 2);
-    messages.push(ChatMessage::new("system", cfg.chat.system_prompt.clone()));
+    messages.push(ChatMessage::new("system", system_prompt.to_string()));
     messages.extend_from_slice(history);
     messages.push(ChatMessage::new("user", wrap_user_message(user_text, &pack)));
 
@@ -184,6 +186,9 @@ pub struct TurnResult {
     pub reply: String,
     pub pack: ContextPack,
     pub turn: ChatTurn,
+    /// A tool the model is asking to run, parsed from its reply. The
+    /// frontend decides whether to confirm and execute it.
+    pub pending_tool: Option<ToolCall>,
 }
 
 /// Convenience wrapper owning everything a chat frontend needs.
@@ -196,6 +201,11 @@ pub struct Agent {
     provider: Box<dyn EmbeddingProvider>,
     pub cfg: Config,
     pub backend: ChatBackend,
+    pub tools: ToolRegistry,
+    /// Base persona plus the tools section, composed once. Kept separate
+    /// from `cfg.chat.system_prompt` so persisting config (on model
+    /// switch) never bakes the tool instructions into the file.
+    system_prompt: String,
     pub session_id: String,
     history: Vec<ChatMessage>,
 }
@@ -206,8 +216,36 @@ impl Agent {
         let writer = MemoryWriter::spawn(&cfg)?;
         let provider = forgetfuldb_embed::create_provider(&cfg.embedding_backend, cfg.embedding_dim)?;
         let backend = ChatBackend::from_config(&cfg)?;
+        let tools = ToolRegistry::from_config(&cfg.tools);
+        let system_prompt = format!("{}{}", cfg.chat.system_prompt, tools.prompt_section());
         let session_id = new_id("session", "chat");
-        Ok(Agent { store, writer, provider, cfg, backend, session_id, history: Vec::new() })
+        Ok(Agent { store, writer, provider, cfg, backend, tools, system_prompt, session_id, history: Vec::new() })
+    }
+
+    /// Tools available this session.
+    pub fn tool_list(&self) -> Vec<forgetfuldb_tools::ToolInfo> {
+        self.tools.list()
+    }
+
+    /// Does running `call` need explicit user approval?
+    pub fn tool_requires_confirmation(&self, call: &ToolCall) -> bool {
+        self.tools.get(&call.tool).map(|t| t.requires_confirmation()).unwrap_or(true)
+    }
+
+    /// The literal action a call will perform (shown in the prompt).
+    pub fn tool_preview(&self, call: &ToolCall) -> Option<String> {
+        self.tools.get(&call.tool).map(|t| t.preview(&call.args))
+    }
+
+    /// Run a tool call directly. Used both for confirmed LLM proposals and
+    /// for the `/cmd` slash command.
+    pub fn execute_tool(&self, call: &ToolCall) -> Result<String> {
+        self.tools.execute(call)
+    }
+
+    /// Build a `shell` tool call for a raw command string (for `/cmd`).
+    pub fn shell_call(command: &str) -> ToolCall {
+        ToolCall { tool: "shell".to_string(), args: serde_json::json!({ "command": command }) }
     }
 
     /// Switch the chat model for this session and persist the choice to
@@ -229,12 +267,68 @@ impl Agent {
         // turn's retrieval sees them (read-your-own-writes). In practice
         // the queue drained long ago and this returns immediately.
         self.writer.flush();
-        let prepared = prepare_turn(&self.store, self.provider.as_ref(), &self.cfg, &self.history, user_text)?;
+        let prepared =
+            prepare_turn(&self.store, self.provider.as_ref(), &self.cfg, &self.system_prompt, &self.history, user_text)?;
 
         // The user message is written to memory while the model generates.
         self.writer
             .submit(WriteJob::Ingest(chat_ingest_request(&self.session_id, "user", user_text)));
 
+        let (reply, usage) = self.stream_and_record(&prepared, on_token).await?;
+        let pending_tool = self.parse_pending_tool(&reply);
+        let turn = build_chat_turn(&self.session_id, &prepared, &reply, &usage, self.backend.name(), self.backend.model());
+
+        Ok(TurnResult { reply, pack: prepared.pack, turn, pending_tool })
+    }
+
+    /// After a tool runs, feed its output back to the model for a follow-up
+    /// answer. The output is sent as a fresh user message; we skip
+    /// retrieval here (the prompt is already grounded) for speed. The model
+    /// may chain another tool call, which the frontend handles the same way.
+    pub async fn respond_to_tool(
+        &mut self,
+        call: &ToolCall,
+        output: &str,
+        on_token: &mut dyn FnMut(&str),
+    ) -> Result<TurnResult> {
+        self.writer.flush();
+        let preview = self.tool_preview(call).unwrap_or_else(|| call.tool.clone());
+        let user_text = format!(
+            "Output of tool `{}` ({}):\n```\n{}\n```\nUse this to answer my previous request.",
+            call.tool, preview, output
+        );
+        let mut messages = Vec::with_capacity(self.history.len() + 2);
+        messages.push(ChatMessage::new("system", self.system_prompt.clone()));
+        messages.extend_from_slice(&self.history);
+        messages.push(ChatMessage::new("user", user_text.clone()));
+        let prepared = PreparedTurn {
+            user_text,
+            messages,
+            pack: ContextPack { query: String::new(), generated_at: now_unix(), memories: vec![] },
+            context_chars: 0,
+            retrieve_duration_ms: 0,
+        };
+
+        // The tool output is worth remembering as a fast-decaying event.
+        self.writer.submit(WriteJob::Ingest(chat_ingest_request(
+            &self.session_id,
+            "assistant",
+            &format!("ran `{preview}` -> {output}"),
+        )));
+
+        let (reply, usage) = self.stream_and_record(&prepared, on_token).await?;
+        let pending_tool = self.parse_pending_tool(&reply);
+        let turn = build_chat_turn(&self.session_id, &prepared, &reply, &usage, self.backend.name(), self.backend.model());
+        Ok(TurnResult { reply, pack: prepared.pack, turn, pending_tool })
+    }
+
+    /// Shared tail of a turn: stream the reply, fill in usage, queue the
+    /// assistant ingest + metrics, and update history.
+    async fn stream_and_record(
+        &mut self,
+        prepared: &PreparedTurn,
+        on_token: &mut dyn FnMut(&str),
+    ) -> Result<(String, ChatUsage)> {
         let t0 = Instant::now();
         let (reply, mut usage) = self.backend.chat_stream(&prepared.messages, on_token).await?;
         if usage.llm_duration_ms.is_none() {
@@ -244,12 +338,12 @@ impl Agent {
             usage.total_duration_ms = Some(t0.elapsed().as_millis() as i64 + prepared.retrieve_duration_ms);
         }
 
-        let turn = build_chat_turn(&self.session_id, &prepared, &reply, &usage, self.backend.name(), self.backend.model());
+        let turn = build_chat_turn(&self.session_id, prepared, &reply, &usage, self.backend.name(), self.backend.model());
         if !reply.trim().is_empty() {
             self.writer
                 .submit(WriteJob::Ingest(chat_ingest_request(&self.session_id, "assistant", &reply)));
         }
-        self.writer.submit(WriteJob::RecordTurn(turn.clone()));
+        self.writer.submit(WriteJob::RecordTurn(turn));
 
         // History keeps the wrapped user message exactly as it was sent:
         // replaying different bytes next turn would invalidate the
@@ -260,8 +354,17 @@ impl Agent {
         if self.history.len() > max_msgs {
             self.history.drain(..self.history.len() - max_msgs);
         }
+        Ok((reply, usage))
+    }
 
-        Ok(TurnResult { reply, pack: prepared.pack, turn })
+    /// Parse a tool call from a reply, but only if tools are registered and
+    /// the named tool actually exists.
+    fn parse_pending_tool(&self, reply: &str) -> Option<ToolCall> {
+        if self.tools.is_empty() {
+            return None;
+        }
+        let call = forgetfuldb_tools::parse_tool_call(reply)?;
+        self.tools.get(&call.tool).map(|_| call)
     }
 
     /// Block until all queued memory writes have been applied.
@@ -291,7 +394,8 @@ mod tests {
 
         let history = [ChatMessage::new("user", "earlier message"), ChatMessage::new("assistant", "earlier reply")];
         let prepared =
-            prepare_turn(&store, provider.as_ref(), &cfg, &history, "what theme do I like?").unwrap();
+            prepare_turn(&store, provider.as_ref(), &cfg, &cfg.chat.system_prompt, &history, "what theme do I like?")
+                .unwrap();
 
         // system + 2 history + user
         assert_eq!(prepared.messages.len(), 4);
@@ -309,7 +413,8 @@ mod tests {
     #[test]
     fn current_message_does_not_retrieve_itself() {
         let (store, _bloom, provider, cfg) = setup();
-        let prepared = prepare_turn(&store, provider.as_ref(), &cfg, &[], "a brand new statement").unwrap();
+        let prepared =
+            prepare_turn(&store, provider.as_ref(), &cfg, &cfg.chat.system_prompt, &[], "a brand new statement").unwrap();
         assert!(
             prepared.pack.memories.iter().all(|m| m.item.content != "a brand new statement"),
             "the just-sent message must not appear in its own context pack"
@@ -319,7 +424,8 @@ mod tests {
     #[test]
     fn finish_turn_records_metrics_and_ingests_reply() {
         let (store, mut bloom, provider, cfg) = setup();
-        let prepared = prepare_turn(&store, provider.as_ref(), &cfg, &[], "what is my editor theme?").unwrap();
+        let prepared =
+            prepare_turn(&store, provider.as_ref(), &cfg, &cfg.chat.system_prompt, &[], "what is my editor theme?").unwrap();
         let usage = ChatUsage {
             prompt_tokens: Some(100),
             completion_tokens: Some(12),

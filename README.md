@@ -225,10 +225,16 @@ iforgot ❯ You prefer dark mode.
   ⏺ 1 memories | prompt 123 tok | reply 5 tok | retrieve 3ms | llm 1200ms
 ```
 
-In-chat commands: `/model [name]` (list installed models or switch),
-`/memories` (show the context pack behind the last answer, with score
-breakdowns), `/metrics`, `/stats`, `/consolidate`, `/pin <id>`,
-`/unpin <id>`, `/stale <id>`, `/inspect <id>`, `/quit`.
+In-chat commands: `/cmd <command>` (run a shell command directly),
+`/tools` (list available tools), `/prompt` (show the system prompt),
+`/model [name]` (list installed models or switch), `/memories` (show the
+context pack behind the last answer, with score breakdowns), `/metrics`,
+`/stats`, `/consolidate`, `/pin <id>`, `/unpin <id>`, `/stale <id>`,
+`/inspect <id>`, `/quit`.
+
+Replies are rendered with lightweight **streaming Markdown** — headings,
+lists, bold/italic and `code` are styled inline as tokens arrive, so you
+keep streaming and get readable output instead of raw `**asterisks**`.
 
 The backend is configured in `forgetfuldb.toml` under `[chat]`:
 `backend = "ollama"` uses Ollama's native API (exact token counts);
@@ -236,6 +242,36 @@ The backend is configured in `forgetfuldb.toml` under `[chat]`:
 LM Studio, or anything OpenAI-shaped. When `local_only = true`, only
 localhost URLs are accepted — and the workspace builds reqwest without
 TLS, so remote https endpoints are unreachable by construction.
+
+### Tools: let the assistant do things
+
+The assistant can run **tools** — starting with a shell command tool — so
+you can ask in plain English and approve the action:
+
+```text
+you ❯ what's my device IP?
+iforgot ❯
+  ⚙ shell wants to run:
+    ipconfig getifaddr en0
+  run it? [Enter/y = run, anything else = cancel] ❯ y
+    192.168.1.42
+iforgot ❯ Your device IP is **192.168.1.42** (interface en0).
+```
+
+The LLM can only *propose* a command (via a hidden ```` ```tool ```` block
+that never reaches your screen); **nothing runs until you confirm** with
+Enter/y. Run a command yourself without the LLM via `/cmd ls -la`.
+
+Tools are a small trait — adding one is a single `impl` plus a line of
+registration in `forgetfuldb-tools` (see the crate docs), so the same
+confirmation flow, `/tools` listing, and server endpoints apply to every
+future custom tool. Configure under `[tools]`: `enabled`, `shell_enabled`,
+`shell_timeout_secs`.
+
+On the **server**, `GET /tools` lists tools and `POST /tools/execute`
+runs one — but execution is **off by default** (`allow_server_execute`),
+because an HTTP endpoint can't ask a human to confirm. Enable it only on a
+trusted local machine.
 
 ### The memory proxy: give any chat UI long-term memory
 

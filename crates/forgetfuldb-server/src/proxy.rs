@@ -54,7 +54,10 @@ pub(crate) async fn chat_completions(
     let (prepared, base_url, default_model, client) = {
         let app = state.lock().expect("state mutex poisoned");
         let prepared = match &user_text {
-            Some(text) => Some(prepare_turn(&app.store, app.provider.as_ref(), &app.cfg, &[], text)?),
+            Some(text) => {
+                let sp = app.cfg.chat.system_prompt.clone();
+                Some(prepare_turn(&app.store, app.provider.as_ref(), &app.cfg, &sp, &[], text)?)
+            }
             None => None,
         };
         (

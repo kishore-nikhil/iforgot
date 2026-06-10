@@ -46,6 +46,9 @@ pub(crate) struct AppState {
     pub(crate) cfg: Config,
     /// Plain-HTTP client for forwarding to the local LLM (cheap to clone).
     pub(crate) http_client: reqwest::Client,
+    /// Tools the server knows about (listed by `/tools`, executed by
+    /// `/tools/execute` only when `tools.allow_server_execute` is set).
+    pub(crate) tools: forgetfuldb_tools::ToolRegistry,
 }
 
 pub(crate) type SharedState = Arc<Mutex<AppState>>;
@@ -175,6 +178,42 @@ async fn metrics_handler(State(state): State<SharedState>) -> Result<Json<serde_
     })))
 }
 
+async fn tools_handler(State(state): State<SharedState>) -> Result<Json<serde_json::Value>, ApiError> {
+    let app = state.lock().expect("state mutex poisoned");
+    Ok(Json(json!({
+        "tools": app.tools.list(),
+        // Tell clients up front whether the server will actually run a tool.
+        "execution_enabled": app.cfg.tools.allow_server_execute,
+    })))
+}
+
+#[derive(Deserialize)]
+struct ToolExecuteBody {
+    tool: String,
+    #[serde(default)]
+    args: serde_json::Value,
+}
+
+async fn tools_execute_handler(
+    State(state): State<SharedState>,
+    Json(body): Json<ToolExecuteBody>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let app = state.lock().expect("state mutex poisoned");
+    // An HTTP endpoint can't ask a human to confirm, so executing tools
+    // here is a remote shell. Refuse unless the operator explicitly
+    // opted in on a trusted local machine.
+    if !app.cfg.tools.allow_server_execute {
+        return Err(anyhow::anyhow!(
+            "tool execution over HTTP is disabled. Set tools.allow_server_execute = true to enable \
+             it (this lets clients run shell commands on this machine without confirmation)."
+        )
+        .into());
+    }
+    let call = forgetfuldb_tools::ToolCall { tool: body.tool, args: body.args };
+    let output = app.tools.execute(&call)?;
+    Ok(Json(json!({ "output": output })))
+}
+
 fn build_router(state: SharedState) -> Router {
     Router::new()
         .route("/ingest", post(ingest_handler))
@@ -183,6 +222,8 @@ fn build_router(state: SharedState) -> Router {
         .route("/memory/:id", get(memory_handler))
         .route("/stats", get(stats_handler))
         .route("/metrics", get(metrics_handler))
+        .route("/tools", get(tools_handler))
+        .route("/tools/execute", post(tools_execute_handler))
         .route("/v1/chat/completions", post(proxy::chat_completions))
         .with_state(state)
 }
@@ -194,12 +235,14 @@ pub async fn serve(cfg: Config, port: u16) -> anyhow::Result<()> {
     let bloom = warm_bloom(&store)?;
     let provider = forgetfuldb_embed::create_provider(&cfg.embedding_backend, cfg.embedding_dim)?;
     let host = if cfg.local_only { "127.0.0.1" } else { "0.0.0.0" };
+    let tools = forgetfuldb_tools::ToolRegistry::from_config(&cfg.tools);
     let state: SharedState = Arc::new(Mutex::new(AppState {
         store,
         bloom,
         provider,
         cfg,
         http_client: reqwest::Client::new(),
+        tools,
     }));
 
     let addr = format!("{host}:{port}");

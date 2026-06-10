@@ -39,6 +39,36 @@ pub struct Config {
     pub local_only: bool,
     /// Chat loop settings (used by forgetfuldb-agent / iforgot-chat).
     pub chat: ChatConfig,
+    /// Tool integration settings (shell execution and future tools).
+    pub tools: ToolsConfig,
+}
+
+/// Settings for the pluggable tool interface.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ToolsConfig {
+    /// Master switch: may the assistant use tools at all?
+    pub enabled: bool,
+    /// Allow the built-in shell tool. Execution still requires
+    /// per-command user confirmation in the CLI.
+    pub shell_enabled: bool,
+    /// Kill a shell command if it runs longer than this.
+    pub shell_timeout_secs: u64,
+    /// Let the HTTP server's `/tools/execute` actually run tools. Off by
+    /// default: an HTTP endpoint can't ask a human to confirm, so this
+    /// would be a remote shell. Enable only on a trusted local machine.
+    pub allow_server_execute: bool,
+}
+
+impl Default for ToolsConfig {
+    fn default() -> Self {
+        ToolsConfig {
+            enabled: true,
+            shell_enabled: true,
+            shell_timeout_secs: 30,
+            allow_server_execute: false,
+        }
+    }
 }
 
 /// Settings for the memory-wrapped chat loop.
@@ -66,6 +96,18 @@ pub struct ChatConfig {
     pub system_prompt: String,
 }
 
+/// The default persona: a developer's assistant that remembers, can run
+/// AI-assisted shell commands, and is extensible with tools for private
+/// local tasks. Override via `chat.system_prompt` in the config.
+pub fn default_system_prompt() -> String {
+    "You are iForgot, a local AI assistant for a software developer. You help with \
+     coding and day-to-day tasks, you keep track of the user's long-term memories, and \
+     you can run AI-assisted shell commands through your tools. Use the user's memories \
+     when they are relevant, and say so plainly when you don't know something. Be \
+     concise and practical. Format answers in Markdown."
+        .to_string()
+}
+
 impl Default for ChatConfig {
     fn default() -> Self {
         ChatConfig {
@@ -75,10 +117,7 @@ impl Default for ChatConfig {
             top_k: 6,
             history_turns: 8,
             keep_alive: "30m".to_string(),
-            system_prompt: "You are iForgot, a local AI assistant with long-term memory. \
-                Use the memories below when they are relevant, and say so plainly when \
-                you don't know something."
-                .to_string(),
+            system_prompt: default_system_prompt(),
         }
     }
 }
@@ -131,6 +170,7 @@ impl Default for Config {
             delete_after_days: 90.0,
             local_only: true,
             chat: ChatConfig::default(),
+            tools: ToolsConfig::default(),
         }
     }
 }
