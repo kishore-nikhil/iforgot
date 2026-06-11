@@ -111,6 +111,14 @@ fn main() -> Result<()> {
             resolved.config.name
         );
     }
+    if resolved.home_local_config {
+        eprintln!(
+            "warning: using a {} found in your HOME directory, not the shared global store \
+             (~/.forgetfuldb/). Move or delete {} if this is unintentional.",
+            forgetfuldb_core::config::CONFIG_FILE,
+            resolved.path.display()
+        );
+    }
     let cfg = resolved.config;
 
     match cli.command {

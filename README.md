@@ -274,6 +274,10 @@ context pack behind the last answer, with score breakdowns), `/metrics`,
 Replies are rendered with lightweight **streaming Markdown** — headings,
 lists, bold/italic and `code` are styled inline as tokens arrive, so you
 keep streaming and get readable output instead of raw `**asterisks**`.
+While you wait for the first token (retrieval, model load on a cold
+start, prompt evaluation) a small **spinner** animates after the
+`iforgot ❯` prefix and erases itself the moment the reply starts; it's
+skipped automatically when output isn't a terminal.
 
 The backend is configured in `forgetfuldb.toml` under `[chat]`:
 `backend = "ollama"` uses Ollama's native API (exact token counts);

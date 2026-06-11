@@ -270,6 +270,12 @@ pub struct ResolvedConfig {
     /// orphaned memories from an older cwd-relative session worth
     /// telling the user about.
     pub stray_local_db: bool,
+    /// True when a "project-local" `forgetfuldb.toml` was found in the
+    /// home directory itself. Home is most terminals' starting cwd, not a
+    /// project: such a config silently splits memories away from the
+    /// global store (usually a leftover from the old cwd-relative era),
+    /// so frontends should warn.
+    pub home_local_config: bool,
 }
 
 pub fn home_dir() -> Option<PathBuf> {
@@ -296,6 +302,7 @@ pub fn resolve_from(explicit: Option<&Path>, cwd: &Path, home: &Path) -> anyhow:
             path: path.to_path_buf(),
             scope: ConfigScope::Explicit,
             stray_local_db: false,
+            home_local_config: false,
         });
     }
 
@@ -303,7 +310,13 @@ pub fn resolve_from(explicit: Option<&Path>, cwd: &Path, home: &Path) -> anyhow:
     if local.exists() {
         let mut config = Config::load(&local)?;
         anchor_sqlite_path(&mut config, cwd);
-        return Ok(ResolvedConfig { config, path: local, scope: ConfigScope::Local, stray_local_db: false });
+        return Ok(ResolvedConfig {
+            config,
+            path: local,
+            scope: ConfigScope::Local,
+            stray_local_db: false,
+            home_local_config: cwd == home,
+        });
     }
 
     let dir = home.join(".forgetfuldb");
@@ -328,6 +341,7 @@ pub fn resolve_from(explicit: Option<&Path>, cwd: &Path, home: &Path) -> anyhow:
         path,
         scope: ConfigScope::Global,
         stray_local_db: cwd.join(DB_FILE).exists(),
+        home_local_config: false,
     })
 }
 
@@ -383,6 +397,25 @@ mod tests {
         assert_eq!(resolved.config.name, "myproject");
         // Relative sqlite_path anchored to the config's directory.
         assert_eq!(resolved.config.sqlite_path, cwd.join(DB_FILE).display().to_string());
+    }
+
+    #[test]
+    fn local_config_in_home_directory_is_flagged() {
+        let home = temp_dir("home-is-cwd");
+        let stray = Config { name: "main".to_string(), ..Config::default() };
+        stray.save(&home.join(CONFIG_FILE)).unwrap();
+
+        // Launched from home itself: the local config wins but is flagged.
+        let resolved = resolve_from(None, &home, &home).unwrap();
+        assert_eq!(resolved.scope, ConfigScope::Local);
+        assert!(resolved.home_local_config);
+
+        // A genuine project dir with its own config is not flagged.
+        let project = temp_dir("project");
+        stray.save(&project.join(CONFIG_FILE)).unwrap();
+        let resolved = resolve_from(None, &project, &home).unwrap();
+        assert_eq!(resolved.scope, ConfigScope::Local);
+        assert!(!resolved.home_local_config);
     }
 
     #[test]

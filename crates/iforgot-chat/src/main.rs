@@ -4,11 +4,13 @@
 //! for context optimization.
 
 mod markdown;
+mod spinner;
 
 use anyhow::Result;
 use forgetfuldb_agent::{Agent, TurnResult};
 use forgetfuldb_consolidate::ExtractiveSummarizer;
 use markdown::MarkdownStream;
+use spinner::Spinner;
 use rustyline::error::ReadlineError;
 use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
@@ -39,6 +41,7 @@ fn main() -> Result<()> {
     let config_path = resolved.path.clone();
     let scope = resolved.scope;
     let stray_local_db = resolved.stray_local_db;
+    let home_local_config = resolved.home_local_config;
 
     let runtime = tokio::runtime::Runtime::new()?;
     let mut agent = Agent::new(resolved.config)?;
@@ -64,6 +67,17 @@ fn main() -> Result<()> {
             forgetfuldb_core::config::DB_FILE,
             scope.as_str(),
             agent.cfg.name,
+            paint(RESET)
+        );
+    }
+    if home_local_config {
+        println!(
+            "{}  warning: this session uses a {} found in your HOME directory, NOT the shared \
+             global store (~/.forgetfuldb/). Sessions started elsewhere won't see these memories. \
+             If that's unintentional, move or delete {} to fall back to the global store.{}",
+            paint(MAGENTA),
+            forgetfuldb_core::config::CONFIG_FILE,
+            config_path.display(),
             paint(RESET)
         );
     }
@@ -221,8 +235,9 @@ fn run_turn(
     Ok(result)
 }
 
-/// Print the assistant prefix, stream tokens through the Markdown
-/// formatter, and flush the trailing partial line.
+/// Print the assistant prefix, spin while waiting for the first token
+/// (retrieval + model load + prompt eval), then stream tokens through the
+/// Markdown formatter and flush the trailing partial line.
 fn stream_reply(
     color: bool,
     paint: impl Fn(&'static str) -> &'static str,
@@ -230,11 +245,19 @@ fn stream_reply(
 ) -> Result<TurnResult> {
     print!("{}iforgot ❯ {}", paint(MAGENTA), paint(RESET));
     let _ = std::io::stdout().flush();
+    let mut spinner = Spinner::start(color, paint(DIM), paint(RESET));
     let mut md = MarkdownStream::new(color);
+    let mut awaiting_first_token = true;
     let result = run(&mut |tok: &str| {
+        if awaiting_first_token {
+            spinner.stop();
+            awaiting_first_token = false;
+        }
         print!("{}", md.push(tok));
         let _ = std::io::stdout().flush();
     });
+    // Empty reply or backend error: the spinner is still running.
+    spinner.stop();
     print!("{}", md.finish());
     println!();
     result
