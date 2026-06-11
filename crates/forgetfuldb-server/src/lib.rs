@@ -122,7 +122,7 @@ async fn retrieve_handler(
     let opts = RetrieveOptions {
         top_k: body.top_k.unwrap_or(10),
         include_stale: body.include_stale,
-        include_archived: false,
+        ..Default::default()
     };
     let pack = forgetfuldb_retrieve::retrieve(&app.store, app.provider.as_ref(), &app.cfg, &body.query, &opts)?;
     Ok(Json(serde_json::to_value(pack)?))

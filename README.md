@@ -78,13 +78,25 @@ Retrieval score:
 
 ```text
 retrieval_score =
-    0.45 * semantic_similarity
+  ( 0.45 * semantic_similarity
   + 0.20 * importance_score      (decay-adjusted)
   + 0.15 * recurrence_score
   + 0.10 * recency_score
   + 0.10 * pinned_boost
-  - 0.20 * staleness_penalty
+  - 0.20 * staleness_penalty )
+  * conversational_damping       (chat-path only, see below)
 ```
+
+Two chat-path refinements keep retrieval honest:
+
+- **Relevance gate** — memories scoring below `min_retrieval_score` are
+  not injected even if `top_k` isn't filled. An empty memory block beats
+  a misleading one.
+- **Conversational damping** — verbatim chat turns (chat-sourced
+  `raw_event`/`episodic` memories) get their score multiplied by
+  `conversational_damping` (default 0.6), so an old conversation can't
+  hijack the current one. Distilled `semantic`/`preference`/`procedural`
+  memories are unaffected — consolidation is the path back to full rank.
 
 Every retrieved memory comes with a full per-component score breakdown so
 you can see *why* it was selected.
@@ -224,6 +236,33 @@ you ❯ what editor theme do I like?
 iforgot ❯ You prefer dark mode.
   ⏺ 1 memories | prompt 123 tok | reply 5 tok | retrieve 3ms | llm 1200ms
 ```
+
+### Context vs memory: keeping the live conversation in charge
+
+Old memories must *support* the current conversation, never replace it.
+Four mechanisms work together (all configurable under `[chat]`):
+
+- **Contextual retrieval** (`query_context_turns`, default 2): the last
+  few raw user messages are folded into the retrieval query — never into
+  the prompt — so a vague follow-up like *"something catchier"* still
+  retrieves memories about what the conversation is actually about,
+  instead of whatever those three words match in storage.
+- **Relevance gate** (`min_retrieval_score`, default 0.25): weak matches
+  are dropped rather than injected. No memories beats wrong memories.
+- **Conversational damping** (`conversational_damping`, default 0.6):
+  verbatim turns from old chats are down-weighted in retrieval so a past
+  conversation can't hijack the present one. Facts distilled by
+  consolidation rank normally.
+- **Session exclusion**: each chat memory is tagged `session:<id>`, and
+  retrieval skips the live session's own turns — they're already in the
+  prompt as history, so re-injecting them as "memories" would only waste
+  tokens and compete with the real context.
+
+The memory block itself is framed as *background from past sessions* and
+the system prompt tells the model the live conversation wins on conflict.
+The longer-term plan — a rolling per-session working-memory summary that
+consolidates into long-term memory when the session ends — is documented
+in [docs/evolving-context.md](docs/evolving-context.md).
 
 In-chat commands: `/cmd <command>` (run a shell command directly),
 `/tools` (list available tools), `/prompt` (show the system prompt),
@@ -409,8 +448,11 @@ consolidate lifecycles against a real SQLite file.
 3. **ANN index** (HNSW) once brute force stops being instant.
 4. **Cuckoo filter** to replace Bloom where deletion support matters
    (forgetting a hash when its memory is deleted).
-5. **Session-aware consolidation**: summarize per session, then across
-   sessions.
+5. **Working memory / evolving context**: a rolling per-session summary
+   between live history and long-term retrieval, consolidated into
+   episodic/semantic memories at session end (subsumes session-aware
+   consolidation) — design in
+   [docs/evolving-context.md](docs/evolving-context.md).
 6. **launchd timer** template for nightly consolidation on macOS.
 7. **MCP server** so any MCP-capable assistant can use ForgetfulDB as a
    memory tool directly.

@@ -139,7 +139,7 @@ fn main() -> Result<()> {
         Command::Retrieve { query, top_k, include_stale } => {
             let store = open_store(&cfg)?;
             let provider = forgetfuldb_embed::create_provider(&cfg.embedding_backend, cfg.embedding_dim)?;
-            let opts = RetrieveOptions { top_k, include_stale, include_archived: false };
+            let opts = RetrieveOptions { top_k, include_stale, ..Default::default() };
             let pack = forgetfuldb_retrieve::retrieve(&store, provider.as_ref(), &cfg, &query, &opts)?;
             println!("{}", serde_json::to_string_pretty(&pack)?);
             Ok(())

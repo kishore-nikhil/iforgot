@@ -40,6 +40,23 @@ fn last_user_content(body: &Value) -> Option<String> {
         .map(str::to_string)
 }
 
+/// Up to `limit` user messages preceding the last one (oldest first).
+/// Folded into the retrieval query so vague follow-ups still retrieve
+/// memories about the conversation's topic; never added to the prompt.
+fn prior_user_contents(body: &Value, limit: usize) -> Vec<String> {
+    let Some(messages) = body.get("messages").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let mut users: Vec<String> = messages
+        .iter()
+        .filter(|m| m.get("role").and_then(Value::as_str) == Some("user"))
+        .filter_map(|m| m.get("content").and_then(Value::as_str).map(str::to_string))
+        .collect();
+    users.pop(); // the last user message is the query itself
+    let skip = users.len().saturating_sub(limit);
+    users.split_off(skip)
+}
+
 pub(crate) async fn chat_completions(
     State(state): State<SharedState>,
     Json(mut body): Json<Value>,
@@ -56,7 +73,13 @@ pub(crate) async fn chat_completions(
         let prepared = match &user_text {
             Some(text) => {
                 let sp = app.cfg.chat.system_prompt.clone();
-                Some(prepare_turn(&app.store, app.provider.as_ref(), &app.cfg, &sp, &[], text)?)
+                let query_context = prior_user_contents(&body, app.cfg.chat.query_context_turns);
+                // No session exclusion here: the proxy's session id is the
+                // constant "proxy", so excluding it would hide every
+                // proxy-learned memory ever, not just this conversation.
+                // Conversational damping covers the duplicate-injection
+                // case instead.
+                Some(prepare_turn(&app.store, app.provider.as_ref(), &app.cfg, &sp, &[], &query_context, None, text)?)
             }
             None => None,
         };
@@ -170,5 +193,21 @@ mod tests {
         });
         assert_eq!(last_user_content(&body).unwrap(), "second");
         assert!(last_user_content(&json!({"messages": []})).is_none());
+    }
+
+    #[test]
+    fn prior_user_contents_skips_the_current_query() {
+        let body = json!({
+            "messages": [
+                {"role": "user", "content": "first"},
+                {"role": "assistant", "content": "hi"},
+                {"role": "user", "content": "second"},
+                {"role": "user", "content": "current"}
+            ]
+        });
+        assert_eq!(prior_user_contents(&body, 2), vec!["first", "second"]);
+        assert_eq!(prior_user_contents(&body, 1), vec!["second"]);
+        assert!(prior_user_contents(&body, 0).is_empty());
+        assert!(prior_user_contents(&json!({"messages": []}), 2).is_empty());
     }
 }

@@ -23,17 +23,39 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct RetrieveOptions {
     pub top_k: usize,
     /// Stale memories are excluded unless explicitly requested.
     pub include_stale: bool,
     /// Archived memories are excluded unless explicitly requested.
     pub include_archived: bool,
+    /// Relevance gate: memories scoring below this are dropped even when
+    /// `top_k` isn't filled. An empty result beats a misleading one.
+    /// 0.0 (the default) keeps the historical "always return top_k"
+    /// behavior.
+    pub min_score: f64,
+    /// Exclude memories ingested by this chat session (tagged
+    /// `session:<id>`). The live conversation is already in the prompt as
+    /// history; re-injecting it as "memories" wastes tokens and competes
+    /// with itself.
+    pub exclude_session: Option<String>,
+    /// Score multiplier in (0, 1] for verbatim conversational memories
+    /// (chat-sourced raw events / episodic turns). Distilled semantic,
+    /// preference and procedural memories are unaffected. 1.0 disables.
+    pub conversational_damping: f64,
 }
 
 impl Default for RetrieveOptions {
     fn default() -> Self {
-        RetrieveOptions { top_k: 10, include_stale: false, include_archived: false }
+        RetrieveOptions {
+            top_k: 10,
+            include_stale: false,
+            include_archived: false,
+            min_score: 0.0,
+            exclude_session: None,
+            conversational_damping: 1.0,
+        }
     }
 }
 
@@ -61,6 +83,12 @@ pub fn keyword_overlap(query_tokens: &HashSet<String>, item: &MemoryItem) -> f64
     }
     let mut item_tokens: HashSet<String> = tokenize(&item.content).into_iter().collect();
     for tag in &item.tags {
+        // `session:<id>` is a system tag (used to exclude the live
+        // session from retrieval), not content — don't let the word
+        // "session" in a query match every chat memory.
+        if tag.starts_with("session:") {
+            continue;
+        }
         // `project:plotperfect` matches both "project" and "plotperfect".
         for part in tag.split(':') {
             item_tokens.insert(part.to_lowercase());
@@ -74,6 +102,13 @@ pub fn keyword_overlap(query_tokens: &HashSet<String>, item: &MemoryItem) -> f64
     }
     let hits = query_tokens.iter().filter(|t| item_tokens.contains(*t)).count();
     hits as f64 / query_tokens.len() as f64
+}
+
+/// A verbatim conversational turn: chat-sourced and never distilled into
+/// a semantic / preference / procedural fact.
+fn is_conversational(item: &MemoryItem) -> bool {
+    item.source.as_deref() == Some("chat")
+        && matches!(item.memory_type, MemoryType::RawEvent | MemoryType::Episodic)
 }
 
 /// Run hybrid retrieval and return the top-k context pack. Retrieved
@@ -90,6 +125,7 @@ pub fn retrieve(
     let query_tokens: HashSet<String> = tokenize(query).into_iter().collect();
     let lambdas = cfg.decay_lambdas();
     let weights = &cfg.retrieval_weights;
+    let session_tag = opts.exclude_session.as_ref().map(|s| format!("session:{s}"));
 
     let mut scored: Vec<RetrievedMemory> = Vec::new();
     for item in store.list_memories(None)? {
@@ -98,6 +134,13 @@ pub fn retrieve(
         }
         if item.memory_type == MemoryType::Archive && !opts.include_archived {
             continue;
+        }
+        // The excluded session's turns are already in the prompt as live
+        // history — they must not come back as "memories" of themselves.
+        if let Some(tag) = &session_tag {
+            if item.tags.iter().any(|t| t == tag) {
+                continue;
+            }
         }
 
         let cosine = item
@@ -122,7 +165,7 @@ pub fn retrieve(
             now,
         ));
 
-        let breakdown = retrieval_score(
+        let mut breakdown = retrieval_score(
             &ScoreInputs {
                 semantic_similarity,
                 importance,
@@ -133,10 +176,20 @@ pub fn retrieve(
             },
             weights,
         );
+        // Verbatim conversational turns hijack chats when re-injected:
+        // damp them so only strong matches survive, while distilled
+        // semantic/preference/procedural memories rank normally.
+        if opts.conversational_damping < 1.0 && is_conversational(&item) {
+            breakdown.conversational_damping = opts.conversational_damping;
+            breakdown.total *= opts.conversational_damping;
+        }
         scored.push(RetrievedMemory { item, score: breakdown });
     }
 
     scored.sort_by(|a, b| b.score.total.partial_cmp(&a.score.total).unwrap_or(std::cmp::Ordering::Equal));
+    if opts.min_score > 0.0 {
+        scored.retain(|m| m.score.total >= opts.min_score);
+    }
     scored.truncate(opts.top_k);
 
     // Retrieval counts as access: it slows future decay-driven cleanup.
@@ -214,6 +267,90 @@ mod tests {
         let pack = retrieve(&store, provider.as_ref(), &cfg, "billing stripe", &RetrieveOptions::default()).unwrap();
         assert_eq!(pack.memories[0].item.id, pinned_id);
         assert_eq!(pack.memories[0].score.pinned_boost, 1.0);
+    }
+
+    fn add_chat_turn(store: &Store, provider: &dyn EmbeddingProvider, cfg: &Config, text: &str, session: &str) -> String {
+        let mut bloom = warm_bloom(store).unwrap();
+        let out = ingest(
+            store,
+            &mut bloom,
+            provider,
+            cfg,
+            IngestRequest {
+                text: text.to_string(),
+                source: Some("chat".to_string()),
+                tags: vec![format!("session:{session}")],
+                memory_type: Some(MemoryType::Episodic),
+                session_id: Some(session.to_string()),
+                role: Some("user".to_string()),
+            },
+        )
+        .unwrap();
+        out.memory().id.clone()
+    }
+
+    #[test]
+    fn min_score_gates_weak_matches() {
+        let (store, provider, cfg) = setup();
+        add(&store, provider.as_ref(), &cfg, "the cat sleeps on the windowsill every afternoon", vec![]);
+
+        let open = retrieve(&store, provider.as_ref(), &cfg, "plot perfect billing stripe", &RetrieveOptions::default()).unwrap();
+        assert_eq!(open.memories.len(), 1, "no gate: weak match still returned");
+
+        let gated_opts = RetrieveOptions { min_score: 0.4, ..Default::default() };
+        let gated = retrieve(&store, provider.as_ref(), &cfg, "plot perfect billing stripe", &gated_opts).unwrap();
+        assert!(gated.memories.is_empty(), "an unrelated memory must not pass the gate");
+
+        // A direct hit still clears the same gate.
+        add(&store, provider.as_ref(), &cfg, "plot perfect billing runs on stripe invoices", vec![]);
+        let hit = retrieve(&store, provider.as_ref(), &cfg, "plot perfect billing stripe", &gated_opts).unwrap();
+        assert_eq!(hit.memories.len(), 1);
+        assert!(hit.memories[0].item.content.contains("billing"));
+    }
+
+    #[test]
+    fn excluded_session_memories_are_skipped() {
+        let (store, provider, cfg) = setup();
+        add_chat_turn(&store, provider.as_ref(), &cfg, "standup moved to nine thirty", "live");
+        add_chat_turn(&store, provider.as_ref(), &cfg, "standup notes go in the wiki", "old");
+
+        let opts = RetrieveOptions { exclude_session: Some("live".to_string()), ..Default::default() };
+        let pack = retrieve(&store, provider.as_ref(), &cfg, "standup", &opts).unwrap();
+        assert_eq!(pack.memories.len(), 1);
+        assert!(pack.memories[0].item.content.contains("wiki"));
+    }
+
+    #[test]
+    fn conversational_turns_are_damped() {
+        let (store, provider, cfg) = setup();
+        // The same fact as a verbatim chat turn and as a distilled memory.
+        add_chat_turn(&store, provider.as_ref(), &cfg, "billing for plot perfect runs on stripe", "old");
+        add(&store, provider.as_ref(), &cfg, "plot perfect billing runs on stripe invoices", vec![]);
+
+        let opts = RetrieveOptions { conversational_damping: 0.5, ..Default::default() };
+        let pack = retrieve(&store, provider.as_ref(), &cfg, "plot perfect billing stripe", &opts).unwrap();
+
+        let turn = pack.memories.iter().find(|m| m.item.memory_type == MemoryType::Episodic).unwrap();
+        let fact = pack.memories.iter().find(|m| m.item.memory_type == MemoryType::Semantic).unwrap();
+        assert_eq!(turn.score.conversational_damping, 0.5);
+        assert_eq!(fact.score.conversational_damping, 1.0, "distilled memories are never damped");
+        assert!(fact.score.total > turn.score.total, "the distilled fact must outrank the verbatim turn");
+        assert_eq!(pack.memories[0].item.id, fact.item.id);
+    }
+
+    #[test]
+    fn session_tags_do_not_leak_into_keyword_overlap() {
+        let (store, provider, cfg) = setup();
+        add_chat_turn(&store, provider.as_ref(), &cfg, "the deploy finished cleanly", "abc123");
+        let pack = retrieve(&store, provider.as_ref(), &cfg, "session abc123", &RetrieveOptions::default()).unwrap();
+        // Without the skip, keyword overlap alone would contribute 0.3
+        // (both query tokens match the tag parts). Allow a little noise
+        // from hashed-BoW collisions, but nowhere near that.
+        assert!(
+            pack.memories[0].score.semantic_similarity < 0.15,
+            "querying the word 'session' must not match the system tag: {}",
+            pack.memories[0].score.semantic_similarity
+        );
     }
 
     #[test]

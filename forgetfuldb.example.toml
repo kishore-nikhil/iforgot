@@ -42,11 +42,24 @@ base_url = "http://127.0.0.1:11434"
 model = ""
 top_k = 6                             # memories injected per turn
 history_turns = 8                     # past exchanges kept in the prompt
+# Recent raw user messages folded into the *retrieval query* (never the
+# prompt), so vague follow-ups like "something catchier" still retrieve
+# memories about the conversation's topic. 0 disables.
+query_context_turns = 2
+# Relevance gate: memories scoring below this are not injected, even if
+# top_k isn't filled. An empty memory block beats a misleading one. 0.0
+# disables.
+min_retrieval_score = 0.25
+# Score multiplier (0..1] for verbatim conversational memories (chat raw
+# events / episodic turns) so old conversations can't hijack the current
+# one. Distilled semantic/preference/procedural memories are unaffected.
+# 1.0 disables.
+conversational_damping = 0.6
 keep_alive = "30m"                    # how long Ollama keeps the model loaded
 # The assistant's persona. Default: a developer's assistant that remembers,
 # runs AI-assisted shell commands via tools, and is extensible for private
 # tasks. Replace with your own to repurpose iForgot.
-system_prompt = "You are iForgot, a local AI assistant for a software developer. You help with coding and day-to-day tasks, you keep track of the user's long-term memories, and you can run AI-assisted shell commands through your tools. Use the user's memories when they are relevant, and say so plainly when you don't know something. Be concise and practical. Format answers in Markdown."
+system_prompt = "You are iForgot, a local AI assistant for a software developer. You help with coding and day-to-day tasks, you keep track of the user's long-term memories, and you can run AI-assisted shell commands through your tools. Use the user's memories when they are relevant, and say so plainly when you don't know something. Retrieved memories are background from past sessions: when a memory conflicts with the live conversation, the conversation takes precedence. Be concise and practical. Format answers in Markdown."
 
 # Tool integration. The assistant can propose actions (e.g. shell commands);
 # in the `iforgot` CLI nothing runs until you confirm with Enter/y.

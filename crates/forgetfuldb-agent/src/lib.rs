@@ -5,9 +5,10 @@
 //!
 //! 1. the user's message is **ingested** (write) through the normal
 //!    pipeline — dedup, hashing, importance scoring
-//! 2. a context pack is **retrieved** (read) for the message and injected
-//!    into the system prompt; retrieval itself bumps access counts, so
-//!    reading is rehearsal
+//! 2. a context pack is **retrieved** (read) for the message — queried
+//!    with recent conversation context, gated by relevance, with the live
+//!    session excluded — and attached to the user message; retrieval
+//!    itself bumps access counts, so reading is rehearsal
 //! 3. the reply streams from the local LLM ([`backend::ChatBackend`]:
 //!    Ollama native or any OpenAI-compatible server)
 //! 4. the assistant's reply is ingested as a fast-decaying `raw_event`
@@ -43,12 +44,18 @@ pub fn estimate_tokens(text: &str) -> i64 {
     (text.chars().count() as i64 + 3) / 4
 }
 
-/// Render the retrieved memories as a context block.
+/// Render the retrieved memories as a context block. The framing matters:
+/// memories are *background* — small models otherwise latch onto an old
+/// topic from storage instead of what the user is talking about right now.
 pub fn memory_context_block(pack: &ContextPack) -> String {
     if pack.memories.is_empty() {
         return "(no stored memories matched this message yet)".to_string();
     }
-    let mut out = String::from("Relevant memories from long-term storage, most relevant first:\n");
+    let mut out = String::from(
+        "Background memories from past sessions, most relevant first. They may be \
+         unrelated to the current conversation; if they conflict with it, the live \
+         conversation takes precedence:\n",
+    );
     for m in &pack.memories {
         out.push_str(&format!("- [{}] {}\n", m.item.memory_type, m.item.content));
     }
@@ -82,17 +89,37 @@ pub struct PreparedTurn {
 /// asynchronously via [`MemoryWriter`] (or synchronously in the proxy),
 /// which also guarantees the current message can't rank as a "memory" of
 /// itself in its own context pack.
+///
+/// `query_context` is the last few *raw* user messages (oldest first).
+/// They are folded into the retrieval query only — never into the prompt —
+/// so a vague follow-up ("something catchier") still retrieves memories
+/// about the conversation's actual topic. `session_id`, when set, keeps
+/// this session's own turns out of the pack: they're already in `history`.
+#[allow(clippy::too_many_arguments)]
 pub fn prepare_turn(
     store: &Store,
     provider: &dyn EmbeddingProvider,
     cfg: &Config,
     system_prompt: &str,
     history: &[ChatMessage],
+    query_context: &[String],
+    session_id: Option<&str>,
     user_text: &str,
 ) -> Result<PreparedTurn> {
     let t0 = Instant::now();
-    let opts = RetrieveOptions { top_k: cfg.chat.top_k, ..Default::default() };
-    let pack = forgetfuldb_retrieve::retrieve(store, provider, cfg, user_text, &opts)?;
+    let opts = RetrieveOptions {
+        top_k: cfg.chat.top_k,
+        min_score: cfg.chat.min_retrieval_score,
+        exclude_session: session_id.map(str::to_string),
+        conversational_damping: cfg.chat.conversational_damping,
+        ..Default::default()
+    };
+    let query = if query_context.is_empty() {
+        user_text.to_string()
+    } else {
+        format!("{}\n{}", query_context.join("\n"), user_text)
+    };
+    let pack = forgetfuldb_retrieve::retrieve(store, provider, cfg, &query, &opts)?;
     let retrieve_duration_ms = t0.elapsed().as_millis() as i64;
     let context_chars: i64 = pack.memories.iter().map(|m| m.item.content.chars().count() as i64).sum();
 
@@ -115,11 +142,13 @@ pub fn prepare_turn(
 }
 
 /// The ingest request for one chat message (user or assistant role).
+/// The `session:<id>` tag lets retrieval exclude the live session's own
+/// turns from its context pack (they're already in the prompt as history).
 pub fn chat_ingest_request(session_id: &str, role: &str, text: &str) -> IngestRequest {
     IngestRequest {
         text: text.to_string(),
         source: Some("chat".to_string()),
-        tags: vec![],
+        tags: vec![format!("session:{session_id}")],
         // User turns: episodic by default (consolidation reclassifies).
         // Assistant turns: fast-decaying raw events.
         memory_type: if role == "assistant" { Some(MemoryType::RawEvent) } else { None },
@@ -208,6 +237,11 @@ pub struct Agent {
     system_prompt: String,
     pub session_id: String,
     history: Vec<ChatMessage>,
+    /// Raw recent user messages (oldest first, capped at
+    /// `chat.query_context_turns`). History keeps the *wrapped* user
+    /// messages — memory blocks included — so it can't be reused for
+    /// retrieval queries without feeding old memories back into retrieval.
+    recent_user_texts: Vec<String>,
 }
 
 impl Agent {
@@ -219,7 +253,18 @@ impl Agent {
         let tools = ToolRegistry::from_config(&cfg.tools);
         let system_prompt = format!("{}{}", cfg.chat.system_prompt, tools.prompt_section());
         let session_id = new_id("session", "chat");
-        Ok(Agent { store, writer, provider, cfg, backend, tools, system_prompt, session_id, history: Vec::new() })
+        Ok(Agent {
+            store,
+            writer,
+            provider,
+            cfg,
+            backend,
+            tools,
+            system_prompt,
+            session_id,
+            history: Vec::new(),
+            recent_user_texts: Vec::new(),
+        })
     }
 
     /// Tools available this session.
@@ -267,12 +312,27 @@ impl Agent {
         // turn's retrieval sees them (read-your-own-writes). In practice
         // the queue drained long ago and this returns immediately.
         self.writer.flush();
-        let prepared =
-            prepare_turn(&self.store, self.provider.as_ref(), &self.cfg, &self.system_prompt, &self.history, user_text)?;
+        let prepared = prepare_turn(
+            &self.store,
+            self.provider.as_ref(),
+            &self.cfg,
+            &self.system_prompt,
+            &self.history,
+            &self.recent_user_texts,
+            Some(&self.session_id),
+            user_text,
+        )?;
 
         // The user message is written to memory while the model generates.
         self.writer
             .submit(WriteJob::Ingest(chat_ingest_request(&self.session_id, "user", user_text)));
+
+        // Remember the raw text for the next turn's retrieval query.
+        self.recent_user_texts.push(user_text.to_string());
+        let cap = self.cfg.chat.query_context_turns;
+        if self.recent_user_texts.len() > cap {
+            self.recent_user_texts.drain(..self.recent_user_texts.len() - cap);
+        }
 
         let (reply, usage) = self.stream_and_record(&prepared, on_token).await?;
         // User-initiated turn: allow the ```bash code-block fallback.
@@ -408,14 +468,18 @@ mod tests {
 
     #[test]
     fn prepare_turn_builds_cache_friendly_prompt() {
-        let (store, mut bloom, provider, cfg) = setup();
+        let (store, mut bloom, provider, mut cfg) = setup();
+        // This test is about prompt *structure*; disable the relevance
+        // gate and damping so the seeded memory is always injected.
+        cfg.chat.min_retrieval_score = 0.0;
+        cfg.chat.conversational_damping = 1.0;
         // A stored memory so the context block is non-empty.
         ingest(&store, &mut bloom, provider.as_ref(), &cfg,
             chat_ingest_request("s0", "user", "I always prefer dark mode in every editor")).unwrap();
 
         let history = [ChatMessage::new("user", "earlier message"), ChatMessage::new("assistant", "earlier reply")];
         let prepared =
-            prepare_turn(&store, provider.as_ref(), &cfg, &cfg.chat.system_prompt, &history, "what theme do I like?")
+            prepare_turn(&store, provider.as_ref(), &cfg, &cfg.chat.system_prompt, &history, &[], None, "what theme do I like?")
                 .unwrap();
 
         // system + 2 history + user
@@ -435,7 +499,8 @@ mod tests {
     fn current_message_does_not_retrieve_itself() {
         let (store, _bloom, provider, cfg) = setup();
         let prepared =
-            prepare_turn(&store, provider.as_ref(), &cfg, &cfg.chat.system_prompt, &[], "a brand new statement").unwrap();
+            prepare_turn(&store, provider.as_ref(), &cfg, &cfg.chat.system_prompt, &[], &[], None, "a brand new statement")
+                .unwrap();
         assert!(
             prepared.pack.memories.iter().all(|m| m.item.content != "a brand new statement"),
             "the just-sent message must not appear in its own context pack"
@@ -446,7 +511,8 @@ mod tests {
     fn finish_turn_records_metrics_and_ingests_reply() {
         let (store, mut bloom, provider, cfg) = setup();
         let prepared =
-            prepare_turn(&store, provider.as_ref(), &cfg, &cfg.chat.system_prompt, &[], "what is my editor theme?").unwrap();
+            prepare_turn(&store, provider.as_ref(), &cfg, &cfg.chat.system_prompt, &[], &[], None, "what is my editor theme?")
+                .unwrap();
         let usage = ChatUsage {
             prompt_tokens: Some(100),
             completion_tokens: Some(12),
@@ -489,6 +555,74 @@ mod tests {
         let wrapped = wrap_user_message("when is standup", &pack);
         assert!(wrapped.ends_with("when is standup"));
         assert!(wrapped.contains("standup is at nine thirty"));
+    }
+
+    #[test]
+    fn vague_followup_retrieves_via_conversation_context() {
+        let (store, mut bloom, provider, mut cfg) = setup();
+        cfg.chat.min_retrieval_score = 0.0;
+        // A distilled fact from an older session about the live topic.
+        ingest(&store, &mut bloom, provider.as_ref(), &cfg,
+            IngestRequest {
+                text: "plot perfect is a story writing app for creating characters".into(),
+                source: Some("chat".into()), tags: vec![], memory_type: Some(MemoryType::Semantic),
+                session_id: None, role: None,
+            }).unwrap();
+
+        // The follow-up alone names no topic at all.
+        let bare = prepare_turn(
+            &store, provider.as_ref(), &cfg, &cfg.chat.system_prompt, &[], &[], None,
+            "something catchy and memorable",
+        ).unwrap();
+        // With the previous user message folded into the retrieval query,
+        // the topic memory ranks despite the vague follow-up.
+        let context = vec!["suggest names for my story writing app plot perfect".to_string()];
+        let contextual = prepare_turn(
+            &store, provider.as_ref(), &cfg, &cfg.chat.system_prompt, &[], &context, None,
+            "something catchy and memorable",
+        ).unwrap();
+
+        let top_sim = |p: &PreparedTurn| p.pack.memories.first().map(|m| m.score.semantic_similarity).unwrap_or(0.0);
+        assert!(
+            top_sim(&contextual) > top_sim(&bare),
+            "conversation context must raise similarity to the topic memory: {} vs {}",
+            top_sim(&contextual), top_sim(&bare)
+        );
+        assert!(contextual.pack.memories[0].item.content.contains("story writing"));
+        // The contextual query never leaks into the prompt itself.
+        assert!(contextual.messages.last().unwrap().content.ends_with("something catchy and memorable"));
+    }
+
+    #[test]
+    fn own_session_turns_are_not_reinjected_as_memories() {
+        let (store, mut bloom, provider, mut cfg) = setup();
+        cfg.chat.min_retrieval_score = 0.0;
+        cfg.chat.conversational_damping = 1.0;
+        // Same content ingested by two sessions.
+        ingest(&store, &mut bloom, provider.as_ref(), &cfg,
+            chat_ingest_request("live-session", "user", "the standup moved to nine thirty")).unwrap();
+        ingest(&store, &mut bloom, provider.as_ref(), &cfg,
+            chat_ingest_request("old-session", "user", "the demo is on friday afternoon")).unwrap();
+
+        let prepared = prepare_turn(
+            &store, provider.as_ref(), &cfg, &cfg.chat.system_prompt, &[], &[],
+            Some("live-session"), "when is the standup and the demo?",
+        ).unwrap();
+
+        assert!(
+            prepared.pack.memories.iter().all(|m| !m.item.content.contains("standup moved")),
+            "the live session's own turns must not come back as memories"
+        );
+        assert!(
+            prepared.pack.memories.iter().any(|m| m.item.content.contains("demo is on friday")),
+            "other sessions' memories still retrieve"
+        );
+    }
+
+    #[test]
+    fn chat_ingest_tags_the_session() {
+        let req = chat_ingest_request("s42", "user", "hello");
+        assert_eq!(req.tags, vec!["session:s42".to_string()]);
     }
 
     #[test]

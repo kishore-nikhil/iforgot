@@ -88,6 +88,22 @@ pub struct ChatConfig {
     pub top_k: usize,
     /// How many past user/assistant exchanges to keep in the prompt.
     pub history_turns: usize,
+    /// How many recent raw user messages are folded into the *retrieval
+    /// query* alongside the current one. A vague follow-up ("something
+    /// catchier") carries no topic on its own; with context the query
+    /// still knows what the conversation is about. Affects retrieval
+    /// only — the prompt sent to the model is unchanged. 0 disables.
+    pub query_context_turns: usize,
+    /// Retrieval score below which a memory is NOT injected into the
+    /// prompt, even if `top_k` isn't filled. An empty memory block is
+    /// better than a misleading one. 0.0 disables the gate.
+    pub min_retrieval_score: f64,
+    /// Score multiplier in (0, 1] applied to verbatim conversational
+    /// memories (chat-sourced raw events and episodic turns) during chat
+    /// retrieval. Old conversations re-injected verbatim are the main way
+    /// a chat gets hijacked onto a stale topic; distilled semantic /
+    /// preference / procedural memories are unaffected. 1.0 disables.
+    pub conversational_damping: f64,
     /// How long Ollama keeps the model loaded after a request (e.g.
     /// "30m", "1h", "-1" for forever). Avoids paying a full model reload
     /// after idle pauses. Ignored by openai_compat backends.
@@ -109,7 +125,9 @@ pub fn default_system_prompt() -> String {
      its real output is given to you. The user always confirms before anything runs, so \
      you don't need disclaimers or warnings about running commands. Use the user's \
      memories when relevant, say so plainly when you don't know, keep answers concise, \
-     and format them in Markdown."
+     and format them in Markdown. Retrieved memories are background from past sessions: \
+     when a memory conflicts with what the user is saying in the live conversation, the \
+     conversation always takes precedence."
         .to_string()
 }
 
@@ -121,6 +139,9 @@ impl Default for ChatConfig {
             model: String::new(),
             top_k: 6,
             history_turns: 8,
+            query_context_turns: 2,
+            min_retrieval_score: 0.25,
+            conversational_damping: 0.6,
             keep_alive: "30m".to_string(),
             system_prompt: default_system_prompt(),
         }

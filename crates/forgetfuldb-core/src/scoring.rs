@@ -63,7 +63,16 @@ pub struct ScoreBreakdown {
     pub recency: f64,
     pub pinned_boost: f64,
     pub staleness_penalty: f64,
+    /// Multiplier applied to `total` because the memory is a verbatim
+    /// conversational turn (chat raw event / episodic) rather than a
+    /// distilled fact. 1.0 means no damping was applied.
+    #[serde(default = "no_damping")]
+    pub conversational_damping: f64,
     pub total: f64,
+}
+
+fn no_damping() -> f64 {
+    1.0
 }
 
 /// Compute the weighted retrieval score with a full breakdown.
@@ -83,6 +92,7 @@ pub fn retrieval_score(inputs: &ScoreInputs, w: &RetrievalWeights) -> ScoreBreak
         recency: inputs.recency,
         pinned_boost,
         staleness_penalty,
+        conversational_damping: 1.0,
         total,
     }
 }
