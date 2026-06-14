@@ -56,15 +56,20 @@ impl Tool for ShellTool {
 
     fn execute(&self, args: &Value) -> Result<String> {
         let command = Self::command_from_args(args)?;
-        run_with_timeout(&command, self.timeout)
+        run_with_timeout(&command, self.timeout, None)
     }
 }
 
 /// Run `command` through the platform shell, killing it if it exceeds
 /// `timeout`. Output is captured after the process ends and truncated to
-/// [`MAX_OUTPUT_CHARS`].
-fn run_with_timeout(command: &str, timeout: Duration) -> Result<String> {
-    let mut child = shell_command(command)
+/// [`MAX_OUTPUT_CHARS`]. `cwd` pins the working directory (used by the
+/// read-only explore tool to anchor commands at its research root).
+pub(crate) fn run_with_timeout(command: &str, timeout: Duration, cwd: Option<&std::path::Path>) -> Result<String> {
+    let mut cmd = shell_command(command);
+    if let Some(dir) = cwd {
+        cmd.current_dir(dir);
+    }
+    let mut child = cmd
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

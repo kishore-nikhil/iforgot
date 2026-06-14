@@ -39,9 +39,13 @@ pub struct ConsolidationReport {
     pub marked_stale: usize,
     pub archived: usize,
     pub deleted: usize,
+    /// Provenance of every summary memory created this pass.
+    pub summaries: Vec<forgetfuldb_store::SummaryProvenance>,
 }
 
-/// Run a full consolidation pass.
+/// Run a full consolidation pass. Every pass is logged to the
+/// `consolidation_runs` table so the observability UI can show what each
+/// sleep cycle did.
 pub fn consolidate(store: &Store, summarizer: &dyn Summarizer, cfg: &Config) -> Result<ConsolidationReport> {
     let mut report = ConsolidationReport::default();
     let now = now_unix();
@@ -52,6 +56,19 @@ pub fn consolidate(store: &Store, summarizer: &dyn Summarizer, cfg: &Config) -> 
     promote_recurring(store, cfg, now, &mut report)?;
     mark_contradicted_stale(store, &mut report)?;
     archive_and_prune(store, cfg, now, &mut report)?;
+
+    store.log_consolidation_run(&forgetfuldb_store::ConsolidationRun {
+        id: new_id("run", &format!("consolidate-{now}")),
+        ran_at: now,
+        duplicates_merged: report.duplicates_merged as i64,
+        recurrence_updated: report.recurrence_updated as i64,
+        clusters_summarized: report.clusters_summarized as i64,
+        promoted: report.promoted_to_semantic as i64,
+        marked_stale: report.marked_stale as i64,
+        archived: report.archived as i64,
+        pruned: report.deleted as i64,
+        summaries: report.summaries.clone(),
+    })?;
 
     Ok(report)
 }
@@ -223,6 +240,10 @@ fn summarize_clusters(
                 relation: LinkRelation::DerivedFrom,
             })?;
         }
+        report.summaries.push(forgetfuldb_store::SummaryProvenance {
+            summary_id: item.id.clone(),
+            source_ids: members.iter().map(|m| m.id.clone()).collect(),
+        });
         report.clusters_summarized += 1;
     }
     Ok(())

@@ -20,9 +20,11 @@
 //! its OpenAI-compatible memory proxy.
 
 pub mod backend;
+pub mod research;
 pub mod writer;
 
 pub use backend::{ChatBackend, ChatMessage, ChatUsage};
+pub use research::{ResearchReport, RESEARCH_MAX_STEPS};
 pub use writer::{MemoryWriter, WriteJob};
 
 use anyhow::Result;
@@ -365,7 +367,13 @@ impl Agent {
         let prepared = PreparedTurn {
             user_text,
             messages,
-            pack: ContextPack { query: String::new(), generated_at: now_unix(), memories: vec![] },
+            pack: ContextPack {
+                query: String::new(),
+                generated_at: now_unix(),
+                memories: vec![],
+                min_score: 0.0,
+                near_misses: vec![],
+            },
             context_chars: 0,
             retrieve_duration_ms: 0,
         };

@@ -44,6 +44,16 @@ pub struct RetrieveOptions {
     /// (chat-sourced raw events / episodic turns). Distilled semantic,
     /// preference and procedural memories are unaffected. 1.0 disables.
     pub conversational_damping: f64,
+    /// Restrict candidates to these memory types (None = all).
+    pub memory_types: Option<Vec<MemoryType>>,
+    /// Restrict candidates to memories created at/after this unix time.
+    pub since: Option<i64>,
+    /// Restrict candidates to memories created at/before this unix time.
+    pub until: Option<i64>,
+    /// Also return near-misses: memories that scored above zero but below
+    /// `min_score`, with full breakdowns. For the retrieval inspector —
+    /// "what almost got injected".
+    pub debug: bool,
 }
 
 impl Default for RetrieveOptions {
@@ -55,6 +65,10 @@ impl Default for RetrieveOptions {
             min_score: 0.0,
             exclude_session: None,
             conversational_damping: 1.0,
+            memory_types: None,
+            since: None,
+            until: None,
+            debug: false,
         }
     }
 }
@@ -73,6 +87,13 @@ pub struct ContextPack {
     pub query: String,
     pub generated_at: i64,
     pub memories: Vec<RetrievedMemory>,
+    /// The relevance gate that was applied (0.0 = none).
+    #[serde(default)]
+    pub min_score: f64,
+    /// Debug mode only: memories that scored above zero but below the
+    /// gate. Never injected into prompts.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub near_misses: Vec<RetrievedMemory>,
 }
 
 /// Jaccard-style overlap between query tokens and memory tokens/tags/topic.
@@ -104,6 +125,9 @@ pub fn keyword_overlap(query_tokens: &HashSet<String>, item: &MemoryItem) -> f64
     hits as f64 / query_tokens.len() as f64
 }
 
+/// Cap on near-misses returned in debug mode.
+const MAX_NEAR_MISSES: usize = 20;
+
 /// A verbatim conversational turn: chat-sourced and never distilled into
 /// a semantic / preference / procedural fact.
 fn is_conversational(item: &MemoryItem) -> bool {
@@ -133,6 +157,14 @@ pub fn retrieve(
             continue;
         }
         if item.memory_type == MemoryType::Archive && !opts.include_archived {
+            continue;
+        }
+        if let Some(types) = &opts.memory_types {
+            if !types.contains(&item.memory_type) {
+                continue;
+            }
+        }
+        if opts.since.is_some_and(|s| item.created_at < s) || opts.until.is_some_and(|u| item.created_at > u) {
             continue;
         }
         // The excluded session's turns are already in the prompt as live
@@ -187,17 +219,34 @@ pub fn retrieve(
     }
 
     scored.sort_by(|a, b| b.score.total.partial_cmp(&a.score.total).unwrap_or(std::cmp::Ordering::Equal));
+    let mut near_misses = Vec::new();
     if opts.min_score > 0.0 {
+        if opts.debug {
+            near_misses = scored
+                .iter()
+                .filter(|m| m.score.total > 0.0 && m.score.total < opts.min_score)
+                .take(MAX_NEAR_MISSES)
+                .cloned()
+                .collect();
+        }
         scored.retain(|m| m.score.total >= opts.min_score);
     }
     scored.truncate(opts.top_k);
 
     // Retrieval counts as access: it slows future decay-driven cleanup.
+    // Near-misses are NOT touched — looking at what almost matched must
+    // not rehearse it.
     for hit in &scored {
         store.touch_memory(&hit.item.id, now)?;
     }
 
-    Ok(ContextPack { query: query.to_string(), generated_at: now, memories: scored })
+    Ok(ContextPack {
+        query: query.to_string(),
+        generated_at: now,
+        memories: scored,
+        min_score: opts.min_score,
+        near_misses,
+    })
 }
 
 #[cfg(test)]
@@ -351,6 +400,50 @@ mod tests {
             "querying the word 'session' must not match the system tag: {}",
             pack.memories[0].score.semantic_similarity
         );
+    }
+
+    #[test]
+    fn debug_mode_reports_near_misses() {
+        let (store, provider, cfg) = setup();
+        add(&store, provider.as_ref(), &cfg, "plot perfect billing runs on stripe invoices", vec![]);
+        add(&store, provider.as_ref(), &cfg, "the cat sleeps on the windowsill every afternoon", vec![]);
+
+        let opts = RetrieveOptions { min_score: 0.4, debug: true, ..Default::default() };
+        let pack = retrieve(&store, provider.as_ref(), &cfg, "plot perfect billing stripe", &opts).unwrap();
+        assert_eq!(pack.memories.len(), 1);
+        assert_eq!(pack.min_score, 0.4);
+        assert_eq!(pack.near_misses.len(), 1, "the weak match shows up as a near-miss");
+        assert!(pack.near_misses[0].item.content.contains("cat"));
+        assert!(pack.near_misses[0].score.total < 0.4);
+
+        // Without debug, near-misses stay private.
+        let quiet = RetrieveOptions { min_score: 0.4, ..Default::default() };
+        let pack = retrieve(&store, provider.as_ref(), &cfg, "plot perfect billing stripe", &quiet).unwrap();
+        assert!(pack.near_misses.is_empty());
+    }
+
+    #[test]
+    fn type_and_time_filters_restrict_candidates() {
+        let (store, provider, cfg) = setup();
+        let id = add(&store, provider.as_ref(), &cfg, "standup is at nine thirty", vec![]);
+
+        let wrong_type = RetrieveOptions {
+            memory_types: Some(vec![MemoryType::Preference]),
+            ..Default::default()
+        };
+        assert!(retrieve(&store, provider.as_ref(), &cfg, "standup", &wrong_type).unwrap().memories.is_empty());
+
+        let right_type = RetrieveOptions {
+            memory_types: Some(vec![MemoryType::Semantic]),
+            ..Default::default()
+        };
+        assert_eq!(retrieve(&store, provider.as_ref(), &cfg, "standup", &right_type).unwrap().memories[0].item.id, id);
+
+        let future_only = RetrieveOptions { since: Some(now_unix() + 1000), ..Default::default() };
+        assert!(retrieve(&store, provider.as_ref(), &cfg, "standup", &future_only).unwrap().memories.is_empty());
+
+        let past_window = RetrieveOptions { until: Some(now_unix() + 1000), ..Default::default() };
+        assert_eq!(retrieve(&store, provider.as_ref(), &cfg, "standup", &past_window).unwrap().memories.len(), 1);
     }
 
     #[test]

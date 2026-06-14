@@ -265,6 +265,7 @@ consolidates into long-term memory when the session ends — is documented
 in [docs/evolving-context.md](docs/evolving-context.md).
 
 In-chat commands: `/cmd <command>` (run a shell command directly),
+`/research <folder>` (read-only research agent, see below),
 `/tools` (list available tools), `/prompt` (show the system prompt),
 `/model [name]` (list installed models or switch), `/memories` (show the
 context pack behind the last answer, with score breakdowns), `/metrics`,
@@ -322,6 +323,35 @@ runs one — but execution is **off by default** (`allow_server_execute`),
 because an HTTP endpoint can't ask a human to confirm. Enable it only on a
 trusted local machine.
 
+### /research: a read-only agent that learns a project
+
+`/research <folder>` points an autonomous agent at a directory. It
+explores with **read-only commands only** — `ls`, `cat`, `head`, `tail`,
+`grep`, `rg`, `find`, `wc`, `file`, `tree`, `du`, `stat` — streams its
+progress with color-coded steps, writes a Markdown report, and distills
+3–8 key facts into semantic memories tagged `project:<folder>`, so any
+later session can answer questions about the project from memory.
+
+```text
+you ❯ /research ~/projects/tinytimer
+  ⌕ researching /Users/you/projects/tinytimer — read-only commands only, up to 12 steps
+  ⚙ [1/12] ls -la
+  ⚙ [2/12] cat README.md
+  ⚙ [3/12] head -40 src/main.swift
+iforgot ❯ ## TinyTimer — a macOS menu-bar pomodoro timer …
+  ⏺ 3 steps | 5 memories stored (tag project:tinytimer) — ask me about it anytime
+```
+
+Safety is by construction, not by approval: every command is validated
+against a hard-coded read-only allowlist before it runs (every segment of
+a pipe/`;` chain is checked), output redirection, command substitution
+and backgrounding are rejected outright, `find`'s `-delete`/`-exec`
+flags are blocked, and the working directory is pinned to the researched
+folder. `rm` can never run — which is why this is the one tool that
+doesn't ask for confirmation per command. Exploration is capped at 12
+commands per run; re-researching a project reinforces its memories
+instead of duplicating them (content-hash dedup).
+
 ### The memory proxy: give any chat UI long-term memory
 
 `forgetfuldb server` also exposes **`POST /v1/chat/completions`** — an
@@ -375,6 +405,47 @@ from OpenAI-compat backends), context share, retrieval vs LLM latency,
 and which memory IDs were injected. View it with `forgetfuldb metrics`,
 `/metrics` in chat, or `GET /metrics` — this is the dataset for tuning
 `top_k`, retrieval weights, and summary sizes against real numbers later.
+
+## Observability UI
+
+A read-only window into the memory store — *not* a memory editor — served
+by the existing axum server at **`/ui`** (no second process, localhost
+only, everything bundled — no CDN). Four views:
+
+1. **Memory Graph** — force-directed graph of memories and links. Node
+   size = importance, opacity = decay, color = memory type, amber ring =
+   pinned, desaturated = stale. The **time scrubber** recomputes decay
+   client-side as of any timestamp, so you can watch memories fade and
+   vanish across the store's lifetime. Click a node for full content,
+   scores, edges, and summary provenance; pin/unpin and archive are the
+   only write actions in the whole UI.
+2. **Retrieval Inspector** — runs the *exact chat-path* retrieval
+   (relevance gate + conversational damping) with per-component stacked
+   score bars, and shows **near-misses**: what scored but fell below the
+   gate and was never injected.
+3. **Consolidation** — timeline of sleep-cycle runs (logged to the new
+   `consolidation_runs` table) with "N memories → 1 summary" diffs.
+4. **Metrics** — token/latency/context-share charts from `chat_turns`,
+   memories by type, live decay distribution.
+
+```bash
+# build the SPA once (Node 18+)
+cd ui && npm install && npm run build && cd ..
+
+# serve any store with the UI mounted
+forgetfuldb server --ui ui/dist        # auto-detected if ./ui/dist exists
+open http://127.0.0.1:8787/ui
+
+# or explore a disposable seeded store first (~220 memories, 60 days)
+forgetfuldb demo
+forgetfuldb server --config demo/forgetfuldb.toml --ui ui/dist
+```
+
+For UI development, `cd ui && npm run dev` proxies API calls to a running
+server on 8787. The JSON endpoints behind the UI (`GET /graph`,
+`GET /uiconfig`, `GET /turns`, `GET /consolidations`,
+`POST /retrieve {"debug": true}`) are plain read-only HTTP — usable from
+scripts too.
 
 ### Plugging in models elsewhere
 

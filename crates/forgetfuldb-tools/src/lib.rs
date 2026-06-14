@@ -31,8 +31,10 @@
 //!   operator opts in (`tools.allow_server_execute`), because an HTTP
 //!   endpoint can't ask a human first.
 
+pub mod explore;
 pub mod shell;
 
+pub use explore::{validate_readonly, ExploreTool};
 pub use shell::ShellTool;
 
 use anyhow::Result;
