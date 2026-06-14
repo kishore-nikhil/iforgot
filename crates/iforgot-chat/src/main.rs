@@ -4,11 +4,13 @@
 //! for context optimization.
 
 mod markdown;
+mod spinner;
 
 use anyhow::Result;
 use forgetfuldb_agent::{Agent, TurnResult};
 use forgetfuldb_consolidate::ExtractiveSummarizer;
 use markdown::MarkdownStream;
+use spinner::Spinner;
 use rustyline::error::ReadlineError;
 use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
@@ -20,12 +22,12 @@ const DIM: &str = "\x1b[2m";
 const RESET: &str = "\x1b[0m";
 
 const LOGO: &str = r#"
-   _ _____                          _
-  (_)  ___|__  _ __ __ _  ___  ___ | |_
-  | | |_ / _ \| '__/ _` |/ _ \/ _ \| __|
-  | |  _| (_) | |  | (_| | (_) | (_) | |_
-  |_|_|  \___/|_|   \__, |\___/ \___/ \__|
-                    |___/
+   _ _____                     _
+  (_)  ___|__  _ __ __ _  ___ | |_
+  | | |_ / _ \| '__/ _` |/ _ \| __|
+  | |  _| (_) | | | (_| | (_) | |_
+  |_|_|  \___/|_|  \__, |\___/ \__|
+                   |___/
 "#;
 
 /// Value of a `--flag value` argument, if present.
@@ -39,6 +41,7 @@ fn main() -> Result<()> {
     let config_path = resolved.path.clone();
     let scope = resolved.scope;
     let stray_local_db = resolved.stray_local_db;
+    let home_local_config = resolved.home_local_config;
 
     let runtime = tokio::runtime::Runtime::new()?;
     let mut agent = Agent::new(resolved.config)?;
@@ -64,6 +67,17 @@ fn main() -> Result<()> {
             forgetfuldb_core::config::DB_FILE,
             scope.as_str(),
             agent.cfg.name,
+            paint(RESET)
+        );
+    }
+    if home_local_config {
+        println!(
+            "{}  warning: this session uses a {} found in your HOME directory, NOT the shared \
+             global store (~/.forgetfuldb/). Sessions started elsewhere won't see these memories. \
+             If that's unintentional, move or delete {} to fall back to the global store.{}",
+            paint(MAGENTA),
+            forgetfuldb_core::config::CONFIG_FILE,
+            config_path.display(),
             paint(RESET)
         );
     }
@@ -221,8 +235,9 @@ fn run_turn(
     Ok(result)
 }
 
-/// Print the assistant prefix, stream tokens through the Markdown
-/// formatter, and flush the trailing partial line.
+/// Print the assistant prefix, spin while waiting for the first token
+/// (retrieval + model load + prompt eval), then stream tokens through the
+/// Markdown formatter and flush the trailing partial line.
 fn stream_reply(
     color: bool,
     paint: impl Fn(&'static str) -> &'static str,
@@ -230,11 +245,19 @@ fn stream_reply(
 ) -> Result<TurnResult> {
     print!("{}iforgot ❯ {}", paint(MAGENTA), paint(RESET));
     let _ = std::io::stdout().flush();
+    let mut spinner = Spinner::start(color, paint(DIM), paint(RESET));
     let mut md = MarkdownStream::new(color);
+    let mut awaiting_first_token = true;
     let result = run(&mut |tok: &str| {
+        if awaiting_first_token {
+            spinner.stop();
+            awaiting_first_token = false;
+        }
         print!("{}", md.push(tok));
         let _ = std::io::stdout().flush();
     });
+    // Empty reply or backend error: the spinner is still running.
+    spinner.stop();
     print!("{}", md.finish());
     println!();
     result
@@ -257,6 +280,82 @@ fn print_metrics(t: &forgetfuldb_store::ChatTurn, paint: impl Fn(&'static str) -
 /// Indent multi-line tool output so it reads as a block.
 fn indent(text: &str) -> String {
     text.lines().map(|l| format!("    {l}")).collect::<Vec<_>>().join("\n")
+}
+
+/// Expand a leading `~/` (or bare `~`) to the home directory.
+fn expand_home(path: &str) -> PathBuf {
+    if path == "~" {
+        return forgetfuldb_core::config::home_dir().unwrap_or_else(|| PathBuf::from(path));
+    }
+    match (path.strip_prefix("~/"), forgetfuldb_core::config::home_dir()) {
+        (Some(rest), Some(home)) => home.join(rest),
+        _ => PathBuf::from(path),
+    }
+}
+
+/// Drive the research agent over `path`: each executed command prints as
+/// a color-coded step line, the model's commentary streams as Markdown
+/// between steps, and a spinner covers every wait for the next reply.
+fn run_research(
+    agent: &mut Agent,
+    runtime: &tokio::runtime::Runtime,
+    path: &std::path::Path,
+    color: bool,
+    paint: impl Fn(&'static str) -> &'static str + Copy,
+) {
+    use std::cell::RefCell;
+    let max = forgetfuldb_agent::RESEARCH_MAX_STEPS;
+    println!(
+        "{}  ⌕ researching {} — read-only commands only, up to {max} steps{}",
+        paint(CYAN),
+        path.display(),
+        paint(RESET)
+    );
+    print!("{}iforgot ❯ {}", paint(MAGENTA), paint(RESET));
+    let _ = std::io::stdout().flush();
+
+    // Both callbacks share the renderer state, so it lives in RefCells.
+    let md = RefCell::new(MarkdownStream::new(color));
+    let spinner = RefCell::new(Some(Spinner::start(color, paint(DIM), paint(RESET))));
+    let stop_spinner = |spinner: &RefCell<Option<Spinner>>| {
+        if let Some(mut s) = spinner.borrow_mut().take() {
+            s.stop();
+        }
+    };
+
+    let mut on_token = |tok: &str| {
+        stop_spinner(&spinner);
+        print!("{}", md.borrow_mut().push(tok));
+        let _ = std::io::stdout().flush();
+    };
+    let mut on_step = |step: usize, command: &str| {
+        stop_spinner(&spinner);
+        print!("{}", md.borrow_mut().finish());
+        println!();
+        println!("{}  ⚙ [{step}/{max}]{} {}{command}{}", paint(DIM), paint(RESET), paint(CYAN), paint(RESET));
+        print!("{}iforgot ❯ {}", paint(MAGENTA), paint(RESET));
+        let _ = std::io::stdout().flush();
+        *md.borrow_mut() = MarkdownStream::new(color);
+        // Spin again while the command runs and the next reply is prepared.
+        *spinner.borrow_mut() = Some(Spinner::start(color, paint(DIM), paint(RESET)));
+    };
+
+    let result = runtime.block_on(agent.research(path, &mut on_token, &mut on_step));
+    stop_spinner(&spinner);
+    print!("{}", md.borrow_mut().finish());
+    println!();
+    match result {
+        Ok(report) => println!(
+            "{}  ⏺ {} steps | {} memories stored (tag project:{}) — ask me about it anytime{}",
+            paint(DIM),
+            report.steps,
+            report.memories_stored,
+            report.project,
+            paint(RESET)
+        ),
+        Err(e) => println!("{}  research error: {e:#}{}", paint(MAGENTA), paint(RESET)),
+    }
+    println!();
 }
 
 /// Numbered model picker. Returns None on empty list or EOF.
@@ -323,6 +422,7 @@ fn handle_command(
             println!("  /tools           list tools the assistant can request");
             println!("  /prompt          show the active system prompt");
             println!("  /model [name]    list installed models, or switch (and save) the model");
+            println!("  /research <dir>  explore a folder with read-only commands and remember it");
             println!("  /memories        show the memories behind the last answer (with scores)");
             println!("  /stats           memory database statistics");
             println!("  /metrics         token & context metrics across all chat turns");
@@ -363,6 +463,8 @@ fn handle_command(
             print!("{}", md.finish());
             println!();
         }
+        ("research", Some(path)) => run_research(agent, runtime, &expand_home(path), color, paint),
+        ("research", None) => println!("  usage: /research <folder>"),
         ("model", arg) => {
             let installed = runtime.block_on(agent.backend.list_models()).unwrap_or_default();
             match arg {

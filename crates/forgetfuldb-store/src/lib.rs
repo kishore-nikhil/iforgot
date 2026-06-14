@@ -12,6 +12,7 @@ pub mod pipeline;
 use anyhow::{Context, Result};
 use forgetfuldb_core::types::{LinkRelation, MemoryItem, MemoryLink, MemoryType, RawEvent, Session};
 use rusqlite::{params, Connection, OptionalExtension, Row};
+use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::str::FromStr;
 
@@ -20,6 +21,7 @@ use std::str::FromStr;
 const MIGRATIONS: &[(&str, &str)] = &[
     ("0001_init", include_str!("../migrations/0001_init.sql")),
     ("0002_chat_turns", include_str!("../migrations/0002_chat_turns.sql")),
+    ("0003_consolidation_runs", include_str!("../migrations/0003_consolidation_runs.sql")),
 ];
 
 pub struct Store {
@@ -409,6 +411,91 @@ impl Store {
             .map_err(Into::into)
     }
 
+    /// Most recent `limit` chat turns, returned oldest-first (chart-ready).
+    pub fn list_chat_turns(&self, limit: usize) -> Result<Vec<ChatTurn>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, session_id, created_at, user_text, assistant_text, model, backend,
+                    prompt_tokens, completion_tokens, total_duration_ms, llm_duration_ms,
+                    retrieve_duration_ms, context_memory_count, context_chars, memory_ids
+             FROM chat_turns ORDER BY created_at DESC, id DESC LIMIT ?1",
+        )?;
+        let mut turns: Vec<ChatTurn> = stmt
+            .query_map([limit as i64], |r| {
+                let memory_ids: String = r.get(14)?;
+                Ok(ChatTurn {
+                    id: r.get(0)?,
+                    session_id: r.get(1)?,
+                    created_at: r.get(2)?,
+                    user_text: r.get(3)?,
+                    assistant_text: r.get(4)?,
+                    model: r.get(5)?,
+                    backend: r.get(6)?,
+                    prompt_tokens: r.get(7)?,
+                    completion_tokens: r.get(8)?,
+                    total_duration_ms: r.get(9)?,
+                    llm_duration_ms: r.get(10)?,
+                    retrieve_duration_ms: r.get(11)?,
+                    context_memory_count: r.get(12)?,
+                    context_chars: r.get(13)?,
+                    memory_ids: serde_json::from_str(&memory_ids).unwrap_or_default(),
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        turns.reverse();
+        Ok(turns)
+    }
+
+    // ---- consolidation runs ------------------------------------------------
+
+    pub fn log_consolidation_run(&self, run: &ConsolidationRun) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO consolidation_runs (
+                 id, ran_at, duplicates_merged, recurrence_updated, clusters_summarized,
+                 promoted, marked_stale, archived, pruned, summaries
+             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+            params![
+                run.id,
+                run.ran_at,
+                run.duplicates_merged,
+                run.recurrence_updated,
+                run.clusters_summarized,
+                run.promoted,
+                run.marked_stale,
+                run.archived,
+                run.pruned,
+                serde_json::to_string(&run.summaries)?,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Most recent `limit` consolidation runs, newest first.
+    pub fn list_consolidation_runs(&self, limit: usize) -> Result<Vec<ConsolidationRun>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, ran_at, duplicates_merged, recurrence_updated, clusters_summarized,
+                    promoted, marked_stale, archived, pruned, summaries
+             FROM consolidation_runs ORDER BY ran_at DESC, id DESC LIMIT ?1",
+        )?;
+        let runs = stmt
+            .query_map([limit as i64], |r| {
+                let summaries: String = r.get(9)?;
+                Ok(ConsolidationRun {
+                    id: r.get(0)?,
+                    ran_at: r.get(1)?,
+                    duplicates_merged: r.get(2)?,
+                    recurrence_updated: r.get(3)?,
+                    clusters_summarized: r.get(4)?,
+                    promoted: r.get(5)?,
+                    marked_stale: r.get(6)?,
+                    archived: r.get(7)?,
+                    pruned: r.get(8)?,
+                    summaries: serde_json::from_str(&summaries).unwrap_or_default(),
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(runs)
+    }
+
     // ---- stats -----------------------------------------------------------
 
     pub fn stats(&self) -> Result<StoreStats> {
@@ -435,8 +522,30 @@ impl Store {
     }
 }
 
+/// Provenance of one summary memory created during consolidation.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SummaryProvenance {
+    pub summary_id: String,
+    pub source_ids: Vec<String>,
+}
+
+/// One row of the `consolidation_runs` log table.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConsolidationRun {
+    pub id: String,
+    pub ran_at: i64,
+    pub duplicates_merged: i64,
+    pub recurrence_updated: i64,
+    pub clusters_summarized: i64,
+    pub promoted: i64,
+    pub marked_stale: i64,
+    pub archived: i64,
+    pub pruned: i64,
+    pub summaries: Vec<SummaryProvenance>,
+}
+
 /// One row of the `chat_turns` metrics table.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ChatTurn {
     pub id: String,
     pub session_id: Option<String>,

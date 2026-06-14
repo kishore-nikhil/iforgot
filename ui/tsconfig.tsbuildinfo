@@ -1,0 +1,1 @@
+{"root":["./src/app.tsx","./src/api.ts","./src/main.tsx","./src/usepoll.ts","./src/views/consolidationview.tsx","./src/views/graphview.tsx","./src/views/metricsview.tsx","./src/views/retrievalview.tsx"],"version":"5.9.3"}

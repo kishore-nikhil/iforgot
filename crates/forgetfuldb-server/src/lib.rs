@@ -6,18 +6,26 @@
 //!
 //! Routes:
 //! - `POST /ingest`       {"text", "source?", "tags?", "memory_type?", "session_id?", "role?"}
-//! - `POST /retrieve`     {"query", "top_k?", "include_stale?"}
+//! - `POST /retrieve`     {"query", "top_k?", "include_stale?", "debug?",
+//!   "min_score?", "memory_types?", "since?", "until?"}
 //! - `POST /consolidate`  {}
+//! - `GET  /graph`        ?since&until&types=csv&limit — nodes+edges for the UI
+//! - `GET  /uiconfig`     decay lambdas, retrieval weights, chat knobs
+//! - `GET  /turns`        ?limit — recent chat_turns rows (oldest first)
+//! - `GET  /consolidations` ?limit — logged consolidation runs
 //! - `GET  /memory/:id`
+//! - `POST /memory/:id/pin`     {"pinned": bool}
+//! - `POST /memory/:id/archive`
 //! - `GET  /stats`
 //! - `GET  /metrics`      aggregate chat-turn token/context metrics
+//! - `GET  /ui`           the observability SPA (when built/mounted)
 //! - `POST /v1/chat/completions`  OpenAI-compatible memory proxy (see
 //!   [`proxy`]): point any OpenAI-shaped chat UI here and it gains
 //!   automatic long-term memory.
 
 pub mod proxy;
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -25,6 +33,7 @@ use axum::{Json, Router};
 use forgetfuldb_consolidate::ExtractiveSummarizer;
 use forgetfuldb_core::config::Config;
 use forgetfuldb_core::types::MemoryType;
+use forgetfuldb_core::{age_days, decay, now_unix};
 use forgetfuldb_embed::EmbeddingProvider;
 use forgetfuldb_retrieve::RetrieveOptions;
 use forgetfuldb_store::pipeline::{ingest, warm_bloom, IngestRequest};
@@ -34,6 +43,7 @@ use serde::Deserialize;
 use serde_json::json;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
+use tower_http::services::{ServeDir, ServeFile};
 
 /// Shared, mutex-guarded state. SQLite connections are not Sync, and a
 /// single-writer model is exactly what a personal memory store needs.
@@ -85,6 +95,27 @@ struct RetrieveBody {
     top_k: Option<usize>,
     #[serde(default)]
     include_stale: bool,
+    /// Debug mode mirrors the chat path (config gate + damping) and also
+    /// returns near-misses with score breakdowns.
+    #[serde(default)]
+    debug: bool,
+    /// Override the relevance gate (debug defaults it from config).
+    min_score: Option<f64>,
+    /// Restrict to these memory types (names as in the schema).
+    memory_types: Option<Vec<String>>,
+    since: Option<i64>,
+    until: Option<i64>,
+}
+
+fn parse_types(names: &[String]) -> Result<Option<Vec<MemoryType>>, ApiError> {
+    if names.is_empty() {
+        return Ok(None);
+    }
+    let mut out = Vec::with_capacity(names.len());
+    for n in names {
+        out.push(MemoryType::from_str(n.trim()).map_err(|e| anyhow::anyhow!(e))?);
+    }
+    Ok(Some(out))
 }
 
 async fn ingest_handler(
@@ -119,13 +150,30 @@ async fn retrieve_handler(
     Json(body): Json<RetrieveBody>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let app = state.lock().expect("state mutex poisoned");
+    // Debug mode mirrors what the chat path would actually inject (config
+    // gate + conversational damping); plain mode keeps the historical
+    // "return everything" behavior for scripts.
+    let (default_min, damping) = if body.debug {
+        (app.cfg.chat.min_retrieval_score, app.cfg.chat.conversational_damping)
+    } else {
+        (0.0, 1.0)
+    };
     let opts = RetrieveOptions {
-        top_k: body.top_k.unwrap_or(10),
+        top_k: body.top_k.unwrap_or(app.cfg.chat.top_k.max(10)),
         include_stale: body.include_stale,
+        min_score: body.min_score.unwrap_or(default_min),
+        conversational_damping: damping,
+        memory_types: parse_types(&body.memory_types.unwrap_or_default())?,
+        since: body.since,
+        until: body.until,
+        debug: body.debug,
         ..Default::default()
     };
+    let t0 = std::time::Instant::now();
     let pack = forgetfuldb_retrieve::retrieve(&app.store, app.provider.as_ref(), &app.cfg, &body.query, &opts)?;
-    Ok(Json(serde_json::to_value(pack)?))
+    let mut value = serde_json::to_value(pack)?;
+    value["retrieve_ms"] = json!(t0.elapsed().as_millis() as i64);
+    Ok(Json(value))
 }
 
 async fn consolidate_handler(State(state): State<SharedState>) -> Result<Json<serde_json::Value>, ApiError> {
@@ -214,22 +262,223 @@ async fn tools_execute_handler(
     Ok(Json(json!({ "output": output })))
 }
 
-fn build_router(state: SharedState) -> Router {
-    Router::new()
+/// Hard cap on graph nodes per response: force layout degrades beyond
+/// this, so the server keeps the strongest (highest live decay) memories.
+const GRAPH_NODE_CAP: usize = 500;
+
+#[derive(Deserialize)]
+struct GraphQuery {
+    since: Option<i64>,
+    until: Option<i64>,
+    /// CSV of memory type names.
+    types: Option<String>,
+    limit: Option<usize>,
+}
+
+async fn graph_handler(
+    State(state): State<SharedState>,
+    Query(q): Query<GraphQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let app = state.lock().expect("state mutex poisoned");
+    let now = now_unix();
+    // Default window: the last 30 days.
+    let since = q.since.unwrap_or(now - 30 * 86_400);
+    let until = q.until.unwrap_or(i64::MAX);
+    let types: Option<Vec<MemoryType>> = match &q.types {
+        None => None,
+        Some(csv) => {
+            let mut parsed = Vec::new();
+            for part in csv.split(',').filter(|s| !s.trim().is_empty()) {
+                parsed.push(MemoryType::from_str(part.trim()).map_err(|e| anyhow::anyhow!(e))?);
+            }
+            if parsed.is_empty() { None } else { Some(parsed) }
+        }
+    };
+    let cap = q.limit.unwrap_or(GRAPH_NODE_CAP).min(GRAPH_NODE_CAP);
+    let lambdas = app.cfg.decay_lambdas();
+
+    let mut nodes: Vec<(f64, serde_json::Value)> = Vec::new();
+    let mut total_count = 0usize;
+    for item in app.store.list_memories(None)? {
+        if item.created_at < since || item.created_at > until {
+            continue;
+        }
+        if types.as_ref().is_some_and(|t| !t.contains(&item.memory_type)) {
+            continue;
+        }
+        total_count += 1;
+        // Decay as of *now*, not the stale stored column.
+        let live_decay = decay::decay_score(
+            item.importance_score,
+            lambdas.for_type(item.memory_type),
+            age_days(item.created_at, now),
+            item.pinned,
+        );
+        let preview: String = item.content.chars().take(120).collect();
+        nodes.push((
+            live_decay,
+            json!({
+                "id": item.id,
+                "content_preview": preview,
+                "memory_type": item.memory_type.as_str(),
+                "importance_score": item.importance_score,
+                "decay_score": live_decay,
+                "recurrence_score": item.recurrence_score,
+                "pinned": item.pinned,
+                "stale": item.stale,
+                "created_at": item.created_at,
+                "last_accessed_at": item.last_accessed_at,
+                "tags": item.tags,
+                "topic": item.topic,
+            }),
+        ));
+    }
+    nodes.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    nodes.truncate(cap);
+    let kept: std::collections::HashSet<String> =
+        nodes.iter().map(|(_, n)| n["id"].as_str().unwrap_or_default().to_string()).collect();
+
+    // memory_links carries no weight or timestamps (yet) — edges report a
+    // constant weight so the UI contract stays stable if that changes.
+    let edges: Vec<serde_json::Value> = app
+        .store
+        .all_links()?
+        .into_iter()
+        .filter(|l| kept.contains(&l.source_id) && kept.contains(&l.target_id))
+        .map(|l| {
+            json!({
+                "src_id": l.source_id,
+                "dst_id": l.target_id,
+                "edge_type": l.relation.as_str(),
+                "weight": 1.0,
+            })
+        })
+        .collect();
+
+    Ok(Json(json!({
+        "nodes": nodes.into_iter().map(|(_, n)| n).collect::<Vec<_>>(),
+        "edges": edges,
+        "total_count": total_count,
+        "window": { "since": since, "until": if until == i64::MAX { None } else { Some(until) } },
+        "generated_at": now,
+    })))
+}
+
+/// Read-only config slice the UI needs: decay lambdas for client-side
+/// scrubbing, plus the retrieval knobs the inspector mirrors.
+async fn uiconfig_handler(State(state): State<SharedState>) -> Result<Json<serde_json::Value>, ApiError> {
+    let app = state.lock().expect("state mutex poisoned");
+    let lambdas = app.cfg.decay_lambdas();
+    let w = &app.cfg.retrieval_weights;
+    let db_size = std::fs::metadata(&app.cfg.sqlite_path).map(|m| m.len()).unwrap_or(0);
+    Ok(Json(json!({
+        "name": app.cfg.name,
+        "db_path": app.cfg.sqlite_path,
+        "db_size_bytes": db_size,
+        "decay_lambdas": {
+            "raw_event": lambdas.raw_event,
+            "episodic": lambdas.episodic,
+            "semantic": lambdas.semantic,
+            "procedural": lambdas.procedural,
+            "preference": lambdas.preference,
+            "archive": lambdas.archive,
+        },
+        "retrieval_weights": {
+            "semantic": w.semantic,
+            "importance": w.importance,
+            "recurrence": w.recurrence,
+            "recency": w.recency,
+            "pinned_boost": w.pinned_boost,
+            "staleness_penalty": w.staleness_penalty,
+        },
+        "chat": {
+            "top_k": app.cfg.chat.top_k,
+            "min_retrieval_score": app.cfg.chat.min_retrieval_score,
+            "conversational_damping": app.cfg.chat.conversational_damping,
+        },
+    })))
+}
+
+#[derive(Deserialize)]
+struct LimitQuery {
+    limit: Option<usize>,
+}
+
+async fn turns_handler(
+    State(state): State<SharedState>,
+    Query(q): Query<LimitQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let app = state.lock().expect("state mutex poisoned");
+    let turns = app.store.list_chat_turns(q.limit.unwrap_or(200).min(2000))?;
+    Ok(Json(json!({ "turns": turns })))
+}
+
+async fn consolidations_handler(
+    State(state): State<SharedState>,
+    Query(q): Query<LimitQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let app = state.lock().expect("state mutex poisoned");
+    let runs = app.store.list_consolidation_runs(q.limit.unwrap_or(20).min(200))?;
+    Ok(Json(json!({ "runs": runs })))
+}
+
+#[derive(Deserialize)]
+struct PinBody {
+    pinned: bool,
+}
+
+async fn pin_handler(
+    State(state): State<SharedState>,
+    Path(id): Path<String>,
+    Json(body): Json<PinBody>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let app = state.lock().expect("state mutex poisoned");
+    if !app.store.set_pinned(&id, body.pinned)? {
+        return Err(anyhow::anyhow!("memory not found: {id}").into());
+    }
+    Ok(Json(json!({ "id": id, "pinned": body.pinned })))
+}
+
+async fn archive_handler(
+    State(state): State<SharedState>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let app = state.lock().expect("state mutex poisoned");
+    if !app.store.set_memory_type(&id, MemoryType::Archive)? {
+        return Err(anyhow::anyhow!("memory not found: {id}").into());
+    }
+    Ok(Json(json!({ "id": id, "memory_type": "archive" })))
+}
+
+fn build_router(state: SharedState, ui_dir: Option<&std::path::Path>) -> Router {
+    let mut router = Router::new()
         .route("/ingest", post(ingest_handler))
         .route("/retrieve", post(retrieve_handler))
         .route("/consolidate", post(consolidate_handler))
+        .route("/graph", get(graph_handler))
+        .route("/uiconfig", get(uiconfig_handler))
+        .route("/turns", get(turns_handler))
+        .route("/consolidations", get(consolidations_handler))
         .route("/memory/:id", get(memory_handler))
+        .route("/memory/:id/pin", post(pin_handler))
+        .route("/memory/:id/archive", post(archive_handler))
         .route("/stats", get(stats_handler))
         .route("/metrics", get(metrics_handler))
         .route("/tools", get(tools_handler))
         .route("/tools/execute", post(tools_execute_handler))
-        .route("/v1/chat/completions", post(proxy::chat_completions))
-        .with_state(state)
+        .route("/v1/chat/completions", post(proxy::chat_completions));
+    if let Some(dir) = ui_dir {
+        // SPA fallback: unknown paths under /ui get index.html so client
+        // routing (if any) works. Inherits the same localhost-only bind.
+        let serve = ServeDir::new(dir).fallback(ServeFile::new(dir.join("index.html")));
+        router = router.nest_service("/ui", serve);
+    }
+    router.with_state(state)
 }
 
 /// Open the store and serve the API. Blocks until shutdown (ctrl-c).
-pub async fn serve(cfg: Config, port: u16) -> anyhow::Result<()> {
+/// `ui_dir`, when set, mounts the built observability SPA at `/ui`.
+pub async fn serve(cfg: Config, port: u16, ui_dir: Option<std::path::PathBuf>) -> anyhow::Result<()> {
     forgetfuldb_agent::backend::ensure_local_url(&cfg)?;
     let store = Store::open(std::path::Path::new(&cfg.sqlite_path))?;
     let bloom = warm_bloom(&store)?;
@@ -248,6 +497,9 @@ pub async fn serve(cfg: Config, port: u16) -> anyhow::Result<()> {
     let addr = format!("{host}:{port}");
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     eprintln!("forgetfuldb-server listening on http://{addr}");
-    axum::serve(listener, build_router(state)).await?;
+    if let Some(dir) = &ui_dir {
+        eprintln!("observability UI at http://{addr}/ui (serving {})", dir.display());
+    }
+    axum::serve(listener, build_router(state, ui_dir.as_deref())).await?;
     Ok(())
 }

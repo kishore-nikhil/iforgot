@@ -20,3 +20,4 @@ forgetfuldb-retrieve = { workspace = true }
 forgetfuldb-consolidate = { workspace = true }
 forgetfuldb-tools = { workspace = true }
 forgetfuldb-agent = { workspace = true }
+tower-http = { workspace = true }

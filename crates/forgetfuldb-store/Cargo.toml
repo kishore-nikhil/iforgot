@@ -8,6 +8,7 @@ description = "SQLite persistence layer for ForgetfulDB"
 [dependencies]
 anyhow = { workspace = true }
 rusqlite = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
 forgetfuldb-core = { workspace = true }
 forgetfuldb-embed = { workspace = true }

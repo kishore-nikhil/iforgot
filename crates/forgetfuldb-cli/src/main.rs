@@ -1,5 +1,7 @@
 //! forgetfuldb — local-first AI memory database CLI.
 
+mod demo;
+
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use forgetfuldb_consolidate::ExtractiveSummarizer;
@@ -87,10 +89,21 @@ enum Command {
         #[arg(long)]
         off: bool,
     },
-    /// Run the local HTTP API
+    /// Run the local HTTP API (and the observability UI at /ui)
     Server {
         #[arg(long, default_value_t = 8787)]
         port: u16,
+        /// Directory of the built observability SPA (ui/dist). Default:
+        /// ./ui/dist when it exists; pass --ui to point elsewhere.
+        #[arg(long)]
+        ui: Option<PathBuf>,
+    },
+    /// Create a self-contained demo store (~200 memories over 60 simulated
+    /// days, links, chat turns, consolidation runs) to explore the UI with
+    Demo {
+        /// Directory for the demo config + database (created if missing)
+        #[arg(long, default_value = "demo")]
+        dir: PathBuf,
     },
 }
 
@@ -109,6 +122,14 @@ fn main() -> Result<()> {
             forgetfuldb_core::config::DB_FILE,
             resolved.scope.as_str(),
             resolved.config.name
+        );
+    }
+    if resolved.home_local_config {
+        eprintln!(
+            "warning: using a {} found in your HOME directory, not the shared global store \
+             (~/.forgetfuldb/). Move or delete {} if this is unintentional.",
+            forgetfuldb_core::config::CONFIG_FILE,
+            resolved.path.display()
         );
     }
     let cfg = resolved.config;
@@ -200,10 +221,16 @@ fn main() -> Result<()> {
             println!("{} {id}", if off { "unpinned" } else { "pinned" });
             Ok(())
         }
-        Command::Server { port } => {
+        Command::Server { port, ui } => {
+            // Auto-detect a built UI next to the cwd unless told otherwise.
+            let ui_dir = ui.or_else(|| {
+                let default = PathBuf::from("ui/dist");
+                default.join("index.html").exists().then_some(default)
+            });
             let runtime = tokio::runtime::Runtime::new()?;
-            runtime.block_on(forgetfuldb_server::serve(cfg, port))
+            runtime.block_on(forgetfuldb_server::serve(cfg, port, ui_dir))
         }
+        Command::Demo { dir } => demo::seed(&dir),
     }
 }
 
