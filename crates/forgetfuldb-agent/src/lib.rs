@@ -247,10 +247,27 @@ pub struct Agent {
 }
 
 impl Agent {
-    pub fn new(cfg: Config) -> Result<Agent> {
+    pub fn new(mut cfg: Config) -> Result<Agent> {
         let store = Store::open(std::path::Path::new(&cfg.sqlite_path))?;
+        // Build the embedding provider first. If a configured Ollama model
+        // is unreachable at startup, don't brick the whole session — warn
+        // and fall back to the built-in hashed_bow so chat still works (the
+        // dimension-mismatch warning then nudges the user to fix/re-embed).
+        let provider = match forgetfuldb_embed::create_provider_from_config(&cfg) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!(
+                    "warning: embedding backend '{}' unavailable ({e}); falling back to hashed_bow for this session",
+                    cfg.embedding_backend
+                );
+                cfg.embedding_backend = "hashed_bow".to_string();
+                cfg.embedding_model = String::new();
+                forgetfuldb_embed::create_provider_from_config(&cfg)?
+            }
+        };
+        // Spawn the writer with the (possibly fallen-back) config so reads
+        // and writes always embed with the same model.
         let writer = MemoryWriter::spawn(&cfg)?;
-        let provider = forgetfuldb_embed::create_provider(&cfg.embedding_backend, cfg.embedding_dim)?;
         let backend = ChatBackend::from_config(&cfg)?;
         let tools = ToolRegistry::from_config(&cfg.tools);
         let system_prompt = format!("{}{}", cfg.chat.system_prompt, tools.prompt_section());
@@ -303,6 +320,56 @@ impl Agent {
         self.cfg.chat.model = name.to_string();
         self.cfg.save(config_path)?;
         Ok(())
+    }
+
+    /// Switch the embedding backend/model and **re-embed the whole store**,
+    /// because vectors from different models are not comparable. The new
+    /// provider is built and validated (Ollama reachable, model exists)
+    /// *before* anything is touched, so a bad choice changes nothing. On
+    /// success the retrieval provider is swapped, the background writer is
+    /// respawned (so new ingests embed with the new model too), and the
+    /// choice is persisted. Returns the number of memories re-embedded.
+    pub fn set_embedding(
+        &mut self,
+        backend: &str,
+        model: &str,
+        config_path: &std::path::Path,
+        on_progress: impl FnMut(usize, usize),
+    ) -> Result<usize> {
+        // Validate first: this is where an unreachable Ollama or a missing
+        // model fails, leaving the session exactly as it was.
+        let mut new_cfg = self.cfg.clone();
+        new_cfg.embedding_backend = backend.to_string();
+        new_cfg.embedding_model = model.to_string();
+        let provider = forgetfuldb_embed::create_provider_from_config(&new_cfg)?;
+
+        // Settle pending writes, then re-embed against the settled store.
+        self.writer.flush();
+        let label = if model.is_empty() { backend.to_string() } else { model.to_string() };
+        let n = forgetfuldb_store::pipeline::reembed_all(&self.store, provider.as_ref(), &label, on_progress)?;
+
+        // Commit: swap retrieval provider, respawn the writer with the new
+        // config, persist. The old writer drops (its thread drains + joins).
+        self.provider = provider;
+        self.cfg = new_cfg;
+        self.writer = MemoryWriter::spawn(&self.cfg)?;
+        self.cfg.save(config_path)?;
+        Ok(n)
+    }
+
+    /// A warning if the stored vectors don't match the active embedding
+    /// provider's dimension (model changed without re-embedding), else None.
+    pub fn embedding_warning(&self) -> Option<String> {
+        forgetfuldb_store::pipeline::embedding_mismatch_warning(&self.store, self.provider.as_ref())
+    }
+
+    /// The active embedding identity, for the banner / `/embed` display.
+    pub fn embedding_label(&self) -> String {
+        if self.cfg.embedding_backend == "hashed_bow" {
+            format!("hashed_bow ({}-dim, built-in)", self.provider.dim())
+        } else {
+            format!("{} ({}-dim, via {})", self.cfg.embedding_model, self.provider.dim(), self.cfg.embedding_backend)
+        }
     }
 
     /// One full turn: retrieve context (the only synchronous memory work),

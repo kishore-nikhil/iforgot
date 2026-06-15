@@ -28,6 +28,7 @@ export const TYPE_COLORS: Record<MemoryTypeName, string> = {
 };
 
 export const EDGE_COLORS: Record<string, string> = {
+  co_occurred: '#2dd4bf',
   derived_from: '#3fb950',
   updates: '#d29922',
   contradicts: '#f85149',
@@ -59,6 +60,7 @@ export interface GraphEdge {
   dst_id: string;
   edge_type: string;
   weight: number;
+  co_count?: number;
 }
 
 export interface GraphResponse {
@@ -77,6 +79,7 @@ export interface ScoreBreakdown {
   pinned_boost: number;
   staleness_penalty: number;
   conversational_damping: number;
+  association_boost?: number;
   total: number;
 }
 

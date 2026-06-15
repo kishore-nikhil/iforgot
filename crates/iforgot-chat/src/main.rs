@@ -139,6 +139,10 @@ fn main() -> Result<()> {
         if agent.tool_list().is_empty() { "off" } else { "on" },
         paint(RESET)
     );
+    println!("{}  embeddings: {} — switch with /embed{}", paint(DIM), agent.embedding_label(), paint(RESET));
+    if let Some(warn) = agent.embedding_warning() {
+        println!("{}  warning: {warn}{}", paint(MAGENTA), paint(RESET));
+    }
     println!();
     let mut last_turn: Option<TurnResult> = None;
 
@@ -282,6 +286,49 @@ fn indent(text: &str) -> String {
     text.lines().map(|l| format!("    {l}")).collect::<Vec<_>>().join("\n")
 }
 
+/// Heuristic: is this Ollama model an embedding model? Embedding models
+/// usually say so in the name; a few well-known families don't.
+fn is_embedding_model(name: &str) -> bool {
+    let n = name.to_lowercase();
+    n.contains("embed")
+        || ["bge", "all-minilm", "paraphrase-multilingual", "snowflake-arctic", "granite-embedding"]
+            .iter()
+            .any(|p| n.starts_with(p))
+}
+
+/// Switch the embedding model and re-embed the store, with a progress
+/// line. `choice` is "hashed_bow" or an Ollama embedding model name.
+fn switch_embedding(
+    agent: &mut Agent,
+    choice: &str,
+    config_path: &std::path::Path,
+    paint: impl Fn(&'static str) -> &'static str,
+) -> Result<()> {
+    let (backend, model) = if choice == "hashed_bow" { ("hashed_bow", "") } else { ("ollama", choice) };
+    if agent.cfg.embedding_backend == backend && agent.cfg.embedding_model == model {
+        println!("  already using {}", agent.embedding_label());
+        return Ok(());
+    }
+    let label = if model.is_empty() { backend } else { model };
+    println!("{}  switching embeddings to {label} — re-embedding the store…{}", paint(DIM), paint(RESET));
+    let res = agent.set_embedding(backend, model, config_path, |done, total| {
+        if done == total || done % 25 == 0 {
+            print!("\r    {done}/{total}");
+            let _ = std::io::stdout().flush();
+        }
+    });
+    match res {
+        Ok(n) => println!("\r  re-embedded {n} memories; now using {} (saved)            ", agent.embedding_label()),
+        Err(e) => println!(
+            "{}  embedding switch failed: {e:#}{}\n  still using {}",
+            paint(MAGENTA),
+            paint(RESET),
+            agent.embedding_label()
+        ),
+    }
+    Ok(())
+}
+
 /// Expand a leading `~/` (or bare `~`) to the home directory.
 fn expand_home(path: &str) -> PathBuf {
     if path == "~" {
@@ -422,6 +469,7 @@ fn handle_command(
             println!("  /tools           list tools the assistant can request");
             println!("  /prompt          show the active system prompt");
             println!("  /model [name]    list installed models, or switch (and save) the model");
+            println!("  /embed [name]    list embedding models, or switch (re-embeds the store)");
             println!("  /research <dir>  explore a folder with read-only commands and remember it");
             println!("  /memories        show the memories behind the last answer (with scores)");
             println!("  /stats           memory database statistics");
@@ -495,6 +543,34 @@ fn handle_command(
                     }
                     None => println!("  current model: {}", agent.backend.model()),
                 },
+            }
+        }
+        ("embed", arg) => {
+            // Offer hashed_bow plus any embedding-capable models the
+            // backend reports. The chat backend is normally the same
+            // Ollama, so its model list is the right source.
+            let installed = runtime.block_on(agent.backend.list_models()).unwrap_or_default();
+            let mut options: Vec<String> = vec!["hashed_bow".to_string()];
+            options.extend(installed.into_iter().filter(|m| is_embedding_model(m)));
+            match arg {
+                Some(name) => switch_embedding(agent, name, config_path, paint)?,
+                None => {
+                    println!("  current: {}", agent.embedding_label());
+                    for (i, o) in options.iter().enumerate() {
+                        let tag = if o == "hashed_bow" { "  (built-in default, offline)" } else { "" };
+                        println!("    {}. {}{}", i + 1, o, tag);
+                    }
+                    let answer = editor.readline("  switch to [number/name, Enter to cancel] ❯ ")?;
+                    let a = answer.trim();
+                    if !a.is_empty() {
+                        let chosen = a
+                            .parse::<usize>()
+                            .ok()
+                            .and_then(|n| options.get(n.wrapping_sub(1)).cloned())
+                            .unwrap_or_else(|| a.to_string());
+                        switch_embedding(agent, &chosen, config_path, paint)?;
+                    }
+                }
             }
         }
         ("memories", _) => match last_turn {

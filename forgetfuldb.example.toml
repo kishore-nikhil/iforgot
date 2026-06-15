@@ -12,10 +12,18 @@ name = "main"
 # Relative paths resolve against this file's directory (never the cwd).
 sqlite_path = "forgetfuldb.sqlite3"
 
-# v1 ships "hashed_bow" (deterministic, model-free).
-# Roadmap: fastembed, candle, llama_cpp, coreml.
+# Embedding backend. "hashed_bow" is the default: deterministic, offline,
+# model-free — but it only captures lexical overlap ("car" != "automobile").
+# "ollama" uses a real local embedding model for true semantic similarity.
+# Switch interactively in chat with /embed (it re-embeds the store for you),
+# or set it here and run `forgetfuldb reembed`.
 embedding_backend = "hashed_bow"
-embedding_dim = 256
+embedding_dim = 256                  # hashed_bow vector size (ignored by ollama)
+# When embedding_backend = "ollama": the embedding model to use, e.g.
+# "embeddinggemma" (768-dim), "nomic-embed-text", "mxbai-embed-large".
+# Pull it first: `ollama pull embeddinggemma`.
+embedding_model = ""
+embedding_base_url = "http://127.0.0.1:11434"   # must be localhost when local_only
 
 # Exponential decay constants (per day). Higher = forgets faster.
 decay_lambda_raw = 0.35        # raw events: half-life ~2 days
@@ -71,6 +79,14 @@ shell_timeout_secs = 30               # kill a command that runs longer
 # an HTTP endpoint can't ask a human to confirm, so this is a remote shell.
 # Enable only on a trusted local machine.
 allow_server_execute = false
+
+# Associative memory. Co-occurrence edges (memories retrieved into the
+# same chat turn) are rebuilt during consolidation. With spreading
+# activation on, retrieving a memory boosts its frequent companions.
+spreading_activation = false         # off by default; flip to A/B it
+spreading_factor = 0.15              # boost strength (and its cap)
+edge_decay_lambda = 0.02             # older co-occurrences count for less
+edge_min_weight = 0.1                # prune weaker association edges
 
 [retrieval_weights]
 semantic = 0.45

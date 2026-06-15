@@ -35,7 +35,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 # No TLS features on purpose: the agent only ever talks plain HTTP to
 # localhost (Ollama / llama-server), which keeps "local-only" enforceable
 # at the dependency level.
-reqwest = { version = "0.12", default-features = false, features = ["json", "stream"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "blocking"] }
 futures-util = "0.3"
 rustyline = "14"
 
@@ -46,7 +46,7 @@ forgetfuldb-store = { path = "crates/forgetfuldb-store" }
 forgetfuldb-retrieve = { path = "crates/forgetfuldb-retrieve" }
 forgetfuldb-consolidate = { path = "crates/forgetfuldb-consolidate" }
 forgetfuldb-tools = { path = "crates/forgetfuldb-tools" }
-forgetfuldb-server = { path = "crates/forgetfuldb-server" }
+forgetfuldb-server = { path = "crates/forgetfuldb-server", default-features = false }
 forgetfuldb-agent = { path = "crates/forgetfuldb-agent" }
 
 [profile.release]

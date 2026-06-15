@@ -414,32 +414,45 @@ only, everything bundled — no CDN). Four views:
 
 1. **Memory Graph** — force-directed graph of memories and links. Node
    size = importance, opacity = decay, color = memory type, amber ring =
-   pinned, desaturated = stale. The **time scrubber** recomputes decay
+   pinned, desaturated = stale. Edges include provenance (`derived_from`,
+   `updates`, …) and the teal **co-occurrence** web (memories used together
+   in past turns — toggleable). The **time scrubber** recomputes decay
    client-side as of any timestamp, so you can watch memories fade and
    vanish across the store's lifetime. Click a node for full content,
    scores, edges, and summary provenance; pin/unpin and archive are the
    only write actions in the whole UI.
 2. **Retrieval Inspector** — runs the *exact chat-path* retrieval
-   (relevance gate + conversational damping) with per-component stacked
-   score bars, and shows **near-misses**: what scored but fell below the
-   gate and was never injected.
+   (relevance gate + conversational damping + spreading activation) with
+   per-component stacked score bars (including the association boost), and
+   shows **near-misses**: what scored but fell below the gate and was never
+   injected.
 3. **Consolidation** — timeline of sleep-cycle runs (logged to the new
    `consolidation_runs` table) with "N memories → 1 summary" diffs.
 4. **Metrics** — token/latency/context-share charts from `chat_turns`,
    memories by type, live decay distribution.
 
 ```bash
-# build the SPA once (Node 18+)
+# build the SPA once (Node 18+), then install — the UI is embedded into
+# the binary, so `forgetfuldb server` serves /ui from ANY directory:
 cd ui && npm install && npm run build && cd ..
+cargo install --path crates/forgetfuldb-cli
 
-# serve any store with the UI mounted
-forgetfuldb server --ui ui/dist        # auto-detected if ./ui/dist exists
+forgetfuldb server                     # serves the global store + embedded /ui
 open http://127.0.0.1:8787/ui
 
-# or explore a disposable seeded store first (~220 memories, 60 days)
+# point it at any other store with the usual config resolution:
+forgetfuldb server --config /path/to/other/forgetfuldb.toml
+
+# or explore a disposable seeded store first (~220 memories, 60 days):
 forgetfuldb demo
-forgetfuldb server --config demo/forgetfuldb.toml --ui ui/dist
+forgetfuldb server --config demo/forgetfuldb.toml
 ```
+
+`--ui <path>` overrides the embedded copy with a live `ui/dist` on disk
+(handy during UI development — no binary rebuild needed); and a
+`./ui/dist` in the working directory is auto-detected the same way. For a
+**lighter binary without the UI baked in**, install with
+`--no-default-features` (then `/ui` requires `--ui <path>`).
 
 For UI development, `cd ui && npm run dev` proxies API calls to a running
 server on 8787. The JSON endpoints behind the UI (`GET /graph`,
@@ -497,11 +510,11 @@ consolidate lifecycles against a real SQLite file.
 
 ## Limitations (v1, by design)
 
-- **Placeholder embeddings.** Hashed bag-of-words captures lexical
-  overlap, not meaning: "car" and "automobile" don't match. Retrieval is
-  hybrid (keywords + tags + recency + importance), which papers over this
-  for personal-scale use, but a real local embedding model is the single
-  biggest upgrade.
+- **Default embeddings are lexical.** The built-in `hashed_bow` captures
+  word overlap, not meaning: "car" and "automobile" don't match. It needs
+  no model and works offline. For true semantic similarity, switch to a
+  local embedding model via Ollama — see *Semantic embeddings* below; that
+  remains the single biggest retrieval upgrade.
 - **Brute-force similarity.** Retrieval and duplicate detection scan all
   rows (retrieval O(n), dedup O(n²)). Comfortable to tens of thousands of
   memories; an ANN index (HNSW) is the fix when that stops being true.
@@ -514,10 +527,67 @@ consolidate lifecycles against a real SQLite file.
 - **Single-writer.** One process at a time (CLI *or* server). WAL mode is
   on, but there's no multi-process coordination.
 
+## Associative memory (co-occurrence edges + spreading activation)
+
+Beyond the typed provenance links (`derived_from`, `updates`, …), memories
+gain **weighted association edges**: two memories retrieved into the same
+chat turn become connected, and the more often (and more recently) that
+happens, the stronger the edge. These `co_occurred` edges live in the
+`memory_edges` table and are rebuilt during consolidation from
+`chat_turns.memory_ids` — recency-decayed (`edge_decay_lambda`) and pruned
+below `edge_min_weight`. They render in the graph view (teal, thickness =
+weight; toggle them on/off).
+
+With `spreading_activation = true` (off by default), retrieval uses them:
+after the normal per-memory scoring, each candidate gets a boost
+proportional to how strongly it associates with the *other* hits —
+
+```text
+association_boost = min( spreading_factor · Σ_neighbors (neighbor_score · w/(1+w)), spreading_factor )
+total = base_score + association_boost
+```
+
+So retrieving "what did we ship this sprint" can pull a memory that rarely
+matches the words but reliably shows up *alongside* the ones that do. The
+boost is one-hop (no cascading), capped so associations never outweigh
+genuine relevance, and shown as its own segment in the Retrieval
+Inspector's score bars. Flip it on in the config (or per-store) to A/B it
+against plain scoring.
+
+## Semantic embeddings (Ollama)
+
+`hashed_bow` is the default — offline and model-free, but it only matches
+shared words. To get real semantic similarity (so "how do customers pay"
+finds a memory about *Stripe billing*), point the embedding backend at a
+local Ollama embedding model:
+
+```bash
+ollama pull embeddinggemma          # 300M, 768-dim; or nomic-embed-text, mxbai-embed-large, …
+```
+
+Then switch — two ways, both of which **re-embed the whole store** (vectors
+from different models aren't comparable, so this is mandatory, not optional):
+
+- **In chat:** `/embed` lists installed embedding models; pick one and it
+  re-embeds with a progress bar and saves the choice. `/embed hashed_bow`
+  switches back. This mirrors `/model` for the chat LLM.
+- **From the CLI:** set `embedding_backend = "ollama"` and
+  `embedding_model = "embeddinggemma"` in the config, then run
+  `forgetfuldb reembed`.
+
+The store records which model its vectors were built with; if the active
+model's dimension doesn't match (e.g. you changed the config but didn't
+re-embed), `iforgot` warns at startup instead of silently returning
+zero-similarity results. If a configured Ollama model is unreachable at
+startup, the session falls back to `hashed_bow` so chat still works.
+
+Everything stays local — the embedding URL must be `localhost` while
+`local_only` is set.
+
 ## Roadmap
 
-1. **Real local embeddings**: fastembed or candle backend; Core ML /
-   MLX on Apple Silicon; embedding versioning + re-embedding migration.
+1. **More embedding backends**: in-process fastembed / candle; Core ML /
+   MLX on Apple Silicon (Ollama embeddings ship today — see above).
 2. **LLM summarizer**: `Summarizer` implementation backed by Ollama /
    llama.cpp for abstractive consolidation and contradiction detection.
 3. **ANN index** (HNSW) once brute force stops being instant.

@@ -8,3 +8,5 @@ description = "Pluggable embedding providers for ForgetfulDB (deterministic hash
 [dependencies]
 anyhow = { workspace = true }
 forgetfuldb-core = { workspace = true }
+reqwest = { workspace = true }
+serde_json = { workspace = true }
