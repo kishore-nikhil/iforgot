@@ -558,6 +558,38 @@ impl Store {
         Ok(())
     }
 
+    /// Incrementally strengthen `co_occurred` edges among `ids` — the
+    /// memories injected into one chat turn. Each pair's weight and count
+    /// grow by one; new pairs are created. Additive (unlike the
+    /// consolidation rebuild, which recomputes with decay), so this is the
+    /// cheap live update that runs off the conversation path. Returns the
+    /// number of pairs touched. A `+1` here equals the rebuild's
+    /// contribution for an age-0 turn, so the two stay consistent.
+    pub fn bump_cooccurrence_edges(&self, ids: &[String], now: i64) -> Result<usize> {
+        // Unique, canonical (src < dst) pairs.
+        let mut uniq: Vec<&String> = ids.iter().collect();
+        uniq.sort();
+        uniq.dedup();
+        let mut pairs = 0;
+        let tx = self.conn.unchecked_transaction()?;
+        for i in 0..uniq.len() {
+            for j in (i + 1)..uniq.len() {
+                tx.execute(
+                    "INSERT INTO memory_edges (src_id, dst_id, edge_type, weight, co_count, created_at, last_activated)
+                     VALUES (?1, ?2, 'co_occurred', 1.0, 1, ?3, ?3)
+                     ON CONFLICT(src_id, dst_id, edge_type) DO UPDATE SET
+                         weight = weight + 1.0,
+                         co_count = co_count + 1,
+                         last_activated = excluded.last_activated",
+                    params![uniq[i], uniq[j], now],
+                )?;
+                pairs += 1;
+            }
+        }
+        tx.commit()?;
+        Ok(pairs)
+    }
+
     /// All weighted edges (for the graph view).
     pub fn list_edges(&self) -> Result<Vec<MemoryEdge>> {
         let mut stmt = self.conn.prepare(
@@ -806,6 +838,41 @@ mod tests {
         let links = store.links_for("mem_2").unwrap();
         assert_eq!(links.len(), 1);
         assert_eq!(links[0].relation, LinkRelation::Updates);
+    }
+
+    #[test]
+    fn cooccurrence_bump_is_additive_and_fast() {
+        let store = Store::open_in_memory().unwrap();
+        // A realistic store: 400 memories, plus a pre-existing edge web so
+        // the bump isn't measured against an empty table.
+        let ids: Vec<String> = (0..400).map(|i| format!("mem_{i:04}")).collect();
+        for id in &ids {
+            store.insert_memory(&sample_item(id, &format!("memory {id}"))).unwrap();
+        }
+        for chunk in ids.chunks(6).take(60) {
+            store.bump_cooccurrence_edges(chunk, 1_000).unwrap();
+        }
+
+        // Additive: bumping the same pair twice doubles its weight.
+        let pair = vec![ids[0].clone(), ids[1].clone()];
+        store.bump_cooccurrence_edges(&pair, 2_000).unwrap();
+        store.bump_cooccurrence_edges(&pair, 3_000).unwrap();
+        let w = store.neighbors(&ids[0], "co_occurred").unwrap();
+        let weight = w.iter().find(|(n, _)| n == &ids[1]).map(|(_, w)| *w).unwrap();
+        assert!(weight >= 2.0, "two extra bumps should add to the weight, got {weight}");
+
+        // Latency: a typical turn injects ~6 memories (15 pairs). Time many
+        // such bumps and assert the per-bump cost is tiny (it runs on the
+        // background writer, but cheap is still the point).
+        let turn: Vec<String> = ids[10..16].to_vec();
+        let iters = 200;
+        let t0 = std::time::Instant::now();
+        for k in 0..iters {
+            store.bump_cooccurrence_edges(&turn, 4_000 + k).unwrap();
+        }
+        let per = t0.elapsed().as_secs_f64() * 1000.0 / iters as f64;
+        println!("co-occurrence bump (6 ids / 15 pairs): {per:.3} ms/turn over {iters} iters");
+        assert!(per < 5.0, "bump should be well under 5ms/turn, was {per:.3} ms");
     }
 
     #[test]

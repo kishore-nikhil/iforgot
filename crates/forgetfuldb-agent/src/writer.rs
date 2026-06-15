@@ -49,7 +49,21 @@ impl MemoryWriter {
                         WriteJob::Ingest(req) => {
                             ingest(&store, &mut bloom, provider.as_ref(), &cfg, req).map(|_| ())
                         }
-                        WriteJob::RecordTurn(turn) => store.insert_chat_turn(&turn),
+                        WriteJob::RecordTurn(turn) => {
+                            let res = store.insert_chat_turn(&turn);
+                            // Strengthen "used together" edges among the
+                            // memories this turn injected — live, off the
+                            // conversation path. Best-effort: a failure here
+                            // must not lose the turn metric above.
+                            if res.is_ok() && turn.memory_ids.len() >= 2 {
+                                if let Err(e) =
+                                    store.bump_cooccurrence_edges(&turn.memory_ids, forgetfuldb_core::now_unix())
+                                {
+                                    eprintln!("forgetfuldb-writer: co-occurrence bump failed: {e:#}");
+                                }
+                            }
+                            res
+                        }
                         WriteJob::Flush(ack) => {
                             let _ = ack.send(());
                             Ok(())
