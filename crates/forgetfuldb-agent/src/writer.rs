@@ -38,7 +38,7 @@ impl MemoryWriter {
         let cfg = cfg.clone();
         let store = Store::open(std::path::Path::new(&cfg.sqlite_path))?;
         let mut bloom = warm_bloom(&store)?;
-        let provider = forgetfuldb_embed::create_provider(&cfg.embedding_backend, cfg.embedding_dim)?;
+        let provider = forgetfuldb_embed::create_provider_from_config(&cfg)?;
         let (tx, rx) = mpsc::channel::<WriteJob>();
 
         let handle = std::thread::Builder::new()

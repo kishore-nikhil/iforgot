@@ -17,11 +17,20 @@ pub struct Config {
     /// against the directory containing the config file, never the
     /// process working directory.
     pub sqlite_path: String,
-    /// Embedding backend name. v1 ships `hashed_bow` (deterministic,
-    /// model-free). Future: `fastembed`, `candle`, `llama_cpp`, `coreml`.
+    /// Embedding backend name. `hashed_bow` (default, deterministic,
+    /// model-free, offline) or `ollama` (a real local embedding model).
     pub embedding_backend: String,
-    /// Dimensionality of placeholder embeddings.
+    /// Dimensionality of `hashed_bow` placeholder embeddings. Ignored by
+    /// `ollama` (the model fixes its own dimension, probed at startup).
     pub embedding_dim: usize,
+    /// Ollama embedding model name when `embedding_backend = "ollama"`
+    /// (e.g. "embeddinggemma", "nomic-embed-text"). Empty otherwise.
+    #[serde(default)]
+    pub embedding_model: String,
+    /// Base URL of the Ollama server used for embeddings. Must be
+    /// localhost while `local_only` is set.
+    #[serde(default = "default_embedding_base_url")]
+    pub embedding_base_url: String,
     pub decay_lambda_raw: f64,
     pub decay_lambda_episodic: f64,
     pub decay_lambda_semantic: f64,
@@ -29,6 +38,23 @@ pub struct Config {
     pub decay_lambda_preference: f64,
     pub retrieval_weights: RetrievalWeights,
     pub consolidation_thresholds: ConsolidationThresholds,
+    /// Enable spreading activation: after base scoring, boost memories
+    /// associated (co-occurring in past chat turns) with the top hits, so
+    /// retrieving one memory can surface its companions. Off by default so
+    /// behavior is unchanged until opted in.
+    #[serde(default)]
+    pub spreading_activation: bool,
+    /// Strength of the spreading-activation boost (0 disables).
+    #[serde(default = "default_spreading_factor")]
+    pub spreading_factor: f64,
+    /// Per-day decay applied to a co-occurrence when summing edge weight,
+    /// so recent shared turns matter more than old ones.
+    #[serde(default = "default_edge_decay_lambda")]
+    pub edge_decay_lambda: f64,
+    /// Co-occurrence edges below this weight are pruned (kept the graph
+    /// from filling with one-off pairings).
+    #[serde(default = "default_edge_min_weight")]
+    pub edge_min_weight: f64,
     /// Raw events older than this become archive memories.
     pub archive_after_days: f64,
     /// Archived, unpinned memories older than this are deleted.
@@ -115,6 +141,21 @@ pub struct ChatConfig {
 /// The default persona: a developer's assistant that remembers, can run
 /// AI-assisted shell commands, and is extensible with tools for private
 /// local tasks. Override via `chat.system_prompt` in the config.
+/// Default Ollama URL for embeddings (same host the chat backend uses).
+pub fn default_embedding_base_url() -> String {
+    "http://127.0.0.1:11434".to_string()
+}
+
+fn default_spreading_factor() -> f64 {
+    0.15
+}
+fn default_edge_decay_lambda() -> f64 {
+    0.02 // ~35-day half-life: associations fade slowly
+}
+fn default_edge_min_weight() -> f64 {
+    0.1
+}
+
 pub fn default_system_prompt() -> String {
     "You are iForgot, a local AI assistant for a software developer on macOS. You help \
      with coding and everyday tasks, you remember the user's long-term context, and you \
@@ -185,6 +226,8 @@ impl Default for Config {
             sqlite_path: "forgetfuldb.sqlite3".to_string(),
             embedding_backend: "hashed_bow".to_string(),
             embedding_dim: 256,
+            embedding_model: String::new(),
+            embedding_base_url: default_embedding_base_url(),
             decay_lambda_raw: lambdas.raw_event,
             decay_lambda_episodic: lambdas.episodic,
             decay_lambda_semantic: lambdas.semantic,
@@ -192,6 +235,10 @@ impl Default for Config {
             decay_lambda_preference: lambdas.preference,
             retrieval_weights: RetrievalWeights::default(),
             consolidation_thresholds: ConsolidationThresholds::default(),
+            spreading_activation: false,
+            spreading_factor: default_spreading_factor(),
+            edge_decay_lambda: default_edge_decay_lambda(),
+            edge_min_weight: default_edge_min_weight(),
             archive_after_days: 14.0,
             delete_after_days: 90.0,
             local_only: true,

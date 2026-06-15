@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import ForceGraph2D from 'react-force-graph-2d';
+import { forceX, forceY } from 'd3-force';
 import {
   api,
   decayAt,
@@ -32,16 +33,52 @@ interface FgLink {
 
 const nodeId = (e: string | GraphNode) => (typeof e === 'string' ? e : e.id);
 
+// Edge types with a real direction (source → target). These get animated
+// flow particles + an arrowhead; co_occurred is undirected (a mutual
+// association) so it flows but carries no arrow.
+const DIRECTED = new Set(['derived_from', 'updates', 'contradicts', 'supports', 'belongs_to_project']);
+
+const now_ms = () => performance.now();
+// Stable per-node phase so glows don't pulse in unison.
+const phaseOf = (id: string) => {
+  let h = 0;
+  for (let i = 0; i < id.length; i++) h = (h * 31 + id.charCodeAt(i)) | 0;
+  return (h % 1000) / 1000 * Math.PI * 2;
+};
+const LABEL_CAP = 5; // how many node labels are visible at once
+const LABEL_FADE = 600; // ms fade in/out
+const LABEL_ROTATE = 1700; // ms between rotations
+
+function withAlpha(hex: string, a: number) {
+  const h = hex.replace('#', '');
+  const r = parseInt(h.slice(0, 2), 16);
+  const g = parseInt(h.slice(2, 4), 16);
+  const b = parseInt(h.slice(4, 6), 16);
+  return `rgba(${r},${g},${b},${a})`;
+}
+
 export default function GraphView({ cfg, active }: { cfg: UiConfig | null; active: boolean }) {
   const [days, setDays] = useState<number | null>(30);
   const [types, setTypes] = useState<Set<MemoryTypeName>>(new Set(MEMORY_TYPES));
   const [tagFilter, setTagFilter] = useState('');
   const [minDecay, setMinDecay] = useState(0);
+  const [showCoOccurred, setShowCoOccurred] = useState(true);
+  const [hideIsolated, setHideIsolated] = useState(true);
+  const [animate, setAnimate] = useState(true);
   const [scrubT, setScrubT] = useState<number | null>(null); // null = live (now)
   const [selected, setSelected] = useState<string | null>(null);
   const [detail, setDetail] = useState<MemoryDetail | null>(null);
   const [size, setSize] = useState({ w: 800, h: 520 });
   const wrapRef = useRef<HTMLDivElement>(null);
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const fgRef = useRef<any>(null);
+  const hasFitRef = useRef(false);
+  // Rotating labels: only LABEL_CAP node captions show at once and cycle
+  // over time, so the graph reads as a mind surfacing memories rather than
+  // a wall of text. Driven by a ref (mutated on a timer, read each frame)
+  // so it animates without re-rendering React.
+  const labelRef = useRef<Map<string, { in: number; out: number | null }>>(new Map());
+  const visibleIdsRef = useRef<string[]>([]);
 
   const since = days === null ? 0 : Math.floor(Date.now() / 1000) - days * 86_400;
   const { data, error } = usePoll<GraphResponse>(
@@ -74,6 +111,18 @@ export default function GraphView({ cfg, active }: { cfg: UiConfig | null; activ
     return graphRef.current;
   }, [data]);
 
+  // Ids touched by at least one currently-shown edge. Disconnected
+  // memories are what fly off into empty space, so this lets us hide them.
+  const connectedIds = useMemo(() => {
+    const ids = new Set<string>();
+    for (const l of graphData.links) {
+      if (!showCoOccurred && l.edge_type === 'co_occurred') continue;
+      ids.add(nodeId(l.source));
+      ids.add(nodeId(l.target));
+    }
+    return ids;
+  }, [graphData, showCoOccurred]);
+
   useEffect(() => {
     const el = wrapRef.current;
     if (!el) return;
@@ -82,6 +131,57 @@ export default function GraphView({ cfg, active }: { cfg: UiConfig | null; activ
     );
     ro.observe(el);
     return () => ro.disconnect();
+  }, []);
+
+  // Tame the layout: cap how far the many-body repulsion reaches (so
+  // disconnected nodes don't shoot off forever) and add a gentle pull
+  // toward the centre, so the whole graph stays compact and framed.
+  useEffect(() => {
+    const fg = fgRef.current;
+    if (!fg || !active) return;
+    fg.d3Force('charge')?.strength(-26).distanceMax(180);
+    fg.d3Force('x', forceX(0).strength(0.07));
+    fg.d3Force('y', forceY(0).strength(0.07));
+    fg.d3ReheatSimulation?.();
+  }, [active, graphData]);
+
+  // Keep the pool of label-eligible (currently visible) ids fresh.
+  useEffect(() => {
+    visibleIdsRef.current = graphData.nodes.filter(visible).map((n) => n.id);
+  });
+
+  // Rotate which node captions are shown: fade a couple out, fade a couple
+  // fresh ones in, holding ~LABEL_CAP at a time.
+  useEffect(() => {
+    if (!active || !animate) return;
+    const tick = () => {
+      const t = now_ms();
+      const ref = labelRef.current;
+      for (const [id, v] of ref) if (v.out !== null && t - v.out > LABEL_FADE) ref.delete(id);
+      const living = [...ref].filter(([, v]) => v.out === null).sort((a, b) => a[1].in - b[1].in);
+      const fadeCount = living.length >= LABEL_CAP ? 2 : 0;
+      for (let i = 0; i < fadeCount; i++) living[i][1].out = t;
+      const present = new Set(ref.keys());
+      const pool = visibleIdsRef.current.filter((id) => !present.has(id));
+      const need = LABEL_CAP - (living.length - fadeCount);
+      for (let i = pool.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [pool[i], pool[j]] = [pool[j], pool[i]];
+      }
+      pool.slice(0, Math.max(0, need)).forEach((id) => ref.set(id, { in: t, out: null }));
+    };
+    tick();
+    const h = setInterval(tick, LABEL_ROTATE);
+    return () => clearInterval(h);
+  }, [active, animate]);
+
+  // Alpha for a node's label given the fade timeline; 0 means hidden.
+  const labelAlpha = useCallback((id: string, t: number) => {
+    const v = labelRef.current.get(id);
+    if (!v) return 0;
+    return v.out !== null
+      ? Math.max(0, 1 - (t - v.out) / LABEL_FADE)
+      : Math.min(1, (t - v.in) / LABEL_FADE);
   }, []);
 
   useEffect(() => {
@@ -116,21 +216,40 @@ export default function GraphView({ cfg, active }: { cfg: UiConfig | null; activ
       if (!types.has(n.memory_type)) return false;
       if (tagFilter && !n.tags.some((t) => t.includes(tagFilter)) && !(n.topic ?? '').includes(tagFilter))
         return false;
+      if (hideIsolated && !connectedIds.has(n.id)) return false;
       return liveDecay(n) >= minDecay;
     },
-    [at, types, tagFilter, minDecay, liveDecay],
+    [at, types, tagFilter, minDecay, liveDecay, hideIsolated, connectedIds],
   );
 
   const paintNode = useCallback(
     (node: GraphNode, ctx: CanvasRenderingContext2D, scale: number) => {
       const d = liveDecay(node);
       const r = 2.5 + node.importance_score * 6;
-      const alpha = node.stale ? 0.25 : Math.max(0.08, Math.min(1, d * 1.6));
+      const color = node.stale ? '#57606a' : TYPE_COLORS[node.memory_type];
+      const alpha = node.stale ? 0.3 : Math.max(0.14, Math.min(1, d * 1.7));
+      const t = now_ms();
+      // Gentle breathing glow; brighter for stronger (less-decayed) memories.
+      const pulse = animate ? 0.5 + 0.5 * Math.sin(t / 700 + phaseOf(node.id)) : 0.6;
+
+      ctx.save();
+      // Coloured glow halo.
       ctx.globalAlpha = alpha;
+      ctx.shadowColor = color;
+      ctx.shadowBlur = (2 + 5 * pulse) * (0.6 + d);
+      ctx.fillStyle = color;
       ctx.beginPath();
       ctx.arc(node.x!, node.y!, r, 0, 2 * Math.PI);
-      ctx.fillStyle = node.stale ? '#57606a' : TYPE_COLORS[node.memory_type];
       ctx.fill();
+      // Bright inner spark, so each note reads as a glowing bead.
+      ctx.shadowBlur = 0;
+      ctx.globalAlpha = Math.min(1, alpha + 0.35);
+      ctx.fillStyle = node.stale ? '#9aa4ae' : 'rgba(255,255,255,0.9)';
+      ctx.beginPath();
+      ctx.arc(node.x!, node.y!, Math.max(0.7, r * 0.32), 0, 2 * Math.PI);
+      ctx.fill();
+      ctx.restore();
+
       if (node.pinned) {
         ctx.globalAlpha = 0.95;
         ctx.lineWidth = 1.2 / scale;
@@ -147,16 +266,25 @@ export default function GraphView({ cfg, active }: { cfg: UiConfig | null; activ
         ctx.arc(node.x!, node.y!, r + 4 / scale, 0, 2 * Math.PI);
         ctx.stroke();
       }
-      if (scale > 2.2) {
-        ctx.globalAlpha = Math.min(1, alpha + 0.3);
-        ctx.font = `${3.6}px sans-serif`;
-        ctx.fillStyle = '#c9d1d9';
-        const label = node.content_preview.slice(0, 34);
-        ctx.fillText(label, node.x! + r + 1.5, node.y! + 1.2);
+
+      // Rotating captions (or all, when zoomed in / animation off).
+      const la = animate ? labelAlpha(node.id, t) : scale > 2.2 ? 1 : 0;
+      const show = node.id === selected ? 1 : la;
+      if (show > 0) {
+        const fs = 10 / scale;
+        ctx.globalAlpha = show * (node.stale ? 0.6 : 1);
+        ctx.font = `${fs}px -apple-system, system-ui, sans-serif`;
+        ctx.shadowColor = '#05080d';
+        ctx.shadowBlur = 4 / scale;
+        ctx.fillStyle = withAlpha(color, 0.55);
+        ctx.fillRect(node.x! + r + 2 / scale, node.y! - fs * 0.7, 0.4 / scale, fs * 1.4); // a tiny tick
+        ctx.fillStyle = '#e6edf3';
+        ctx.fillText(node.content_preview.slice(0, 40), node.x! + r + 4 / scale, node.y! + fs * 0.34);
+        ctx.shadowBlur = 0;
       }
       ctx.globalAlpha = 1;
     },
-    [liveDecay, selected],
+    [liveDecay, selected, animate, labelAlpha],
   );
 
   const toggleType = (t: MemoryTypeName) =>
@@ -211,6 +339,19 @@ export default function GraphView({ cfg, active }: { cfg: UiConfig | null; activ
           />
           {minDecay.toFixed(2)}
         </label>
+        <label className="ctl">
+          <input type="checkbox" checked={showCoOccurred} onChange={(e) => setShowCoOccurred(e.target.checked)} />
+          <span className="legend-swatch" style={{ background: EDGE_COLORS.co_occurred }} />
+          co-occurrence edges
+        </label>
+        <label className="ctl">
+          <input type="checkbox" checked={hideIsolated} onChange={(e) => setHideIsolated(e.target.checked)} />
+          hide unconnected
+        </label>
+        <label className="ctl">
+          <input type="checkbox" checked={animate} onChange={(e) => setAnimate(e.target.checked)} />
+          ✨ living
+        </label>
         <span className="dim mono">
           {data ? `${graphData.nodes.filter(visible).length}/${data.total_count} memories` : '…'}
         </span>
@@ -238,10 +379,19 @@ export default function GraphView({ cfg, active }: { cfg: UiConfig | null; activ
       <div className="graph-wrap" ref={wrapRef}>
         {active && (
           <ForceGraph2D
+            ref={fgRef}
             graphData={graphData}
             width={size.w}
             height={size.h}
             backgroundColor="#0a0d12"
+            onEngineStop={() => {
+              // Frame the whole graph once it settles — but only the first
+              // time, so background polls don't fight the user's zoom/pan.
+              if (!hasFitRef.current) {
+                hasFitRef.current = true;
+                fgRef.current?.zoomToFit(400, 60);
+              }
+            }}
             nodeId="id"
             nodeVal={(n: GraphNode) => 1 + n.importance_score * 5}
             nodeVisibility={visible}
@@ -250,12 +400,21 @@ export default function GraphView({ cfg, active }: { cfg: UiConfig | null; activ
               `${n.memory_type}${n.pinned ? ' 📌' : ''}${n.stale ? ' (stale)' : ''}\n${n.content_preview}`
             }
             linkVisibility={(l: FgLink) =>
-              visible(l.source as GraphNode) && visible(l.target as GraphNode)
+              (showCoOccurred || l.edge_type !== 'co_occurred') &&
+              visible(l.source as GraphNode) &&
+              visible(l.target as GraphNode)
             }
-            linkColor={(l: FgLink) => EDGE_COLORS[l.edge_type] ?? '#30363d'}
-            linkWidth={(l: FgLink) => 0.5 + l.weight}
-            linkDirectionalArrowLength={3}
+            linkColor={(l: FgLink) =>
+              withAlpha(EDGE_COLORS[l.edge_type] ?? '#30363d', l.edge_type === 'co_occurred' ? 0.35 : 0.7)
+            }
+            linkWidth={(l: FgLink) => 0.4 + Math.min(2.5, l.weight)}
+            linkDirectionalArrowLength={(l: FgLink) => (DIRECTED.has(l.edge_type) ? 3 : 0)}
             linkDirectionalArrowRelPos={0.9}
+            linkDirectionalArrowColor={(l: FgLink) => EDGE_COLORS[l.edge_type] ?? '#888'}
+            linkDirectionalParticles={(l: FgLink) => (animate ? (DIRECTED.has(l.edge_type) ? 2 : 1) : 0)}
+            linkDirectionalParticleSpeed={(l: FgLink) => 0.004 + Math.min(0.012, l.weight * 0.004)}
+            linkDirectionalParticleWidth={(l: FgLink) => (DIRECTED.has(l.edge_type) ? 2 : 1.3)}
+            linkDirectionalParticleColor={(l: FgLink) => EDGE_COLORS[l.edge_type] ?? '#888'}
             onNodeClick={(n: GraphNode) => setSelected(n.id === selected ? null : n.id)}
             onBackgroundClick={() => setSelected(null)}
             cooldownTicks={120}

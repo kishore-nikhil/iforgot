@@ -128,6 +128,44 @@ pub fn keyword_overlap(query_tokens: &HashSet<String>, item: &MemoryItem) -> f64
 /// Cap on near-misses returned in debug mode.
 const MAX_NEAR_MISSES: usize = 20;
 
+/// Add a one-hop spreading-activation boost in place: each candidate gains
+/// `spreading_factor · Σ (neighbor_base_score · w/(1+w))` over its
+/// co-occurrence edges, capped at `spreading_factor` so associations
+/// never dominate genuine relevance. Uses pre-boost scores throughout.
+fn apply_spreading_activation(store: &Store, cfg: &Config, scored: &mut [RetrievedMemory]) -> Result<()> {
+    use std::collections::HashMap;
+    let edges = store.list_edges()?;
+    if edges.is_empty() {
+        return Ok(());
+    }
+    // Undirected adjacency for the co-occurrence edges.
+    let mut adj: HashMap<&str, Vec<(&str, f64)>> = HashMap::new();
+    for e in &edges {
+        if e.edge_type != forgetfuldb_store::pipeline::EDGE_CO_OCCURRED {
+            continue;
+        }
+        adj.entry(&e.src_id).or_default().push((&e.dst_id, e.weight));
+        adj.entry(&e.dst_id).or_default().push((&e.src_id, e.weight));
+    }
+    // Snapshot pre-boost scores (owned keys, so the mutable pass below is
+    // free of the borrow) so the spread can't cascade across hits.
+    let base: HashMap<String, f64> = scored.iter().map(|m| (m.item.id.clone(), m.score.total)).collect();
+
+    for m in scored.iter_mut() {
+        let Some(neighbors) = adj.get(m.item.id.as_str()) else { continue };
+        let raw: f64 = neighbors
+            .iter()
+            .filter_map(|(nbr, w)| base.get(*nbr).map(|s| s * (w / (1.0 + w))))
+            .sum();
+        let boost = (cfg.spreading_factor * raw).min(cfg.spreading_factor);
+        if boost > 0.0 {
+            m.score.association_boost = boost;
+            m.score.total += boost;
+        }
+    }
+    Ok(())
+}
+
 /// A verbatim conversational turn: chat-sourced and never distilled into
 /// a semantic / preference / procedural fact.
 fn is_conversational(item: &MemoryItem) -> bool {
@@ -216,6 +254,14 @@ pub fn retrieve(
             breakdown.total *= opts.conversational_damping;
         }
         scored.push(RetrievedMemory { item, score: breakdown });
+    }
+
+    // Spreading activation: a memory that co-occurs (in past chat turns)
+    // with strong hits gets an additive boost, so retrieving one memory
+    // surfaces its companions. One hop, computed from pre-boost scores so
+    // it can't cascade. Off unless enabled in config.
+    if cfg.spreading_activation && cfg.spreading_factor > 0.0 {
+        apply_spreading_activation(store, cfg, &mut scored)?;
     }
 
     scored.sort_by(|a, b| b.score.total.partial_cmp(&a.score.total).unwrap_or(std::cmp::Ordering::Equal));
@@ -444,6 +490,43 @@ mod tests {
 
         let past_window = RetrieveOptions { until: Some(now_unix() + 1000), ..Default::default() };
         assert_eq!(retrieve(&store, provider.as_ref(), &cfg, "standup", &past_window).unwrap().memories.len(), 1);
+    }
+
+    #[test]
+    fn spreading_activation_boosts_associated_memories() {
+        let (store, provider, mut cfg) = setup();
+        // A memory that matches the query, and an unrelated one that does not.
+        let _hit = add(&store, provider.as_ref(), &cfg, "the standup is at nine thirty on mondays", vec![]);
+        let companion = add(&store, provider.as_ref(), &cfg, "the sprint demo is on friday afternoon", vec![]);
+
+        // Without an edge, the companion gets no boost.
+        let base = retrieve(&store, provider.as_ref(), &cfg, "standup time", &RetrieveOptions::default()).unwrap();
+        let base_companion = base.memories.iter().find(|m| m.item.id == companion).unwrap().score.total;
+
+        // Associate them (as if they'd been retrieved together before) and
+        // enable spreading activation.
+        store
+            .upsert_edge(&forgetfuldb_store::MemoryEdge {
+                src_id: base.memories[0].item.id.clone().min(companion.clone()),
+                dst_id: base.memories[0].item.id.clone().max(companion.clone()),
+                edge_type: forgetfuldb_store::pipeline::EDGE_CO_OCCURRED.to_string(),
+                weight: 3.0,
+                co_count: 3,
+                created_at: 0,
+                last_activated: 0,
+            })
+            .unwrap();
+        cfg.spreading_activation = true;
+
+        let spread = retrieve(&store, provider.as_ref(), &cfg, "standup time", &RetrieveOptions::default()).unwrap();
+        let boosted = spread.memories.iter().find(|m| m.item.id == companion).unwrap();
+        assert!(boosted.score.association_boost > 0.0, "companion should gain an association boost");
+        assert!(
+            boosted.score.total > base_companion,
+            "spreading activation should raise the companion's total ({} vs {})",
+            boosted.score.total,
+            base_companion
+        );
     }
 
     #[test]

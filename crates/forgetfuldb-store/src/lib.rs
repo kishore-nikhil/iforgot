@@ -22,6 +22,8 @@ const MIGRATIONS: &[(&str, &str)] = &[
     ("0001_init", include_str!("../migrations/0001_init.sql")),
     ("0002_chat_turns", include_str!("../migrations/0002_chat_turns.sql")),
     ("0003_consolidation_runs", include_str!("../migrations/0003_consolidation_runs.sql")),
+    ("0004_store_meta", include_str!("../migrations/0004_store_meta.sql")),
+    ("0005_memory_edges", include_str!("../migrations/0005_memory_edges.sql")),
 ];
 
 pub struct Store {
@@ -445,6 +447,34 @@ impl Store {
         Ok(turns)
     }
 
+    // ---- store metadata (key/value) ---------------------------------------
+
+    pub fn get_meta(&self, key: &str) -> Result<Option<String>> {
+        self.conn
+            .query_row("SELECT value FROM store_meta WHERE key = ?1", [key], |r| r.get(0))
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn set_meta(&self, key: &str, value: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO store_meta (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![key, value],
+        )?;
+        Ok(())
+    }
+
+    /// Overwrite just the embedding vector of one memory (used when
+    /// re-embedding the store under a new model). Leaves all scores intact.
+    pub fn set_embedding(&self, id: &str, embedding: &[f32]) -> Result<()> {
+        self.conn.execute(
+            "UPDATE memory_items SET embedding = ?2 WHERE id = ?1",
+            params![id, encode_embedding(embedding)],
+        )?;
+        Ok(())
+    }
+
     // ---- consolidation runs ------------------------------------------------
 
     pub fn log_consolidation_run(&self, run: &ConsolidationRun) -> Result<()> {
@@ -496,6 +526,73 @@ impl Store {
         Ok(runs)
     }
 
+    // ---- memory_edges (weighted associations) -----------------------------
+
+    /// Insert or replace one weighted edge (canonical src < dst handled by
+    /// the caller). Used by the co-occurrence rebuild.
+    pub fn upsert_edge(&self, edge: &MemoryEdge) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO memory_edges (src_id, dst_id, edge_type, weight, co_count, created_at, last_activated)
+             VALUES (?1,?2,?3,?4,?5,?6,?7)
+             ON CONFLICT(src_id, dst_id, edge_type) DO UPDATE SET
+                 weight = excluded.weight,
+                 co_count = excluded.co_count,
+                 last_activated = excluded.last_activated",
+            params![
+                edge.src_id,
+                edge.dst_id,
+                edge.edge_type,
+                edge.weight,
+                edge.co_count,
+                edge.created_at,
+                edge.last_activated,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Delete every edge of one type (the co-occurrence pass rebuilds them
+    /// from scratch each run, so it clears first).
+    pub fn clear_edges(&self, edge_type: &str) -> Result<()> {
+        self.conn.execute("DELETE FROM memory_edges WHERE edge_type = ?1", [edge_type])?;
+        Ok(())
+    }
+
+    /// All weighted edges (for the graph view).
+    pub fn list_edges(&self) -> Result<Vec<MemoryEdge>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT src_id, dst_id, edge_type, weight, co_count, created_at, last_activated FROM memory_edges",
+        )?;
+        let edges = stmt
+            .query_map([], |r| {
+                Ok(MemoryEdge {
+                    src_id: r.get(0)?,
+                    dst_id: r.get(1)?,
+                    edge_type: r.get(2)?,
+                    weight: r.get(3)?,
+                    co_count: r.get(4)?,
+                    created_at: r.get(5)?,
+                    last_activated: r.get(6)?,
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(edges)
+    }
+
+    /// Neighbors of `id` via edges of `edge_type`, as `(other_id, weight)`.
+    /// Edges are undirected, so both endpoints are checked.
+    pub fn neighbors(&self, id: &str, edge_type: &str) -> Result<Vec<(String, f64)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT CASE WHEN src_id = ?1 THEN dst_id ELSE src_id END, weight
+             FROM memory_edges
+             WHERE edge_type = ?2 AND (src_id = ?1 OR dst_id = ?1)",
+        )?;
+        let rows = stmt
+            .query_map(params![id, edge_type], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
     // ---- stats -----------------------------------------------------------
 
     pub fn stats(&self) -> Result<StoreStats> {
@@ -520,6 +617,18 @@ impl Store {
         let sessions: i64 = self.conn.query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0))?;
         Ok(StoreStats { total_memories: total, by_type, stale, pinned, raw_events, links, sessions })
     }
+}
+
+/// One weighted association edge (e.g. `co_occurred`) from `memory_edges`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryEdge {
+    pub src_id: String,
+    pub dst_id: String,
+    pub edge_type: String,
+    pub weight: f64,
+    pub co_count: i64,
+    pub created_at: i64,
+    pub last_activated: i64,
 }
 
 /// Provenance of one summary memory created during consolidation.
@@ -697,6 +806,20 @@ mod tests {
         let links = store.links_for("mem_2").unwrap();
         assert_eq!(links.len(), 1);
         assert_eq!(links[0].relation, LinkRelation::Updates);
+    }
+
+    #[test]
+    fn meta_roundtrip_and_set_embedding() {
+        let store = Store::open_in_memory().unwrap();
+        assert_eq!(store.get_meta("embedding_dim").unwrap(), None);
+        store.set_meta("embedding_dim", "768").unwrap();
+        store.set_meta("embedding_dim", "1024").unwrap(); // upsert
+        assert_eq!(store.get_meta("embedding_dim").unwrap().as_deref(), Some("1024"));
+
+        store.insert_memory(&sample_item("mem_1", "fact")).unwrap();
+        store.set_embedding("mem_1", &[0.1, 0.2, 0.3, 0.4]).unwrap();
+        let m = store.get_memory("mem_1").unwrap().unwrap();
+        assert_eq!(m.embedding.unwrap().len(), 4, "embedding swapped, dimension changed");
     }
 
     #[test]

@@ -5,8 +5,17 @@ edition.workspace = true
 license.workspace = true
 description = "Optional local HTTP API (axum) for ForgetfulDB"
 
+[features]
+# Embed the built observability UI (ui/dist) into the binary so
+# `forgetfuldb server` serves /ui from any directory. On by default;
+# disable for a lighter binary (then /ui needs --ui <path>):
+#   cargo install --path crates/forgetfuldb-cli --no-default-features
+default = ["embed-ui"]
+embed-ui = ["dep:include_dir"]
+
 [dependencies]
 anyhow = { workspace = true }
+include_dir = { version = "0.7", optional = true }
 axum = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

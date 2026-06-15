@@ -41,6 +41,8 @@ pub struct ConsolidationReport {
     pub deleted: usize,
     /// Provenance of every summary memory created this pass.
     pub summaries: Vec<forgetfuldb_store::SummaryProvenance>,
+    /// Co-occurrence association edges rebuilt from chat history.
+    pub associations: usize,
 }
 
 /// Run a full consolidation pass. Every pass is logged to the
@@ -56,6 +58,15 @@ pub fn consolidate(store: &Store, summarizer: &dyn Summarizer, cfg: &Config) -> 
     promote_recurring(store, cfg, now, &mut report)?;
     mark_contradicted_stale(store, &mut report)?;
     archive_and_prune(store, cfg, now, &mut report)?;
+
+    // Rebuild "used-together" association edges from chat history. Done
+    // last, after pruning, so edges never point at deleted memories.
+    report.associations = forgetfuldb_store::pipeline::rebuild_cooccurrence_edges(
+        store,
+        cfg.edge_decay_lambda,
+        cfg.edge_min_weight,
+        now,
+    )?;
 
     store.log_consolidation_run(&forgetfuldb_store::ConsolidationRun {
         id: new_id("run", &format!("consolidate-{now}")),

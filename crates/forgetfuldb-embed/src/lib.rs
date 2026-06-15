@@ -10,6 +10,11 @@
 //! implementation selected by name in `forgetfuldb.toml`
 //! (`embedding_backend = "..."`); nothing else in the system changes.
 
+pub mod ollama;
+
+pub use ollama::OllamaEmbeddings;
+
+use forgetfuldb_core::config::Config;
 use forgetfuldb_core::ingest::tokenize;
 use std::hash::{Hash, Hasher};
 
@@ -86,14 +91,64 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     }
 }
 
-/// Build a provider from the config's `embedding_backend` name.
+/// Build a provider by backend name + dim. Handles the offline,
+/// model-free `hashed_bow`; for networked backends like `ollama` use
+/// [`create_provider_from_config`], which has the model name and URL.
 pub fn create_provider(backend: &str, dim: usize) -> anyhow::Result<Box<dyn EmbeddingProvider>> {
     match backend {
         "hashed_bow" => Ok(Box::new(HashedBagOfWords::new(dim))),
-        other => anyhow::bail!(
-            "unknown embedding backend '{other}' (available: hashed_bow; \
-             candle/fastembed/llama_cpp/coreml are on the roadmap)"
+        "ollama" => anyhow::bail!(
+            "the 'ollama' embedding backend needs a model and URL — build it with \
+             create_provider_from_config(&cfg)"
         ),
+        other => anyhow::bail!(
+            "unknown embedding backend '{other}' (available: hashed_bow, ollama; \
+             candle/fastembed/coreml are on the roadmap)"
+        ),
+    }
+}
+
+/// True for localhost-style hosts, enforcing `local_only` for networked
+/// embedding backends.
+pub fn is_local_url(url: &str) -> bool {
+    let host = url
+        .split("://")
+        .nth(1)
+        .unwrap_or(url)
+        .split('/')
+        .next()
+        .unwrap_or("")
+        .rsplit_once(':')
+        .map(|(h, _)| h)
+        .unwrap_or("")
+        .trim_matches(['[', ']']);
+    matches!(host, "127.0.0.1" | "localhost" | "::1" | "0.0.0.0")
+}
+
+/// Build the embedding provider described by the config. This is the
+/// entry point for real (networked) backends: `hashed_bow` stays the
+/// default, `ollama` selects a local embedding model by name.
+pub fn create_provider_from_config(cfg: &Config) -> anyhow::Result<Box<dyn EmbeddingProvider>> {
+    match cfg.embedding_backend.as_str() {
+        "hashed_bow" => Ok(Box::new(HashedBagOfWords::new(cfg.embedding_dim))),
+        "ollama" => {
+            anyhow::ensure!(
+                !cfg.embedding_model.trim().is_empty(),
+                "embedding_backend = \"ollama\" requires embedding_model (e.g. \"embeddinggemma\")"
+            );
+            if cfg.local_only {
+                anyhow::ensure!(
+                    is_local_url(&cfg.embedding_base_url),
+                    "local_only is set, but embedding_base_url ({}) is not localhost",
+                    cfg.embedding_base_url
+                );
+            }
+            Ok(Box::new(OllamaEmbeddings::new(
+                cfg.embedding_base_url.clone(),
+                cfg.embedding_model.clone(),
+            )?))
+        }
+        other => anyhow::bail!("unknown embedding backend '{other}' (available: hashed_bow, ollama)"),
     }
 }
 
@@ -121,5 +176,23 @@ mod tests {
         let p = HashedBagOfWords::new(64);
         let v = p.embed("hello world example");
         assert!((cosine_similarity(&v, &v) - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn local_url_detection() {
+        for ok in ["http://127.0.0.1:11434", "http://localhost:11434", "http://[::1]:8080", "http://0.0.0.0:1"] {
+            assert!(is_local_url(ok), "should be local: {ok}");
+        }
+        for bad in ["http://example.com:11434", "https://api.openai.com", "http://10.0.0.5:11434"] {
+            assert!(!is_local_url(bad), "should be remote: {bad}");
+        }
+    }
+
+    #[test]
+    fn ollama_backend_needs_config_not_bare_name() {
+        // create_provider can't build ollama (no model/url); the config
+        // path is the only way in.
+        assert!(create_provider("ollama", 256).is_err());
+        assert!(create_provider("hashed_bow", 256).is_ok());
     }
 }

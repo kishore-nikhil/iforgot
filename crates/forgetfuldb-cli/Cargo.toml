@@ -9,6 +9,13 @@ description = "ForgetfulDB command-line interface"
 name = "forgetfuldb"
 path = "src/main.rs"
 
+[features]
+# Embed the observability UI into the `forgetfuldb` binary (default).
+# Lightweight build without it:
+#   cargo install --path crates/forgetfuldb-cli --no-default-features
+default = ["embed-ui"]
+embed-ui = ["forgetfuldb-server/embed-ui"]
+
 [dependencies]
 anyhow = { workspace = true }
 clap = { workspace = true }

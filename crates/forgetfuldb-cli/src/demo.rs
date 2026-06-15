@@ -201,7 +201,7 @@ pub fn seed(dir: &Path) -> Result<()> {
     cfg.save(&dir.join("forgetfuldb.toml"))?;
 
     let store = Store::open(&db_path)?;
-    let provider = forgetfuldb_embed::create_provider(&cfg.embedding_backend, cfg.embedding_dim)?;
+    let provider = forgetfuldb_embed::create_provider_from_config(&cfg)?;
     let now = now_unix();
     let mut rng = Lcg(0x5EED);
 
@@ -388,8 +388,20 @@ pub fn seed(dir: &Path) -> Result<()> {
         }
     }
 
+    // Build co-occurrence association edges from the seeded chat turns, so
+    // the graph shows "used-together" links immediately.
+    let assoc = forgetfuldb_store::pipeline::rebuild_cooccurrence_edges(
+        &store,
+        cfg.edge_decay_lambda,
+        cfg.edge_min_weight,
+        now,
+    )?;
+
     println!("seeded demo store in {}:", dir.display());
-    println!("  {memories} memories | {links} links | {} consolidation runs | {turns} chat turns", runs.len());
+    println!(
+        "  {memories} memories | {links} links | {assoc} co-occurrence edges | {} consolidation runs | {turns} chat turns",
+        runs.len()
+    );
     println!("explore it:");
     println!("  forgetfuldb server --config {} --ui ui/dist", dir.join("forgetfuldb.toml").display());
     println!("  open http://127.0.0.1:8787/ui");

@@ -68,6 +68,11 @@ pub struct ScoreBreakdown {
     /// distilled fact. 1.0 means no damping was applied.
     #[serde(default = "no_damping")]
     pub conversational_damping: f64,
+    /// Additive boost from spreading activation: this memory is associated
+    /// (co-occurs in past turns) with higher-scoring hits. 0 when spreading
+    /// activation is off or the memory has no relevant associations.
+    #[serde(default)]
+    pub association_boost: f64,
     pub total: f64,
 }
 
@@ -93,6 +98,7 @@ pub fn retrieval_score(inputs: &ScoreInputs, w: &RetrievalWeights) -> ScoreBreak
         pinned_boost,
         staleness_penalty,
         conversational_damping: 1.0,
+        association_boost: 0.0,
         total,
     }
 }

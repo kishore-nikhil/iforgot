@@ -155,6 +155,10 @@ export default function RetrievalView({ cfg }: { cfg: UiConfig | null }) {
               </span>
             ))}
             <span style={{ fontSize: 11 }}>
+              <span className="legend-swatch" style={{ background: '#2dd4bf', borderRadius: 2 }} />
+              association
+            </span>
+            <span style={{ fontSize: 11 }}>
               <span className="legend-swatch" style={{ background: 'var(--red)', borderRadius: 2 }} />
               stale penalty
             </span>
@@ -216,6 +220,7 @@ function ResultRow({
       s.conversational_damping,
   }));
   const penalty = weights.staleness_penalty * s.staleness_penalty * s.conversational_damping;
+  const association = s.association_boost ?? 0;
 
   return (
     <tr className={miss ? 'miss' : ''}>
@@ -227,15 +232,21 @@ function ResultRow({
         {m.content.length > 140 ? '…' : ''}
       </td>
       <td>
-        <div className="scorebar" title={`sim ${s.semantic_similarity.toFixed(2)} · imp ${s.importance.toFixed(2)} · rec ${s.recurrence.toFixed(2)} · recency ${s.recency.toFixed(2)}`}>
+        <div className="scorebar" title={`sim ${s.semantic_similarity.toFixed(2)} · imp ${s.importance.toFixed(2)} · rec ${s.recurrence.toFixed(2)} · recency ${s.recency.toFixed(2)}${association ? ` · assoc +${association.toFixed(2)}` : ''}`}>
           {parts.map((p, i) => (
             <div key={i} style={{ width: `${p.value * 100}%`, background: p.color }} />
           ))}
+          {association > 0 && <div style={{ width: `${association * 100}%`, background: '#2dd4bf' }} />}
           {penalty > 0 && <div style={{ width: `${penalty * 100}%`, background: 'var(--red)' }} />}
         </div>
       </td>
       <td className="mono">{s.total.toFixed(3)}</td>
       <td>
+        {association > 0 && (
+          <span className="chip" title="boosted by association with other hits (spreading activation)">
+            ↝ assoc
+          </span>
+        )}
         {damped && (
           <span className="chip" title="verbatim chat turn — score damped">
             ×{s.conversational_damping}

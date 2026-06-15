@@ -105,6 +105,10 @@ enum Command {
         #[arg(long, default_value = "demo")]
         dir: PathBuf,
     },
+    /// Re-embed every memory with the configured embedding model. Run this
+    /// after changing `embedding_backend`/`embedding_model` in the config,
+    /// since vectors from different models are not comparable.
+    Reembed,
 }
 
 fn main() -> Result<()> {
@@ -139,7 +143,7 @@ fn main() -> Result<()> {
         Command::Ingest { text, source, tags, memory_type, session, role } => {
             let store = open_store(&cfg)?;
             let mut bloom = warm_bloom(&store)?;
-            let provider = forgetfuldb_embed::create_provider(&cfg.embedding_backend, cfg.embedding_dim)?;
+            let provider = forgetfuldb_embed::create_provider_from_config(&cfg)?;
             let memory_type = memory_type
                 .as_deref()
                 .map(MemoryType::from_str)
@@ -159,7 +163,7 @@ fn main() -> Result<()> {
         }
         Command::Retrieve { query, top_k, include_stale } => {
             let store = open_store(&cfg)?;
-            let provider = forgetfuldb_embed::create_provider(&cfg.embedding_backend, cfg.embedding_dim)?;
+            let provider = forgetfuldb_embed::create_provider_from_config(&cfg)?;
             let opts = RetrieveOptions { top_k, include_stale, ..Default::default() };
             let pack = forgetfuldb_retrieve::retrieve(&store, provider.as_ref(), &cfg, &query, &opts)?;
             println!("{}", serde_json::to_string_pretty(&pack)?);
@@ -231,6 +235,20 @@ fn main() -> Result<()> {
             runtime.block_on(forgetfuldb_server::serve(cfg, port, ui_dir))
         }
         Command::Demo { dir } => demo::seed(&dir),
+        Command::Reembed => {
+            let store = open_store(&cfg)?;
+            let provider = forgetfuldb_embed::create_provider_from_config(&cfg)?;
+            let model = if cfg.embedding_model.is_empty() { cfg.embedding_backend.clone() } else { cfg.embedding_model.clone() };
+            println!("re-embedding with {} ({}-dim)…", model, provider.dim());
+            let n = forgetfuldb_store::pipeline::reembed_all(&store, provider.as_ref(), &model, |done, total| {
+                if done == total || done % 50 == 0 {
+                    print!("\r  {done}/{total}");
+                    let _ = std::io::Write::flush(&mut std::io::stdout());
+                }
+            })?;
+            println!("\rre-embedded {n} memories with {model}        ");
+            Ok(())
+        }
     }
 }
 

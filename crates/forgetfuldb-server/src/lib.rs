@@ -338,9 +338,9 @@ async fn graph_handler(
     let kept: std::collections::HashSet<String> =
         nodes.iter().map(|(_, n)| n["id"].as_str().unwrap_or_default().to_string()).collect();
 
-    // memory_links carries no weight or timestamps (yet) — edges report a
-    // constant weight so the UI contract stays stable if that changes.
-    let edges: Vec<serde_json::Value> = app
+    // Two edge sources: typed provenance/dedup links (memory_links, weight
+    // 1.0) and weighted association edges (memory_edges, e.g. co_occurred).
+    let mut edges: Vec<serde_json::Value> = app
         .store
         .all_links()?
         .into_iter()
@@ -354,6 +354,21 @@ async fn graph_handler(
             })
         })
         .collect();
+    edges.extend(
+        app.store
+            .list_edges()?
+            .into_iter()
+            .filter(|e| kept.contains(&e.src_id) && kept.contains(&e.dst_id))
+            .map(|e| {
+                json!({
+                    "src_id": e.src_id,
+                    "dst_id": e.dst_id,
+                    "edge_type": e.edge_type,
+                    "weight": e.weight,
+                    "co_count": e.co_count,
+                })
+            }),
+    );
 
     Ok(Json(json!({
         "nodes": nodes.into_iter().map(|(_, n)| n).collect::<Vec<_>>(),
@@ -450,6 +465,62 @@ async fn archive_handler(
     Ok(Json(json!({ "id": id, "memory_type": "archive" })))
 }
 
+/// The observability UI embedded into the binary at build time (see
+/// build.rs). Lets `forgetfuldb server` serve `/ui` from any directory
+/// with no `--ui` path. Compiled out entirely when the `embed-ui` feature
+/// is off or `ui/dist` wasn't built.
+#[cfg(embed_ui)]
+mod embedded_ui {
+    use axum::http::{header, HeaderValue, StatusCode, Uri};
+    use axum::response::{IntoResponse, Response};
+    use include_dir::{include_dir, Dir};
+
+    static UI: Dir<'static> = include_dir!("$CARGO_MANIFEST_DIR/../../ui/dist");
+
+    pub(crate) async fn handler(uri: Uri) -> Response {
+        let rel = uri.path().trim_start_matches("/ui").trim_start_matches('/');
+        // SPA fallback: unknown sub-paths serve index.html.
+        let file = if rel.is_empty() {
+            UI.get_file("index.html")
+        } else {
+            UI.get_file(rel).or_else(|| UI.get_file("index.html"))
+        };
+        match file {
+            Some(f) => {
+                let ext = f.path().extension().and_then(|e| e.to_str()).unwrap_or("");
+                (
+                    [(header::CONTENT_TYPE, HeaderValue::from_static(content_type(ext)))],
+                    f.contents().to_vec(),
+                )
+                    .into_response()
+            }
+            None => (StatusCode::NOT_FOUND, "embedded UI missing").into_response(),
+        }
+    }
+
+    fn content_type(ext: &str) -> &'static str {
+        match ext {
+            "html" => "text/html; charset=utf-8",
+            "js" | "mjs" => "text/javascript; charset=utf-8",
+            "css" => "text/css; charset=utf-8",
+            "json" | "map" => "application/json",
+            "svg" => "image/svg+xml",
+            "png" => "image/png",
+            "jpg" | "jpeg" => "image/jpeg",
+            "ico" => "image/x-icon",
+            "woff2" => "font/woff2",
+            "woff" => "font/woff",
+            "ttf" => "font/ttf",
+            _ => "application/octet-stream",
+        }
+    }
+}
+
+/// Is an embedded UI compiled into this binary?
+pub fn ui_is_embedded() -> bool {
+    cfg!(embed_ui)
+}
+
 fn build_router(state: SharedState, ui_dir: Option<&std::path::Path>) -> Router {
     let mut router = Router::new()
         .route("/ingest", post(ingest_handler))
@@ -468,10 +539,22 @@ fn build_router(state: SharedState, ui_dir: Option<&std::path::Path>) -> Router 
         .route("/tools/execute", post(tools_execute_handler))
         .route("/v1/chat/completions", post(proxy::chat_completions));
     if let Some(dir) = ui_dir {
-        // SPA fallback: unknown paths under /ui get index.html so client
-        // routing (if any) works. Inherits the same localhost-only bind.
+        // Explicit/disk UI (dev or --ui override): served from the
+        // filesystem so rebuilds show up without recompiling the binary.
+        // SPA fallback: unknown paths under /ui get index.html.
         let serve = ServeDir::new(dir).fallback(ServeFile::new(dir.join("index.html")));
         router = router.nest_service("/ui", serve);
+    } else {
+        // No path given: serve the UI baked into the binary, if any.
+        // Three routes so "/ui", "/ui/" (trailing slash) and "/ui/<asset>"
+        // all reach the handler — `/ui/*rest` alone misses the bare "/ui/".
+        #[cfg(embed_ui)]
+        {
+            router = router
+                .route("/ui", get(embedded_ui::handler))
+                .route("/ui/", get(embedded_ui::handler))
+                .route("/ui/*rest", get(embedded_ui::handler));
+        }
     }
     router.with_state(state)
 }
@@ -482,7 +565,7 @@ pub async fn serve(cfg: Config, port: u16, ui_dir: Option<std::path::PathBuf>) -
     forgetfuldb_agent::backend::ensure_local_url(&cfg)?;
     let store = Store::open(std::path::Path::new(&cfg.sqlite_path))?;
     let bloom = warm_bloom(&store)?;
-    let provider = forgetfuldb_embed::create_provider(&cfg.embedding_backend, cfg.embedding_dim)?;
+    let provider = forgetfuldb_embed::create_provider_from_config(&cfg)?;
     let host = if cfg.local_only { "127.0.0.1" } else { "0.0.0.0" };
     let tools = forgetfuldb_tools::ToolRegistry::from_config(&cfg.tools);
     let state: SharedState = Arc::new(Mutex::new(AppState {
@@ -497,8 +580,10 @@ pub async fn serve(cfg: Config, port: u16, ui_dir: Option<std::path::PathBuf>) -
     let addr = format!("{host}:{port}");
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     eprintln!("forgetfuldb-server listening on http://{addr}");
-    if let Some(dir) = &ui_dir {
-        eprintln!("observability UI at http://{addr}/ui (serving {})", dir.display());
+    match &ui_dir {
+        Some(dir) => eprintln!("observability UI at http://{addr}/ui (serving {})", dir.display()),
+        None if ui_is_embedded() => eprintln!("observability UI at http://{addr}/ui (embedded)"),
+        None => eprintln!("(no UI: build ui/dist and pass --ui, or install with the embed-ui feature)"),
     }
     axum::serve(listener, build_router(state, ui_dir.as_deref())).await?;
     Ok(())
