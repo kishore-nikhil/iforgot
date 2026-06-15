@@ -55,6 +55,23 @@ pub struct Config {
     /// from filling with one-off pairings).
     #[serde(default = "default_edge_min_weight")]
     pub edge_min_weight: f64,
+    /// How strongly salience resists decay, in `[0, 1]`. A fully-salient
+    /// memory decays at `(1 - salience_resist)` of the base rate (0.7 →
+    /// 30%). 0 disables salience-based decay resistance.
+    #[serde(default = "default_salience_resist")]
+    pub salience_resist: f64,
+    /// Salience at/above which a memory is **kept** through pruning,
+    /// regardless of decay — the automatic counterpart to a manual pin.
+    /// This is how a formative memory survives the archiving that buries
+    /// the routine around it. 1.0 effectively disables the hard keep.
+    #[serde(default = "default_salience_keep_threshold")]
+    pub salience_keep_threshold: f64,
+    /// Minimum cosine for a `semantic_similar` edge (kNN in meaning-space).
+    #[serde(default = "default_semantic_edge_min_sim")]
+    pub semantic_edge_min_sim: f64,
+    /// Nearest neighbors linked per memory for `semantic_similar` edges.
+    #[serde(default = "default_semantic_edge_top_k")]
+    pub semantic_edge_top_k: usize,
     /// Raw events older than this become archive memories.
     pub archive_after_days: f64,
     /// Archived, unpinned memories older than this are deleted.
@@ -155,6 +172,18 @@ fn default_edge_decay_lambda() -> f64 {
 fn default_edge_min_weight() -> f64 {
     0.1
 }
+fn default_salience_resist() -> f64 {
+    0.7
+}
+fn default_salience_keep_threshold() -> f64 {
+    0.6
+}
+fn default_semantic_edge_min_sim() -> f64 {
+    0.55
+}
+fn default_semantic_edge_top_k() -> usize {
+    5
+}
 
 pub fn default_system_prompt() -> String {
     "You are iForgot, a local AI assistant for a software developer on macOS. You help \
@@ -239,6 +268,10 @@ impl Default for Config {
             spreading_factor: default_spreading_factor(),
             edge_decay_lambda: default_edge_decay_lambda(),
             edge_min_weight: default_edge_min_weight(),
+            salience_resist: default_salience_resist(),
+            salience_keep_threshold: default_salience_keep_threshold(),
+            semantic_edge_min_sim: default_semantic_edge_min_sim(),
+            semantic_edge_top_k: default_semantic_edge_top_k(),
             archive_after_days: 14.0,
             delete_after_days: 90.0,
             local_only: true,

@@ -43,6 +43,12 @@ pub struct ConsolidationReport {
     pub summaries: Vec<forgetfuldb_store::SummaryProvenance>,
     /// Co-occurrence association edges rebuilt from chat history.
     pub associations: usize,
+    /// Memories whose salience was revised by the neighbor discriminator.
+    pub salience_revised: usize,
+    /// `semantic_similar` (cosine kNN) edges rebuilt.
+    pub semantic_edges: usize,
+    /// `sequence` (session-order) edges rebuilt.
+    pub sequence_edges: usize,
 }
 
 /// Run a full consolidation pass. Every pass is logged to the
@@ -54,19 +60,28 @@ pub fn consolidate(store: &Store, summarizer: &dyn Summarizer, cfg: &Config) -> 
 
     merge_duplicates(store, cfg, now, &mut report)?;
     refresh_recurrence(store, now, &mut report)?;
+    revise_salience(store, now, &mut report)?;
     summarize_clusters(store, summarizer, cfg, now, &mut report)?;
     promote_recurring(store, cfg, now, &mut report)?;
     mark_contradicted_stale(store, &mut report)?;
     archive_and_prune(store, cfg, now, &mut report)?;
 
-    // Rebuild "used-together" association edges from chat history. Done
-    // last, after pruning, so edges never point at deleted memories.
-    report.associations = forgetfuldb_store::pipeline::rebuild_cooccurrence_edges(
+    // Rebuild the association graph from scratch. Done last, after pruning,
+    // so edges never point at deleted memories. Three distinct edge types,
+    // each a different notion of "related":
+    //   co_occurred     — recalled together (behavioral / Hebbian)
+    //   semantic_similar — close in meaning (embedding kNN)
+    //   sequence        — discussed one after another (causal / session order)
+    report.associations =
+        forgetfuldb_store::pipeline::rebuild_cooccurrence_edges(store, cfg.edge_decay_lambda, cfg.edge_min_weight, now)?;
+    report.semantic_edges = forgetfuldb_store::pipeline::rebuild_semantic_edges(
         store,
-        cfg.edge_decay_lambda,
-        cfg.edge_min_weight,
+        cfg.semantic_edge_min_sim,
+        cfg.semantic_edge_top_k,
         now,
     )?;
+    report.sequence_edges =
+        forgetfuldb_store::pipeline::rebuild_sequence_edges(store, cfg.edge_decay_lambda, cfg.edge_min_weight, now, 2)?;
 
     store.log_consolidation_run(&forgetfuldb_store::ConsolidationRun {
         id: new_id("run", &format!("consolidate-{now}")),
@@ -82,6 +97,58 @@ pub fn consolidate(store: &Store, summarizer: &dyn Summarizer, cfg: &Config) -> 
     })?;
 
     Ok(report)
+}
+
+/// Authoritative salience pass: classify every memory by its near-neighbor
+/// distribution over time (the shared discriminator) and set salience to
+/// the U-shaped max of surprise and habit, gated by relevance. This is what
+/// lets a formative memory resist the decay that buries the routine around
+/// it. O(n^2) over active memories — fine at personal scale (the sleep
+/// cycle is off the conversation path).
+fn revise_salience(store: &Store, now: i64, report: &mut ConsolidationReport) -> Result<()> {
+    use forgetfuldb_core::salience::{analyze_neighbors, salience, Neighbor, NeighborParams};
+
+    // Archives are de-emphasized copies of pruned memories, kept for the
+    // record but out of the active retrieval corpus — so they neither get a
+    // salience nor count as neighbors for active memories.
+    let items: Vec<MemoryItem> = store
+        .list_memories(None)?
+        .into_iter()
+        .filter(|m| m.memory_type != MemoryType::Archive && m.embedding.is_some())
+        .collect();
+    if items.len() < 2 {
+        return Ok(());
+    }
+    // History span: age of the oldest memory, the window spread is measured
+    // against.
+    let oldest = items.iter().map(|m| m.created_at).min().unwrap_or(now);
+    let history_span_days = age_days(oldest, now).max(1.0);
+    let params = NeighborParams::default();
+
+    for item in &items {
+        let emb = item.embedding.as_ref().unwrap();
+        let neighbors: Vec<Neighbor> = items
+            .iter()
+            .filter(|o| o.id != item.id)
+            .filter_map(|o| {
+                o.embedding.as_ref().map(|oe| Neighbor {
+                    similarity: cosine_similarity(emb, oe).max(0.0) as f64,
+                    age_days: age_days(o.created_at, now),
+                })
+            })
+            .collect();
+        let stats = analyze_neighbors(&neighbors, history_span_days, &params);
+        let relevance = forgetfuldb_core::salience::content_relevance(item.content.chars().count(), item.entities.len());
+        let new_salience = salience(&stats, relevance);
+        if (new_salience - item.salience).abs() > 1e-6 {
+            let mut updated = item.clone();
+            updated.salience = new_salience;
+            updated.updated_at = now;
+            store.update_memory(&updated)?;
+            report.salience_revised += 1;
+        }
+    }
+    Ok(())
 }
 
 /// Pure merge logic: fold `dup` into `keep`. The surviving memory absorbs
@@ -307,12 +374,19 @@ fn archive_and_prune(store: &Store, cfg: &Config, now: i64, report: &mut Consoli
         if item.pinned {
             continue; // pinned memories never decay or get pruned
         }
+        if item.salience >= cfg.salience_keep_threshold {
+            continue; // formative (high-salience) memories are kept, like pins
+        }
         let age = age_days(item.created_at, now);
-        let current_decay = decay::decay_score(
+        // Salience-resisted so a formative memory survives the pruning that
+        // buries the routine around it.
+        let current_decay = decay::decay_score_resisted(
             item.importance_score,
             lambdas.for_type(item.memory_type),
             age,
             item.pinned,
+            item.salience,
+            cfg.salience_resist,
         );
         match item.memory_type {
             MemoryType::RawEvent if age > archive_cutoff_days && current_decay < max_decay => {
@@ -390,6 +464,113 @@ mod tests {
         .memory()
         .id
         .clone()
+    }
+
+    /// Push a memory's creation back in time (created_at is set to "now" at
+    /// ingest; behavior tests need aged memories).
+    fn backdate(store: &Store, id: &str, days: i64) {
+        let mut m = store.get_memory(id).unwrap().unwrap();
+        m.created_at = now_unix() - days * 86_400;
+        store.update_memory(&m).unwrap();
+    }
+
+    fn salience_of(store: &Store, id: &str) -> f64 {
+        store.get_memory(id).unwrap().unwrap().salience
+    }
+
+    // ---- Eval Layer 1: behavior tests (each isolates one mechanism) ----
+
+    #[test]
+    fn eval_surprise_a_novel_memory_outscores_routine_on_salience() {
+        let (store, provider, mut cfg) = setup();
+        // Isolate the salience mechanism: disable dedup-merging so the
+        // routine cluster stays intact (merging it to one would erase the
+        // "many similar neighbors" signal this test is about).
+        cfg.consolidation_thresholds.duplicate_similarity = 0.999;
+        // A cluster of mutually-similar routine memories (distinct trailing
+        // word so they don't collapse to one identical token set)...
+        for room in ["alpha", "bravo", "charlie", "delta", "echo", "foxtrot"] {
+            add(
+                &store,
+                provider.as_ref(),
+                &cfg,
+                &format!("the daily standup meeting was held at nine in room {room}"),
+                MemoryType::Episodic,
+            );
+        }
+        // ...and one genuinely novel memory (disjoint vocabulary).
+        let anomaly = add(
+            &store,
+            provider.as_ref(),
+            &cfg,
+            "a burst water pipe flooded the basement archive overnight",
+            MemoryType::Episodic,
+        );
+
+        consolidate(&store, &ExtractiveSummarizer::default(), &cfg).unwrap();
+
+        // Compare against the most-salient surviving routine memory (some may
+        // have merged) — the novel one must out-salience all of them. The
+        // behavioral claim is relative: absolute values float with the
+        // embedding backend (hashed_bow has a collision floor).
+        let anomaly_sal = salience_of(&store, &anomaly);
+        let routine_max = store
+            .list_memories(None)
+            .unwrap()
+            .iter()
+            .filter(|m| m.id != anomaly && m.source.as_deref() != Some("consolidation"))
+            .map(|m| m.salience)
+            .fold(0.0_f64, f64::max);
+        assert!(
+            anomaly_sal > routine_max + 0.1,
+            "the novel memory should be clearly more salient: anomaly {anomaly_sal:.3} vs best routine {routine_max:.3}"
+        );
+    }
+
+    #[test]
+    fn eval_selective_forgetting_anomaly_survives_routine_is_archived() {
+        let (store, provider, cfg) = setup();
+        // 6 routine raw events + 1 anomaly, all aged past the archive window.
+        let mut routine = Vec::new();
+        for d in 0..6 {
+            let id = add(
+                &store,
+                provider.as_ref(),
+                &cfg,
+                &format!("logged the routine nightly backup job run number {d} completed ok"),
+                MemoryType::RawEvent,
+            );
+            backdate(&store, &id, 30);
+            routine.push(id);
+        }
+        let anomaly = add(
+            &store,
+            provider.as_ref(),
+            &cfg,
+            "the production database was accidentally dropped during the migration incident",
+            MemoryType::RawEvent,
+        );
+        backdate(&store, &anomaly, 30);
+
+        consolidate(&store, &ExtractiveSummarizer::default(), &cfg).unwrap();
+
+        // The anomaly is formative — kept as a raw event, not archived.
+        let kept = store.get_memory(&anomaly).unwrap().unwrap();
+        assert_eq!(kept.memory_type, MemoryType::RawEvent, "the anomaly must survive (salience {:.3})", kept.salience);
+        assert!(kept.salience >= cfg.salience_keep_threshold, "anomaly salience {:.3} should clear the keep bar", kept.salience);
+
+        // The routine decayed into the archive (forgotten as distinct events).
+        let archived = routine
+            .iter()
+            .filter(|id| {
+                store
+                    .get_memory(id)
+                    .unwrap()
+                    .map(|m| m.memory_type == MemoryType::Archive)
+                    .unwrap_or(true) // pruned entirely also counts as forgotten
+            })
+            .count();
+        assert!(archived >= 4, "most routine memories should be archived/forgotten, got {archived}/6");
     }
 
     #[test]

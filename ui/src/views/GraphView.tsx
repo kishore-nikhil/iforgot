@@ -36,7 +36,7 @@ const nodeId = (e: string | GraphNode) => (typeof e === 'string' ? e : e.id);
 // Edge types with a real direction (source → target). These get animated
 // flow particles + an arrowhead; co_occurred is undirected (a mutual
 // association) so it flows but carries no arrow.
-const DIRECTED = new Set(['derived_from', 'updates', 'contradicts', 'supports', 'belongs_to_project']);
+const DIRECTED = new Set(['sequence', 'derived_from', 'updates', 'contradicts', 'supports', 'belongs_to_project']);
 
 const now_ms = () => performance.now();
 // Stable per-node phase so glows don't pulse in unison.
@@ -563,6 +563,11 @@ function DetailPanel({
       <dl>
         <dt>importance</dt>
         <dd className="mono">{m.importance_score.toFixed(3)}</dd>
+        <dt>salience</dt>
+        <dd className="mono" style={m.salience >= 0.6 ? { color: 'var(--green)' } : {}}>
+          {m.salience.toFixed(3)}
+          {m.salience >= 0.6 ? ' ✦ kept' : ''}
+        </dd>
         <dt>decay (stored)</dt>
         <dd className="mono">{m.decay_score.toFixed(3)}</dd>
         <dt>recurrence</dt>

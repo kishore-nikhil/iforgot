@@ -24,6 +24,7 @@ const MIGRATIONS: &[(&str, &str)] = &[
     ("0003_consolidation_runs", include_str!("../migrations/0003_consolidation_runs.sql")),
     ("0004_store_meta", include_str!("../migrations/0004_store_meta.sql")),
     ("0005_memory_edges", include_str!("../migrations/0005_memory_edges.sql")),
+    ("0006_salience", include_str!("../migrations/0006_salience.sql")),
 ];
 
 pub struct Store {
@@ -90,8 +91,8 @@ impl Store {
                  id, content, summary, memory_type, source, topic, entities, tags,
                  created_at, updated_at, last_accessed_at, access_count,
                  importance_score, recurrence_score, recency_score, decay_score,
-                 confidence, stale, pinned, embedding, content_hash
-             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21)",
+                 confidence, stale, pinned, embedding, content_hash, salience
+             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22)",
             params![
                 item.id,
                 item.content,
@@ -114,6 +115,7 @@ impl Store {
                 item.pinned as i64,
                 item.embedding.as_ref().map(|e| encode_embedding(e)),
                 item.content_hash,
+                item.salience,
             ],
         )?;
         Ok(())
@@ -126,7 +128,8 @@ impl Store {
                  entities = ?7, tags = ?8, updated_at = ?9, last_accessed_at = ?10,
                  access_count = ?11, importance_score = ?12, recurrence_score = ?13,
                  recency_score = ?14, decay_score = ?15, confidence = ?16,
-                 stale = ?17, pinned = ?18, embedding = ?19, content_hash = ?20
+                 stale = ?17, pinned = ?18, embedding = ?19, content_hash = ?20,
+                 salience = ?21
              WHERE id = ?1",
             params![
                 item.id,
@@ -149,6 +152,7 @@ impl Store {
                 item.pinned as i64,
                 item.embedding.as_ref().map(|e| encode_embedding(e)),
                 item.content_hash,
+                item.salience,
             ],
         )?;
         Ok(())
@@ -205,8 +209,16 @@ impl Store {
 
     pub fn delete_memory(&self, id: &str) -> Result<bool> {
         let n = self.conn.execute("DELETE FROM memory_items WHERE id = ?1", [id])?;
+        // Cascade: don't leave dangling links/edges pointing at a memory
+        // that no longer exists. (The consolidation edge rebuilds also clear
+        // and recompute, but deleting here keeps the graph consistent in
+        // between — and outside — those passes.)
         self.conn.execute(
             "DELETE FROM memory_links WHERE source_id = ?1 OR target_id = ?1",
+            [id],
+        )?;
+        self.conn.execute(
+            "DELETE FROM memory_edges WHERE src_id = ?1 OR dst_id = ?1",
             [id],
         )?;
         Ok(n > 0)
@@ -448,6 +460,17 @@ impl Store {
     }
 
     // ---- store metadata (key/value) ---------------------------------------
+
+    /// SQLite's `data_version` pragma: a counter that changes whenever the
+    /// database file is modified by **another** connection (it does *not*
+    /// move for this connection's own writes). Polling it lets the server
+    /// detect writes made by a separate `iforgot` process so the UI can be
+    /// pushed an update — server-originated writes are signaled explicitly.
+    pub fn data_version(&self) -> Result<i64> {
+        self.conn
+            .query_row("PRAGMA data_version", [], |r| r.get(0))
+            .map_err(Into::into)
+    }
 
     pub fn get_meta(&self, key: &str) -> Result<Option<String>> {
         self.conn
@@ -733,7 +756,7 @@ pub struct StoreStats {
 
 const MEMORY_COLUMNS: &str = "id, content, summary, memory_type, source, topic, entities, tags, \
     created_at, updated_at, last_accessed_at, access_count, importance_score, recurrence_score, \
-    recency_score, decay_score, confidence, stale, pinned, embedding, content_hash";
+    recency_score, decay_score, confidence, stale, pinned, embedding, content_hash, salience";
 
 fn row_to_memory(row: &Row<'_>) -> rusqlite::Result<MemoryItem> {
     let memory_type: String = row.get(3)?;
@@ -768,6 +791,7 @@ fn row_to_memory(row: &Row<'_>) -> rusqlite::Result<MemoryItem> {
         pinned: row.get::<_, i64>(18)? != 0,
         embedding: embedding.map(|b| decode_embedding(&b)),
         content_hash: row.get(20)?,
+        salience: row.get(21)?,
     })
 }
 
@@ -873,6 +897,27 @@ mod tests {
         let per = t0.elapsed().as_secs_f64() * 1000.0 / iters as f64;
         println!("co-occurrence bump (6 ids / 15 pairs): {per:.3} ms/turn over {iters} iters");
         assert!(per < 5.0, "bump should be well under 5ms/turn, was {per:.3} ms");
+    }
+
+    #[test]
+    fn delete_memory_cascades_to_edges_and_links() {
+        let store = Store::open_in_memory().unwrap();
+        store.insert_memory(&sample_item("mem_1", "a")).unwrap();
+        store.insert_memory(&sample_item("mem_2", "b")).unwrap();
+        store
+            .insert_link(&MemoryLink {
+                source_id: "mem_1".into(),
+                target_id: "mem_2".into(),
+                relation: LinkRelation::Updates,
+            })
+            .unwrap();
+        store.bump_cooccurrence_edges(&["mem_1".into(), "mem_2".into()], 1).unwrap();
+        assert_eq!(store.list_edges().unwrap().len(), 1);
+
+        store.delete_memory("mem_1").unwrap();
+        // No dangling links or edges reference the deleted memory.
+        assert!(store.links_for("mem_2").unwrap().is_empty());
+        assert!(store.list_edges().unwrap().is_empty(), "edges to a deleted memory must be cleaned up");
     }
 
     #[test]

@@ -388,19 +388,26 @@ pub fn seed(dir: &Path) -> Result<()> {
         }
     }
 
-    // Build co-occurrence association edges from the seeded chat turns, so
-    // the graph shows "used-together" links immediately.
-    let assoc = forgetfuldb_store::pipeline::rebuild_cooccurrence_edges(
+    // Run one consolidation "sleep cycle" so the demo store showcases the
+    // full engine: salience is scored, all three association-edge types are
+    // built (co-occurrence, semantic, sequence), routine raw events fade to
+    // archive, and a run is logged for the consolidation view.
+    let report = forgetfuldb_consolidate::consolidate(
         &store,
-        cfg.edge_decay_lambda,
-        cfg.edge_min_weight,
-        now,
+        &forgetfuldb_consolidate::ExtractiveSummarizer::default(),
+        &cfg,
     )?;
 
     println!("seeded demo store in {}:", dir.display());
     println!(
-        "  {memories} memories | {links} links | {assoc} co-occurrence edges | {} consolidation runs | {turns} chat turns",
-        runs.len()
+        "  {memories} memories | {links} seeded links | salience scored on {} | edges: {} co-occur, {} semantic, {} sequence",
+        report.salience_revised, report.associations, report.semantic_edges, report.sequence_edges,
+    );
+    println!(
+        "  consolidation: {} merged, {} archived, {} runs total | {turns} chat turns",
+        report.duplicates_merged,
+        report.archived,
+        runs.len() + 1,
     );
     println!("explore it:");
     println!("  forgetfuldb server --config {} --ui ui/dist", dir.join("forgetfuldb.toml").display());
@@ -418,10 +425,16 @@ mod tests {
         seed(&dir).unwrap();
         let store = Store::open(&dir.join("forgetfuldb-demo.sqlite3")).unwrap();
         let stats = store.stats().unwrap();
-        assert!(stats.total_memories >= 150, "expected a populated store, got {}", stats.total_memories);
+        // After the demo's consolidation pass, near-duplicates merge and some
+        // routine raw events archive, so the count is well below the ~219
+        // seeded — still a richly populated store.
+        assert!(stats.total_memories >= 100, "expected a populated store, got {}", stats.total_memories);
         assert!(stats.links > 5);
         assert!(!store.list_consolidation_runs(20).unwrap().is_empty());
         assert!(!store.list_chat_turns(500).unwrap().is_empty());
+        // The consolidation pass scored salience and built the typed edges.
+        assert!(store.list_edges().unwrap().iter().any(|e| e.edge_type == "semantic_similar"));
+        assert!(store.list_memories(None).unwrap().iter().any(|m| m.salience > 0.0));
 
         // Re-seeding is idempotent (clean slate, same generator seed).
         let first_total = stats.total_memories;

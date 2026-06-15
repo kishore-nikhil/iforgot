@@ -72,6 +72,17 @@ export default function RetrievalView({ cfg }: { cfg: UiConfig | null }) {
       <p className="dim">
         Runs the exact chat-path retrieval (gate {cfg?.chat.min_retrieval_score ?? '…'}, damping{' '}
         {cfg?.chat.conversational_damping ?? '…'}) and shows what would be injected — and what almost was.
+        {cfg?.embedding && (
+          <>
+            {' '}Embedding:{' '}
+            <span className="mono">
+              {cfg.embedding.backend === 'hashed_bow'
+                ? `hashed_bow (${cfg.embedding.dim}d, lexical)`
+                : `${cfg.embedding.model} (${cfg.embedding.dim}d)`}
+            </span>
+            .
+          </>
+        )}
       </p>
 
       <div className="panel">
@@ -250,6 +261,11 @@ function ResultRow({
         {damped && (
           <span className="chip" title="verbatim chat turn — score damped">
             ×{s.conversational_damping}
+          </span>
+        )}
+        {(s.salience ?? 0) >= 0.6 && (
+          <span className="chip" style={{ color: 'var(--green)' }} title={`salience ${(s.salience ?? 0).toFixed(2)} — resists decay`}>
+            ✦ salient
           </span>
         )}
         {m.pinned && <span className="chip">📌</span>}

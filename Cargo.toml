@@ -31,7 +31,8 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 clap = { version = "4", features = ["derive"] }
 axum = "0.7"
 tower-http = { version = "0.6", features = ["fs"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
 # No TLS features on purpose: the agent only ever talks plain HTTP to
 # localhost (Ollama / llama-server), which keeps "local-only" enforceable
 # at the dependency level.

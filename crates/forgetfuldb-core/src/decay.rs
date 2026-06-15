@@ -62,6 +62,20 @@ pub fn decay_score(importance: f64, lambda: f64, age_days: f64, pinned: bool) ->
     importance * (-lambda * age_days.max(0.0)).exp()
 }
 
+/// Decay-adjusted importance with **salience resistance**: a formative
+/// (high-salience) memory forgets more slowly. `salience` in `[0, 1]`
+/// scales the effective decay rate down by up to `resist` (e.g. resist
+/// 0.7 → a fully-salient memory decays at 30% of the base rate). Pinned
+/// still short-circuits to no decay at all. This is where the salience
+/// axis "keeps the formative" meets decay "forgets the unused".
+pub fn decay_score_resisted(importance: f64, lambda: f64, age_days: f64, pinned: bool, salience: f64, resist: f64) -> f64 {
+    if pinned {
+        return importance;
+    }
+    let eff_lambda = lambda * (1.0 - resist.clamp(0.0, 1.0) * salience.clamp(0.0, 1.0));
+    importance * (-eff_lambda * age_days.max(0.0)).exp()
+}
+
 /// Recency score in [0, 1] from days since last access (or creation).
 /// Uses a gentle curve so something touched a week ago still registers.
 pub fn recency_score(days_since_access: f64) -> f64 {
@@ -91,6 +105,21 @@ mod tests {
     fn pinned_memories_do_not_decay() {
         let s = decay_score(0.8, 0.35, 365.0, true);
         assert_eq!(s, 0.8);
+    }
+
+    #[test]
+    fn salience_slows_decay() {
+        // Same memory, same age — the salient one retains far more.
+        let dull = decay_score_resisted(0.8, 0.35, 20.0, false, 0.0, 0.7);
+        let salient = decay_score_resisted(0.8, 0.35, 20.0, false, 1.0, 0.7);
+        assert!(salient > dull);
+        // A fully-salient memory decays at (1 - resist) of the base rate.
+        let plain = decay_score(0.8, 0.35, 20.0, false);
+        assert!((dull - plain).abs() < 1e-9, "salience 0 == plain decay");
+        let expected_salient = decay_score(0.8, 0.35 * 0.3, 20.0, false);
+        assert!((salient - expected_salient).abs() < 1e-9);
+        // Pin still wins outright.
+        assert_eq!(decay_score_resisted(0.8, 0.35, 365.0, true, 0.0, 0.7), 0.8);
     }
 
     #[test]

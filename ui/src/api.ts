@@ -28,7 +28,9 @@ export const TYPE_COLORS: Record<MemoryTypeName, string> = {
 };
 
 export const EDGE_COLORS: Record<string, string> = {
-  co_occurred: '#2dd4bf',
+  co_occurred: '#2dd4bf', // recalled together (Hebbian)
+  semantic_similar: '#a371f7', // close in meaning (cosine kNN)
+  sequence: '#f778ba', // discussed one after another (causal, directed)
   derived_from: '#3fb950',
   updates: '#d29922',
   contradicts: '#f85149',
@@ -46,6 +48,7 @@ export interface GraphNode {
   recurrence_score: number;
   pinned: boolean;
   stale: boolean;
+  salience: number;
   created_at: number;
   last_accessed_at: number | null;
   tags: string[];
@@ -80,6 +83,7 @@ export interface ScoreBreakdown {
   staleness_penalty: number;
   conversational_damping: number;
   association_boost?: number;
+  salience?: number;
   total: number;
 }
 
@@ -118,6 +122,8 @@ export interface UiConfig {
     staleness_penalty: number;
   };
   chat: { top_k: number; min_retrieval_score: number; conversational_damping: number };
+  embedding?: { backend: string; model: string; dim: number };
+  salience?: { resist: number; keep_threshold: number; spreading_activation: boolean };
 }
 
 export interface ChatTurn {
@@ -161,6 +167,7 @@ export interface MemoryDetail {
     summary: string | null;
     source: string | null;
     entities: string[];
+    salience: number;
     access_count: number;
     importance_score: number;
     recurrence_score: number;

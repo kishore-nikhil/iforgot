@@ -54,6 +54,12 @@ pub struct RetrieveOptions {
     /// `min_score`, with full breakdowns. For the retrieval inspector —
     /// "what almost got injected".
     pub debug: bool,
+    /// Skip decay entirely and use raw importance. For *dated* / epoch
+    /// queries ("everything I did in 2026"): decay governs ambient recall
+    /// (what surfaces unprompted), but a temporal lookup is a different
+    /// operation — "what happened in this interval", regardless of whether
+    /// it has faded.
+    pub bypass_decay: bool,
 }
 
 impl Default for RetrieveOptions {
@@ -69,6 +75,7 @@ impl Default for RetrieveOptions {
             since: None,
             until: None,
             debug: false,
+            bypass_decay: false,
         }
     }
 }
@@ -224,12 +231,19 @@ pub fn retrieve(
         let semantic_similarity = (0.7 * cosine + 0.3 * keywords).clamp(0.0, 1.0);
 
         let lambda = lambdas.for_type(item.memory_type);
-        let importance = decay::decay_score(
-            item.importance_score,
-            lambda,
-            age_days(item.created_at, now),
-            item.pinned,
-        );
+        // Salience resists decay; a dated query bypasses decay entirely.
+        let importance = if opts.bypass_decay {
+            item.importance_score
+        } else {
+            decay::decay_score_resisted(
+                item.importance_score,
+                lambda,
+                age_days(item.created_at, now),
+                item.pinned,
+                item.salience,
+                cfg.salience_resist,
+            )
+        };
         let recency = decay::recency_score(age_days(
             item.last_accessed_at.unwrap_or(item.created_at),
             now,
@@ -243,6 +257,7 @@ pub fn retrieve(
                 recency,
                 pinned: item.pinned,
                 stale: item.stale,
+                salience: item.salience,
             },
             weights,
         );
