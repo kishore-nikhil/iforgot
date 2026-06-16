@@ -49,9 +49,14 @@ pub struct Config {
     /// behavior is unchanged until opted in.
     #[serde(default)]
     pub spreading_activation: bool,
-    /// Strength of the spreading-activation boost (0 disables).
+    /// Strength of the spreading-activation boost (0 disables). Also the
+    /// per-node cap, so an associated memory can never outscore a direct hit.
     #[serde(default = "default_spreading_factor")]
     pub spreading_factor: f64,
+    /// Multi-hop walk parameters (how far association spreads, per-edge-type
+    /// strengths). At `max_hops = 1` this is the original one-hop boost.
+    #[serde(default)]
+    pub spreading: SpreadingConfig,
     /// Per-day decay applied to a co-occurrence when summing edge weight,
     /// so recent shared turns matter more than old ones.
     #[serde(default = "default_edge_decay_lambda")]
@@ -223,6 +228,50 @@ impl Default for ChatConfig {
     }
 }
 
+/// Multi-hop spreading-activation parameters. Mirrors
+/// `forgetfuldb_retrieve::traverse::TraverseParams`; the retrieve crate maps
+/// one to the other (core can't depend on retrieve).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SpreadingConfig {
+    /// Hops out from a seed the walk may take. 1 = the original one-hop boost.
+    pub max_hops: usize,
+    /// Per-hop attenuation in `(0, 1]`.
+    pub hop_decay: f64,
+    /// Contributions below this are dropped (stops weak chains leaking).
+    pub activation_floor: f64,
+    /// How many top-scoring memories seed the walk.
+    pub seed_count: usize,
+    /// Per-edge-type propagation strengths: a `sequence` (causal) edge
+    /// carries more than `semantic_similar` (mere closeness).
+    pub co_occurred_factor: f64,
+    pub semantic_factor: f64,
+    pub sequence_factor: f64,
+    /// Attach the connected subgraph (paths among the injected memories) to
+    /// the context pack, so the prompt can show *how* memories relate, not
+    /// just a flat list. Off by default — it costs tokens; watch the
+    /// retention-efficiency metric.
+    pub inject_subgraph: bool,
+    /// Cap on distinct memories spanned by the injected subgraph.
+    pub subgraph_max_nodes: usize,
+}
+
+impl Default for SpreadingConfig {
+    fn default() -> Self {
+        SpreadingConfig {
+            max_hops: 1, // opt-in to multi-hop; 1 preserves today's behavior
+            hop_decay: 0.5,
+            activation_floor: 0.01,
+            seed_count: 10,
+            co_occurred_factor: 0.8,
+            semantic_factor: 0.6,
+            sequence_factor: 1.0,
+            inject_subgraph: false,
+            subgraph_max_nodes: 12,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ConsolidationThresholds {
@@ -305,6 +354,7 @@ impl Default for Config {
             consolidation_thresholds: ConsolidationThresholds::default(),
             spreading_activation: false,
             spreading_factor: default_spreading_factor(),
+            spreading: SpreadingConfig::default(),
             edge_decay_lambda: default_edge_decay_lambda(),
             edge_min_weight: default_edge_min_weight(),
             salience_resist: default_salience_resist(),

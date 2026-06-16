@@ -34,7 +34,7 @@ Each is a distinct axis over the same memories. The one-line thesis:
 | **Salience** | Keeps the formative — U-shaped (surprise ∨ habit), resists decay | ✅ shipped |
 | **Abstraction** | Turns repetition into traits (raw → episodic → semantic → foundation) | ✅ shipped (episodic→semantic, habit→foundation, burst→gist) |
 | **Epochs** | Organizes a lifetime into eras (drift-segmented) | ✅ shipped (drift segmentation; calendar grid still planned) |
-| **Edges** | Connects memories (typed graph + traversal) | ◐ partial (4 edge types + one-hop activation; multi-hop traversal planned) |
+| **Edges** | Connects memories (typed graph + traversal) | ✅ shipped (4 edge types + multi-hop traversal + subgraph injection) |
 | **Dreaming** | *Creates* memories/connections offline (recombination) | ○ planned |
 
 A unifying insight used throughout: **one neighbor-density-over-time
@@ -98,10 +98,20 @@ Three notions of "related", each a different traversal meaning:
 Plus the consolidation-built `derived_from` (summary provenance) and
 `duplicates` (dedup) links.
 
-### Spreading activation (one hop, config-gated)
-Retrieving a memory boosts its co-occurrence neighbors, so companions
-surface even at low query similarity. Intentionally one-hop today
-(non-cascading); multi-hop traversal is planned.
+### Multi-hop spreading activation + subgraph injection (`retrieve::traverse`)
+Retrieval doesn't just score memories in isolation — from the top hits,
+activation spreads along the typed graph (all three edge types), decaying each
+hop, so a memory that doesn't match the query but is *connected* to one that
+does can surface. A `sequence` (causal) edge propagates more strongly than
+`semantic_similar` (mere closeness); an activation floor and `max_hops` bound
+the walk; the pure walk lives in `traverse.rs`. With `inject_subgraph` on, the
+connective memories (linked to the hits but not themselves top-k — the whole
+point) are pulled into the result and the **paths** attached, which the agent
+renders as a "how these connect" block so the model can reason over the chain,
+not a flat list. The boost is capped at `spreading_factor`, so association is
+a *hint* that never outranks a genuine hit (conversational dominance).
+`max_hops = 1` is exactly the original one-hop co-occurrence boost, so the
+whole thing is opt-in.
 
 ### Temporal query bypass
 Dated / epoch queries (`bypass_decay`) skip decay and read raw importance:
@@ -164,8 +174,9 @@ this server or by a separate `iforgot` process (detected via SQLite
 Ordered by the critical path. Each is specced enough to build cleanly.
 
 > ✅ **Done:** the **Foundation tier**, **gist-collapse keeping the anomaly**,
-> and **epochs** (items 1–3 below) now ship — see "What's implemented today".
-> The remaining critical path starts at **multi-hop traversal**.
+> **epochs**, and **multi-hop traversal + subgraph injection** (items 1–4
+> below) now ship — see "What's implemented today". The remaining critical
+> path starts at **inferred contradiction detection**.
 
 1. ~~**Foundation tier**~~ — *shipped.* Decay-exempt trait memories
    *concluded* by consolidation from accumulated habit evidence ("user
@@ -178,12 +189,12 @@ Ordered by the critical path. Each is specced enough to build cleanly.
    art: **ES-Mem** (arXiv 2601.07582). Consolidate *within* an epoch, preserve
    *across*. Still planned: a calendar grid running orthogonally to the
    organic eras.
-4. **Multi-hop edge traversal + subgraph injection** — retrieval becomes a
-   path-walk of the typed graph with per-hop activation decay, and injects
-   a *connected subgraph with paths* (so the model can reason over the
-   chain), not a flat list. The difference between *retrieval* and
-   *thinking*. Must preserve conversational dominance (relationships are
-   hints, not overrides).
+4. ~~**Multi-hop edge traversal + subgraph injection**~~ — *shipped.*
+   Retrieval is now a path-walk of the typed graph with per-hop activation
+   decay that injects the *connected subgraph with paths* (so the model can
+   reason over the chain), not a flat list — capped so it never overrides the
+   live conversation. Follow-ups: a UI view of the cascade, and tuning before
+   it's on by default.
 5. **Inferred contradiction detection** — read text, conclude
    "A supersedes B", write a contrastive edge — the direct attack on
    *staleness*, the hardest open problem in agent memory.
