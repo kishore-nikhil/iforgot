@@ -7,6 +7,7 @@ export type MemoryTypeName =
   | 'semantic'
   | 'procedural'
   | 'preference'
+  | 'foundation'
   | 'archive';
 
 export const MEMORY_TYPES: MemoryTypeName[] = [
@@ -15,6 +16,7 @@ export const MEMORY_TYPES: MemoryTypeName[] = [
   'semantic',
   'procedural',
   'preference',
+  'foundation',
   'archive',
 ];
 
@@ -24,11 +26,14 @@ export const TYPE_COLORS: Record<MemoryTypeName, string> = {
   semantic: '#3fb950',
   procedural: '#d29922',
   preference: '#bc8cff',
+  foundation: '#e3b341', // decay-exempt identity trait — gold for bedrock
   archive: '#484f58',
 };
 
 export const EDGE_COLORS: Record<string, string> = {
-  co_occurred: '#2dd4bf',
+  co_occurred: '#2dd4bf', // recalled together (Hebbian)
+  semantic_similar: '#a371f7', // close in meaning (cosine kNN)
+  sequence: '#f778ba', // discussed one after another (causal, directed)
   derived_from: '#3fb950',
   updates: '#d29922',
   contradicts: '#f85149',
@@ -46,6 +51,7 @@ export interface GraphNode {
   recurrence_score: number;
   pinned: boolean;
   stale: boolean;
+  salience: number;
   created_at: number;
   last_accessed_at: number | null;
   tags: string[];
@@ -80,6 +86,7 @@ export interface ScoreBreakdown {
   staleness_penalty: number;
   conversational_damping: number;
   association_boost?: number;
+  salience?: number;
   total: number;
 }
 
@@ -118,6 +125,8 @@ export interface UiConfig {
     staleness_penalty: number;
   };
   chat: { top_k: number; min_retrieval_score: number; conversational_damping: number };
+  embedding?: { backend: string; model: string; dim: number };
+  salience?: { resist: number; keep_threshold: number; spreading_activation: boolean };
 }
 
 export interface ChatTurn {
@@ -161,6 +170,7 @@ export interface MemoryDetail {
     summary: string | null;
     source: string | null;
     entities: string[];
+    salience: number;
     access_count: number;
     importance_score: number;
     recurrence_score: number;
@@ -183,6 +193,24 @@ export interface StoreStats {
   sessions: number;
 }
 
+/** Aggregate chat metrics from /metrics, including retention-efficiency
+ *  cost terms (the per-token price of injected memory). */
+export interface ChatMetrics {
+  turns: number;
+  avg_prompt_tokens: number | null;
+  avg_completion_tokens: number | null;
+  total_prompt_tokens: number;
+  total_completion_tokens: number;
+  avg_context_chars: number | null;
+  avg_context_memories: number | null;
+  avg_retrieve_ms: number | null;
+  avg_llm_ms: number | null;
+  injected_tokens: number;
+  injected_tokens_per_turn: number | null;
+  injected_token_share: number | null;
+  tokens_per_injected_memory: number | null;
+}
+
 async function getJson<T>(url: string): Promise<T> {
   const res = await fetch(url);
   if (!res.ok) throw new Error(`${url}: ${res.status} ${await res.text()}`);
@@ -199,6 +227,7 @@ export const api = {
   },
   uiconfig: () => getJson<UiConfig>('/uiconfig'),
   stats: () => getJson<StoreStats>('/stats'),
+  metrics: () => getJson<ChatMetrics>('/metrics'),
   turns: (limit = 300) => getJson<{ turns: ChatTurn[] }>(`/turns?limit=${limit}`),
   consolidations: (limit = 20) => getJson<{ runs: ConsolidationRun[] }>(`/consolidations?limit=${limit}`),
   memory: (id: string) => getJson<MemoryDetail>(`/memory/${id}`),

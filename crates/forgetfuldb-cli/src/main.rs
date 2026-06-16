@@ -1,6 +1,7 @@
 //! forgetfuldb — local-first AI memory database CLI.
 
 mod demo;
+mod schedule;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -68,6 +69,12 @@ enum Command {
     },
     /// Run a consolidation pass (dedup, summarize, promote, archive)
     Consolidate,
+    /// Manage the nightly consolidation timer (macOS launchd). Consolidation
+    /// is otherwise manual — install this so the sleep cycle runs on its own.
+    Schedule {
+        #[command(subcommand)]
+        action: ScheduleAction,
+    },
     /// Show database statistics
     Stats,
     /// Show chat token/context metrics (recorded by iforgot chat & the proxy)
@@ -111,6 +118,24 @@ enum Command {
     Reembed,
 }
 
+#[derive(Subcommand)]
+enum ScheduleAction {
+    /// Install (or refresh) the nightly consolidation agent for the active
+    /// store. Runs `forgetfuldb consolidate` every night at the given time.
+    Install {
+        /// Hour of day, 0–23 (local time). Default: 3am.
+        #[arg(long, default_value_t = 3)]
+        hour: u8,
+        /// Minute, 0–59. Default: 0.
+        #[arg(long, default_value_t = 0)]
+        minute: u8,
+    },
+    /// Stop and remove the nightly consolidation agent.
+    Uninstall,
+    /// Show whether the nightly agent is installed and loaded.
+    Status,
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
@@ -136,6 +161,7 @@ fn main() -> Result<()> {
             resolved.path.display()
         );
     }
+    let config_path = resolved.path.clone();
     let cfg = resolved.config;
 
     match cli.command {
@@ -175,6 +201,11 @@ fn main() -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&report)?);
             Ok(())
         }
+        Command::Schedule { action } => match action {
+            ScheduleAction::Install { hour, minute } => schedule::install(&config_path, hour, minute),
+            ScheduleAction::Uninstall => schedule::uninstall(),
+            ScheduleAction::Status => schedule::status(),
+        },
         Command::Stats => {
             let store = open_store(&cfg)?;
             let stats = store.stats()?;
@@ -199,11 +230,20 @@ fn main() -> Result<()> {
                 return Ok(());
             }
             let fmt = |v: Option<f64>| v.map_or("?".to_string(), |x| format!("{x:.0}"));
+            let fmt1 = |v: Option<f64>| v.map_or("?".to_string(), |x| format!("{x:.1}"));
+            let pct = |v: Option<f64>| v.map_or("?".to_string(), |x| format!("{:.1}%", x * 100.0));
             println!("chat turns      : {}", m.turns);
             println!("prompt tokens   : avg {} (total {})", fmt(m.avg_prompt_tokens), m.total_prompt_tokens);
             println!("reply tokens    : avg {} (total {})", fmt(m.avg_completion_tokens), m.total_completion_tokens);
             println!("context         : avg {} chars, avg {} memories/turn", fmt(m.avg_context_chars), fmt(m.avg_context_memories));
             println!("latency         : retrieve avg {} ms, llm avg {} ms", fmt(m.avg_retrieve_ms), fmt(m.avg_llm_ms));
+            // Retention efficiency = accuracy ÷ injected tokens. Accuracy comes
+            // from the behavior tests / benchmarks; this is the cost it pairs
+            // with — the number that flatters forgetting.
+            println!("— retention efficiency (cost denominator) —");
+            println!("injected memory : ~{} tok/turn", fmt1(m.injected_tokens_per_turn()));
+            println!("prompt share    : {} of prompt is memory", pct(m.injected_token_share()));
+            println!("per memory      : ~{} tok/injected memory", fmt1(m.tokens_per_injected_memory()));
             Ok(())
         }
         Command::Inspect { id } => {

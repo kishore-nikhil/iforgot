@@ -87,6 +87,9 @@ const IMPORTANCE_CUES: &[&str] = &[
 /// boosts for explicit cues, tags and substantial content.
 pub fn initial_importance(text: &str, memory_type: MemoryType, tags: &[String]) -> f64 {
     let base = match memory_type {
+        // Foundation is concluded by consolidation, not ingested directly;
+        // if one is ever written by hand it should rank as a core trait.
+        MemoryType::Foundation => 0.90,
         MemoryType::Preference => 0.75,
         MemoryType::Procedural => 0.70,
         MemoryType::Semantic => 0.65,

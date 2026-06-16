@@ -51,6 +51,11 @@ pub struct ScoreInputs {
     pub recency: f64,
     pub pinned: bool,
     pub stale: bool,
+    /// The memory's salience in `[0, 1]`. Informational here — its effect
+    /// is already baked into `importance` via salience-resisted decay — but
+    /// surfaced in the breakdown so the UI can explain *why* an old memory
+    /// survived.
+    pub salience: f64,
 }
 
 /// Per-component breakdown returned to callers so the CLI/API can explain
@@ -73,6 +78,10 @@ pub struct ScoreBreakdown {
     /// activation is off or the memory has no relevant associations.
     #[serde(default)]
     pub association_boost: f64,
+    /// The memory's salience in `[0, 1]` (informational; folded into
+    /// `importance` via decay resistance).
+    #[serde(default)]
+    pub salience: f64,
     pub total: f64,
 }
 
@@ -99,6 +108,7 @@ pub fn retrieval_score(inputs: &ScoreInputs, w: &RetrievalWeights) -> ScoreBreak
         staleness_penalty,
         conversational_damping: 1.0,
         association_boost: 0.0,
+        salience: inputs.salience,
         total,
     }
 }
@@ -115,6 +125,7 @@ mod tests {
             recency: 0.5,
             pinned: false,
             stale: false,
+            salience: 0.0,
         }
     }
 

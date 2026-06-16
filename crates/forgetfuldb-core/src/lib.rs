@@ -16,6 +16,7 @@ pub mod config;
 pub mod decay;
 pub mod ids;
 pub mod ingest;
+pub mod salience;
 pub mod scoring;
 pub mod types;
 

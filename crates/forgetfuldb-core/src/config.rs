@@ -36,6 +36,11 @@ pub struct Config {
     pub decay_lambda_semantic: f64,
     pub decay_lambda_procedural: f64,
     pub decay_lambda_preference: f64,
+    /// Decay rate for Foundation traits. Defaults to 0 (never decays);
+    /// `serde(default)` keeps configs written before the Foundation tier
+    /// loadable.
+    #[serde(default)]
+    pub decay_lambda_foundation: f64,
     pub retrieval_weights: RetrievalWeights,
     pub consolidation_thresholds: ConsolidationThresholds,
     /// Enable spreading activation: after base scoring, boost memories
@@ -55,6 +60,23 @@ pub struct Config {
     /// from filling with one-off pairings).
     #[serde(default = "default_edge_min_weight")]
     pub edge_min_weight: f64,
+    /// How strongly salience resists decay, in `[0, 1]`. A fully-salient
+    /// memory decays at `(1 - salience_resist)` of the base rate (0.7 →
+    /// 30%). 0 disables salience-based decay resistance.
+    #[serde(default = "default_salience_resist")]
+    pub salience_resist: f64,
+    /// Salience at/above which a memory is **kept** through pruning,
+    /// regardless of decay — the automatic counterpart to a manual pin.
+    /// This is how a formative memory survives the archiving that buries
+    /// the routine around it. 1.0 effectively disables the hard keep.
+    #[serde(default = "default_salience_keep_threshold")]
+    pub salience_keep_threshold: f64,
+    /// Minimum cosine for a `semantic_similar` edge (kNN in meaning-space).
+    #[serde(default = "default_semantic_edge_min_sim")]
+    pub semantic_edge_min_sim: f64,
+    /// Nearest neighbors linked per memory for `semantic_similar` edges.
+    #[serde(default = "default_semantic_edge_top_k")]
+    pub semantic_edge_top_k: usize,
     /// Raw events older than this become archive memories.
     pub archive_after_days: f64,
     /// Archived, unpinned memories older than this are deleted.
@@ -155,6 +177,18 @@ fn default_edge_decay_lambda() -> f64 {
 fn default_edge_min_weight() -> f64 {
     0.1
 }
+fn default_salience_resist() -> f64 {
+    0.7
+}
+fn default_salience_keep_threshold() -> f64 {
+    0.6
+}
+fn default_semantic_edge_min_sim() -> f64 {
+    0.55
+}
+fn default_semantic_edge_top_k() -> usize {
+    5
+}
 
 pub fn default_system_prompt() -> String {
     "You are iForgot, a local AI assistant for a software developer on macOS. You help \
@@ -204,6 +238,21 @@ pub struct ConsolidationThresholds {
     /// How many pruned raw events to keep as a representative sample
     /// (reservoir sampling) when deleting.
     pub prune_sample_size: usize,
+    /// Promote a semantic/preference memory to a Foundation trait once its
+    /// near-neighbors form a *habit* (the discriminator's class) spread over
+    /// at least this fraction of the store's history — evidence of a
+    /// long-standing pattern, not a recent flurry.
+    pub foundation_min_temporal_spread: f64,
+    /// …and only with at least this many near-neighbors, so a couple of
+    /// repeats can't mint a lifelong trait.
+    pub foundation_min_neighbors: usize,
+    /// Collapse *bursts* — dense clusters of similar event memories packed
+    /// into a tight time window — into a single gist while keeping the one
+    /// outlier (the anomaly). The temporal inverse of Foundation promotion.
+    pub burst_collapse_enabled: bool,
+    /// Minimum cluster size before a burst is collapsed to a gist. Below this
+    /// it's just a few related notes, not a flood worth compressing.
+    pub burst_min_size: usize,
 }
 
 impl Default for ConsolidationThresholds {
@@ -214,6 +263,10 @@ impl Default for ConsolidationThresholds {
             promote_min_access_count: 3,
             archive_max_decay: 0.05,
             prune_sample_size: 5,
+            foundation_min_temporal_spread: 0.5,
+            foundation_min_neighbors: 4,
+            burst_collapse_enabled: true,
+            burst_min_size: 4,
         }
     }
 }
@@ -233,12 +286,17 @@ impl Default for Config {
             decay_lambda_semantic: lambdas.semantic,
             decay_lambda_procedural: lambdas.procedural,
             decay_lambda_preference: lambdas.preference,
+            decay_lambda_foundation: lambdas.foundation,
             retrieval_weights: RetrievalWeights::default(),
             consolidation_thresholds: ConsolidationThresholds::default(),
             spreading_activation: false,
             spreading_factor: default_spreading_factor(),
             edge_decay_lambda: default_edge_decay_lambda(),
             edge_min_weight: default_edge_min_weight(),
+            salience_resist: default_salience_resist(),
+            salience_keep_threshold: default_salience_keep_threshold(),
+            semantic_edge_min_sim: default_semantic_edge_min_sim(),
+            semantic_edge_top_k: default_semantic_edge_top_k(),
             archive_after_days: 14.0,
             delete_after_days: 90.0,
             local_only: true,
@@ -276,6 +334,7 @@ impl Config {
             semantic: self.decay_lambda_semantic,
             procedural: self.decay_lambda_procedural,
             preference: self.decay_lambda_preference,
+            foundation: self.decay_lambda_foundation,
             archive: self.decay_lambda_raw,
         }
     }

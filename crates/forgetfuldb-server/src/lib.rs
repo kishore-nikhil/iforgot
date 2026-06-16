@@ -27,9 +27,12 @@ pub mod proxy;
 
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
+use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use tokio_stream::wrappers::BroadcastStream;
+use tokio_stream::{Stream, StreamExt};
 use forgetfuldb_consolidate::ExtractiveSummarizer;
 use forgetfuldb_core::config::Config;
 use forgetfuldb_core::types::MemoryType;
@@ -59,6 +62,17 @@ pub(crate) struct AppState {
     /// Tools the server knows about (listed by `/tools`, executed by
     /// `/tools/execute` only when `tools.allow_server_execute` is set).
     pub(crate) tools: forgetfuldb_tools::ToolRegistry,
+    /// Broadcast channel for Server-Sent Events: a "change" is pushed
+    /// whenever the store is modified, so the UI updates instantly instead
+    /// of blind-polling.
+    pub(crate) events: tokio::sync::broadcast::Sender<String>,
+}
+
+impl AppState {
+    /// Notify SSE subscribers that the store changed (best-effort).
+    pub(crate) fn notify_change(&self) {
+        let _ = self.events.send("change".to_string());
+    }
 }
 
 pub(crate) type SharedState = Arc<Mutex<AppState>>;
@@ -137,12 +151,15 @@ async fn ingest_handler(
         session_id: body.session_id,
         role: body.role,
     };
+    let events = app.events.clone();
     let AppState { store, bloom, provider, cfg, .. } = &mut *app;
     let outcome = ingest(store, bloom, provider.as_ref(), cfg, req)?;
-    Ok(Json(json!({
+    let body = json!({
         "duplicate": outcome.is_duplicate(),
         "memory": outcome.memory(),
-    })))
+    });
+    let _ = events.send("change".to_string());
+    Ok(Json(body))
 }
 
 async fn retrieve_handler(
@@ -179,6 +196,7 @@ async fn retrieve_handler(
 async fn consolidate_handler(State(state): State<SharedState>) -> Result<Json<serde_json::Value>, ApiError> {
     let app = state.lock().expect("state mutex poisoned");
     let report = forgetfuldb_consolidate::consolidate(&app.store, &ExtractiveSummarizer::default(), &app.cfg)?;
+    app.notify_change();
     Ok(Json(serde_json::to_value(report)?))
 }
 
@@ -223,6 +241,12 @@ async fn metrics_handler(State(state): State<SharedState>) -> Result<Json<serde_
         "avg_context_memories": m.avg_context_memories,
         "avg_retrieve_ms": m.avg_retrieve_ms,
         "avg_llm_ms": m.avg_llm_ms,
+        // Retention-efficiency cost terms: the per-token price of memory,
+        // the denominator every accuracy number should be paired against.
+        "injected_tokens": m.injected_tokens(),
+        "injected_tokens_per_turn": m.injected_tokens_per_turn(),
+        "injected_token_share": m.injected_token_share(),
+        "tokens_per_injected_memory": m.tokens_per_injected_memory(),
     })))
 }
 
@@ -326,6 +350,7 @@ async fn graph_handler(
                 "recurrence_score": item.recurrence_score,
                 "pinned": item.pinned,
                 "stale": item.stale,
+                "salience": item.salience,
                 "created_at": item.created_at,
                 "last_accessed_at": item.last_accessed_at,
                 "tags": item.tags,
@@ -411,6 +436,18 @@ async fn uiconfig_handler(State(state): State<SharedState>) -> Result<Json<serde
             "min_retrieval_score": app.cfg.chat.min_retrieval_score,
             "conversational_damping": app.cfg.chat.conversational_damping,
         },
+        // The embedding identity the retrieval inspector is actually using
+        // (the transparency the inspector was missing), plus the salience knobs.
+        "embedding": {
+            "backend": app.cfg.embedding_backend,
+            "model": app.cfg.embedding_model,
+            "dim": app.provider.dim(),
+        },
+        "salience": {
+            "resist": app.cfg.salience_resist,
+            "keep_threshold": app.cfg.salience_keep_threshold,
+            "spreading_activation": app.cfg.spreading_activation,
+        },
     })))
 }
 
@@ -451,6 +488,7 @@ async fn pin_handler(
     if !app.store.set_pinned(&id, body.pinned)? {
         return Err(anyhow::anyhow!("memory not found: {id}").into());
     }
+    app.notify_change();
     Ok(Json(json!({ "id": id, "pinned": body.pinned })))
 }
 
@@ -462,6 +500,7 @@ async fn archive_handler(
     if !app.store.set_memory_type(&id, MemoryType::Archive)? {
         return Err(anyhow::anyhow!("memory not found: {id}").into());
     }
+    app.notify_change();
     Ok(Json(json!({ "id": id, "memory_type": "archive" })))
 }
 
@@ -521,6 +560,18 @@ pub fn ui_is_embedded() -> bool {
     cfg!(embed_ui)
 }
 
+/// `GET /events` — Server-Sent Events stream of `change` notifications, so
+/// the UI refreshes the instant the store changes (from this server or from
+/// a separate `iforgot` process) instead of blind-polling.
+async fn events_handler(
+    State(state): State<SharedState>,
+) -> Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>> {
+    let rx = state.lock().expect("state mutex poisoned").events.subscribe();
+    let stream = BroadcastStream::new(rx)
+        .map(|msg| Ok(Event::default().data(msg.unwrap_or_else(|_| "change".to_string()))));
+    Sse::new(stream).keep_alive(KeepAlive::default())
+}
+
 fn build_router(state: SharedState, ui_dir: Option<&std::path::Path>) -> Router {
     let mut router = Router::new()
         .route("/ingest", post(ingest_handler))
@@ -535,6 +586,7 @@ fn build_router(state: SharedState, ui_dir: Option<&std::path::Path>) -> Router 
         .route("/memory/:id/archive", post(archive_handler))
         .route("/stats", get(stats_handler))
         .route("/metrics", get(metrics_handler))
+        .route("/events", get(events_handler))
         .route("/tools", get(tools_handler))
         .route("/tools/execute", post(tools_execute_handler))
         .route("/v1/chat/completions", post(proxy::chat_completions));
@@ -568,6 +620,7 @@ pub async fn serve(cfg: Config, port: u16, ui_dir: Option<std::path::PathBuf>) -
     let provider = forgetfuldb_embed::create_provider_from_config(&cfg)?;
     let host = if cfg.local_only { "127.0.0.1" } else { "0.0.0.0" };
     let tools = forgetfuldb_tools::ToolRegistry::from_config(&cfg.tools);
+    let (events, _) = tokio::sync::broadcast::channel::<String>(64);
     let state: SharedState = Arc::new(Mutex::new(AppState {
         store,
         bloom,
@@ -575,7 +628,34 @@ pub async fn serve(cfg: Config, port: u16, ui_dir: Option<std::path::PathBuf>) -
         cfg,
         http_client: reqwest::Client::new(),
         tools,
+        events: events.clone(),
     }));
+
+    // Watch for writes made by *other* connections (a separate iforgot
+    // process chatting against the same store) and push an SSE event so the
+    // UI updates live. Server-originated writes notify explicitly from their
+    // handlers; this catches everything else. PRAGMA data_version is a
+    // microsecond read, so a 500ms poll is cheap.
+    {
+        let poll_state = state.clone();
+        let poll_tx = events.clone();
+        tokio::spawn(async move {
+            let mut last: i64 = -1;
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                let ver = match poll_state.lock() {
+                    Ok(app) => app.store.data_version().unwrap_or(last),
+                    Err(_) => last,
+                };
+                if ver != last {
+                    if last != -1 {
+                        let _ = poll_tx.send("change".to_string());
+                    }
+                    last = ver;
+                }
+            }
+        });
+    }
 
     let addr = format!("{host}:{port}");
     let listener = tokio::net::TcpListener::bind(&addr).await?;

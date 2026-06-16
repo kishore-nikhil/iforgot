@@ -165,6 +165,8 @@ tr.miss { opacity: 0.45; }
 .diff-src { color: var(--text-dim); padding: 2px 0 2px 14px; border-left: 1px solid var(--border); margin-left: 4px; font-size: 12px; }
 .diff-sum { color: var(--green); margin-top: 6px; }
 
+h3.section { margin-top: 6px; display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+h3.section .hint { color: var(--text-dim); font-weight: 400; font-size: 11px; text-transform: none; letter-spacing: 0; }
 .tiles { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 10px; margin-bottom: 12px; }
 .tile { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; }
 .tile .v { font-size: 20px; font-weight: 700; }

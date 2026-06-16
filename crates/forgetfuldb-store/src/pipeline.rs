@@ -109,6 +109,119 @@ pub fn embedding_mismatch_warning(store: &Store, provider: &dyn EmbeddingProvide
 
 /// The association edge type for "retrieved into the same chat turn".
 pub const EDGE_CO_OCCURRED: &str = "co_occurred";
+/// Edge type for "close in embedding space" (cosine kNN). Unlike
+/// co-occurrence (behavioral — recalled together), this is *semantic*: two
+/// memories that mean similar things, even if never recalled together.
+pub const EDGE_SEMANTIC: &str = "semantic_similar";
+/// Edge type for "discussing A was followed by discussing B" — directional,
+/// reconstructed from the order of chat turns within a session. The causal
+/// signal that session conversational order carries (and that nothing else
+/// captures).
+pub const EDGE_SEQUENCE: &str = "sequence";
+
+/// Rebuild `semantic_similar` edges: connect each memory to its nearest
+/// neighbors in embedding space (cosine >= `min_sim`, up to `top_k`).
+/// Recomputed from scratch (idempotent). Undirected (canonical src < dst);
+/// weight is the cosine. Answers "what is *close in meaning*", distinct
+/// from co-occurrence's "what is *recalled together*".
+pub fn rebuild_semantic_edges(store: &Store, min_sim: f64, top_k: usize, now: i64) -> Result<usize> {
+    let items: Vec<MemoryItem> = store
+        .list_memories(None)?
+        .into_iter()
+        .filter(|m| m.embedding.is_some())
+        .collect();
+
+    // Canonical pair -> best cosine seen.
+    let mut pairs: HashMap<(String, String), f64> = HashMap::new();
+    for item in &items {
+        let emb = item.embedding.as_ref().unwrap();
+        let mut sims: Vec<(&str, f64)> = items
+            .iter()
+            .filter(|o| o.id != item.id)
+            .filter_map(|o| {
+                o.embedding
+                    .as_ref()
+                    .map(|oe| (o.id.as_str(), forgetfuldb_embed::cosine_similarity(emb, oe) as f64))
+            })
+            .filter(|(_, c)| *c >= min_sim)
+            .collect();
+        sims.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        for (other, cos) in sims.into_iter().take(top_k) {
+            let (a, b) = if item.id.as_str() <= other { (item.id.as_str(), other) } else { (other, item.id.as_str()) };
+            let e = pairs.entry((a.to_string(), b.to_string())).or_insert(0.0);
+            *e = e.max(cos);
+        }
+    }
+
+    store.clear_edges(EDGE_SEMANTIC)?;
+    let mut written = 0;
+    for ((src_id, dst_id), weight) in pairs {
+        store.upsert_edge(&MemoryEdge {
+            src_id,
+            dst_id,
+            edge_type: EDGE_SEMANTIC.to_string(),
+            weight,
+            co_count: 1,
+            created_at: now,
+            last_activated: now,
+        })?;
+        written += 1;
+    }
+    Ok(written)
+}
+
+/// Rebuild `sequence` edges from session conversational order: for each
+/// pair of consecutive turns in a session, link the top memories of the
+/// earlier turn to the top memories of the later one (directional,
+/// src=earlier). Weight is recency-decayed like co-occurrence. This is the
+/// reasoning-path signal — "we discussed A, then B" — recovered from
+/// `chat_turns`, which nothing else reads for structure.
+pub fn rebuild_sequence_edges(store: &Store, lambda: f64, min_weight: f64, now: i64, top_per_turn: usize) -> Result<usize> {
+    let alive: HashSet<String> = store.list_memories(None)?.into_iter().map(|m| m.id).collect();
+    let turns = store.list_chat_turns(usize::MAX)?; // oldest first
+
+    // Directional (src=earlier -> dst=later) pair -> (weight, count, latest).
+    let mut pairs: HashMap<(String, String), (f64, i64, i64)> = HashMap::new();
+    for win in turns.windows(2) {
+        let (a, b) = (&win[0], &win[1]);
+        if a.session_id.is_none() || a.session_id != b.session_id {
+            continue; // only within one session
+        }
+        let w = (-lambda * age_days(b.created_at, now).max(0.0)).exp();
+        let earlier: Vec<&String> = a.memory_ids.iter().filter(|id| alive.contains(*id)).take(top_per_turn).collect();
+        let later: Vec<&String> = b.memory_ids.iter().filter(|id| alive.contains(*id)).take(top_per_turn).collect();
+        for src in &earlier {
+            for dst in &later {
+                if src == dst {
+                    continue;
+                }
+                let entry = pairs.entry(((*src).clone(), (*dst).clone())).or_insert((0.0, 0, 0));
+                entry.0 += w;
+                entry.1 += 1;
+                entry.2 = entry.2.max(b.created_at);
+            }
+        }
+    }
+
+    store.clear_edges(EDGE_SEQUENCE)?;
+    let mut written = 0;
+    for ((src_id, dst_id), (weight, co_count, last_activated)) in pairs {
+        if weight < min_weight {
+            continue;
+        }
+        store.upsert_edge(&MemoryEdge {
+            src_id,
+            dst_id,
+            edge_type: EDGE_SEQUENCE.to_string(),
+            weight,
+            co_count,
+            created_at: now,
+            last_activated,
+        })?;
+        written += 1;
+    }
+    Ok(written)
+}
 
 /// Rebuild the `co_occurred` association edges from `chat_turns`: two
 /// memories injected into the same turn are associated, and the more
@@ -225,11 +338,33 @@ pub fn ingest(
     item.importance_score = importance;
     item.decay_score = decay::decay_score(importance, lambda, 0.0, false);
     item.recency_score = 1.0;
-    item.embedding = Some(provider.embed(&item.content));
+    let embedding = provider.embed(&item.content);
+    // Provisional salience from novelty alone (the free write-time signal):
+    // 1 - max cosine to anything stored, gated by content quality so a
+    // novel typo doesn't enshrine itself. Consolidation later revises this
+    // with the full surprise/habit discriminator.
+    let relevance = forgetfuldb_core::salience::content_relevance(item.content.chars().count(), item.entities.len());
+    item.salience = provisional_salience(store, &embedding, relevance)?;
+    item.embedding = Some(embedding);
 
     store.insert_memory(&item)?;
     bloom.insert(&hash);
     Ok(IngestOutcome::Stored(item))
+}
+
+/// Write-time provisional salience from novelty: `1 - max cosine to any
+/// stored memory`, gated by relevance so novel-noise stays low. O(n) scan
+/// — runs on the ingest path (the background writer thread for chat), fine
+/// at personal scale; the authoritative value comes from consolidation.
+fn provisional_salience(store: &Store, embedding: &[f32], relevance: f64) -> Result<f64> {
+    let mut max_cos = 0.0_f32;
+    for other in store.list_memories(None)? {
+        if let Some(e) = &other.embedding {
+            max_cos = max_cos.max(forgetfuldb_embed::cosine_similarity(embedding, e));
+        }
+    }
+    let surprise = (1.0 - max_cos as f64).clamp(0.0, 1.0);
+    Ok((surprise * relevance.clamp(0.0, 1.0)).clamp(0.0, 1.0))
 }
 
 /// Duplicate input strengthens the existing memory: recurrence climbs

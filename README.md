@@ -1,22 +1,46 @@
 # ForgetfulDB
 
-A local-first AI memory database for macOS that behaves like human memory
-instead of an append-only vector store.
+**A forgetting engine — a memory layer for agents — backed by SQLite.**
+Not a database. A database stores faithfully and forever; this engine
+actively decides what to keep, lets memories decay, consolidates routine
+into gist, promotes traits, connects memories, and segments time. SQLite
+is persistence; iforgot is the retention/decay/salience/consolidation
+policy on top. (The name is the joke: it forgets, on purpose.)
 
-ForgetfulDB gives a local AI assistant **selective retention, lossy
-compression, deduplication, decay, consolidation, and retrieval**:
+The one-line thesis — six orthogonal mechanisms over the same memories:
 
-- remembers recurring and useful information
-- forgets low-value details (exponential decay per memory type)
-- compresses related events into summaries during consolidation
-- detects duplicates probabilistically (Bloom filter) and semantically
-  (cosine similarity)
-- marks stale or contradicted memories instead of silently keeping lies
-- retrieves only a compact, relevant context pack for an LLM prompt
+> **decay forgets · salience keeps · habit reinforces · epochs organize ·
+> edges connect · dreaming creates.**
 
-Everything runs locally: Rust + SQLite, no network calls, no model
-downloads. `local_only = true` is the default and the HTTP server binds
-to `127.0.0.1` only.
+Concretely, it gives a local AI assistant:
+
+- **decay** — forgets the unused (exponential `exp(-λt)`, per-type half-lives)
+- **salience** — keeps the formative: U-shaped over novelty, so both the
+  *surprising* (novel) and the *habitual* (recurring evenly over time)
+  resist forgetting, while routine fades
+- **consolidation** — a "sleep cycle" that dedups, compresses clusters into
+  gist, promotes rehearsed episodes to durable facts, and marks
+  contradicted memories stale instead of keeping lies
+- **a typed association graph** — memories connected three ways:
+  co-occurrence (recalled together), semantic similarity (close in
+  meaning), and sequence (discussed one after another) — with
+  spreading-activation retrieval that pulls in companions
+- **real local embeddings** (via Ollama) so semantic distance is meaningful
+- **time the model can't see** — every "now / 3 years ago / during 2026" is
+  computed by the engine from stored timestamps, so it can be exact
+
+A read-only **observability UI** (embedded in the binary, live via SSE)
+makes every mechanism inspectable — watch memories glow, fade on a time
+scrubber, and form connections as you chat.
+
+> 📐 **The full vision, the mental model, what's shipped vs. planned, and
+> the evaluation philosophy** live in
+> [docs/memory-architecture.md](docs/memory-architecture.md). Read that for
+> the direction; this README is the operational guide.
+
+Everything runs locally: Rust + SQLite, no network calls beyond a local
+LLM/embedding server. `local_only = true` is the default and the HTTP
+server binds to `127.0.0.1` only.
 
 ## Architecture
 

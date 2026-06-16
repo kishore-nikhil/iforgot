@@ -36,7 +36,7 @@ const nodeId = (e: string | GraphNode) => (typeof e === 'string' ? e : e.id);
 // Edge types with a real direction (source → target). These get animated
 // flow particles + an arrowhead; co_occurred is undirected (a mutual
 // association) so it flows but carries no arrow.
-const DIRECTED = new Set(['derived_from', 'updates', 'contradicts', 'supports', 'belongs_to_project']);
+const DIRECTED = new Set(['sequence', 'derived_from', 'updates', 'contradicts', 'supports', 'belongs_to_project']);
 
 const now_ms = () => performance.now();
 // Stable per-node phase so glows don't pulse in unison.
@@ -48,6 +48,15 @@ const phaseOf = (id: string) => {
 const LABEL_CAP = 5; // how many node labels are visible at once
 const LABEL_FADE = 600; // ms fade in/out
 const LABEL_ROTATE = 1700; // ms between rotations
+const FRESH_MS = 5000; // how long a just-formed node/edge stays highlighted
+
+const edgeKey = (l: FgLink) => `${nodeId(l.source)}|${nodeId(l.target)}|${l.edge_type}`;
+const freshness = (m: Map<string, number>, key: string, t: number) => {
+  const stamp = m.get(key);
+  if (stamp === undefined) return 0;
+  const f = 1 - (t - stamp) / FRESH_MS;
+  return f > 0 ? f : 0;
+};
 
 function withAlpha(hex: string, a: number) {
   const h = hex.replace('#', '');
@@ -79,6 +88,13 @@ export default function GraphView({ cfg, active }: { cfg: UiConfig | null; activ
   // so it animates without re-rendering React.
   const labelRef = useRef<Map<string, { in: number; out: number | null }>>(new Map());
   const visibleIdsRef = useRef<string[]>([]);
+  // Freshness: when a poll reveals a new node or a new/strengthened edge,
+  // we stamp it so it pulses for FRESH_MS — the visible "a connection just
+  // formed" moment while you chat.
+  const freshNodeRef = useRef<Map<string, number>>(new Map());
+  const freshEdgeRef = useRef<Map<string, number>>(new Map());
+  const prevNodeRef = useRef<Set<string>>(new Set());
+  const prevEdgeRef = useRef<Map<string, number>>(new Map());
 
   const since = days === null ? 0 : Math.floor(Date.now() / 1000) - days * 86_400;
   const { data, error } = usePoll<GraphResponse>(
@@ -175,6 +191,32 @@ export default function GraphView({ cfg, active }: { cfg: UiConfig | null; activ
     return () => clearInterval(h);
   }, [active, animate]);
 
+  // Diff each poll against the last: brand-new nodes and new/strengthened
+  // edges get a freshness stamp so they pulse. The very first load only
+  // records the baseline (no "everything just formed" flash on open).
+  useEffect(() => {
+    if (!data) return;
+    const t = now_ms();
+    const firstLoad = prevNodeRef.current.size === 0;
+
+    const curNodes = new Set(data.nodes.map((n) => n.id));
+    if (!firstLoad) {
+      for (const id of curNodes) if (!prevNodeRef.current.has(id)) freshNodeRef.current.set(id, t);
+    }
+    prevNodeRef.current = curNodes;
+
+    const curEdges = new Map<string, number>();
+    for (const e of data.edges) {
+      const k = `${e.src_id}|${e.dst_id}|${e.edge_type}`;
+      curEdges.set(k, e.weight);
+      if (!firstLoad) {
+        const prev = prevEdgeRef.current.get(k);
+        if (prev === undefined || e.weight > prev + 1e-6) freshEdgeRef.current.set(k, t);
+      }
+    }
+    prevEdgeRef.current = curEdges;
+  }, [data]);
+
   // Alpha for a node's label given the fade timeline; 0 means hidden.
   const labelAlpha = useCallback((id: string, t: number) => {
     const v = labelRef.current.get(id);
@@ -231,12 +273,26 @@ export default function GraphView({ cfg, active }: { cfg: UiConfig | null; activ
       const t = now_ms();
       // Gentle breathing glow; brighter for stronger (less-decayed) memories.
       const pulse = animate ? 0.5 + 0.5 * Math.sin(t / 700 + phaseOf(node.id)) : 0.6;
+      // Just appeared? Flare brightly, fading over FRESH_MS.
+      const fresh = freshness(freshNodeRef.current, node.id, t);
 
       ctx.save();
-      // Coloured glow halo.
-      ctx.globalAlpha = alpha;
+      // A spreading flash ring for a memory that just formed.
+      if (fresh > 0) {
+        const fr = r + (3 + 14 * (1 - fresh)) / scale;
+        ctx.globalAlpha = fresh * 0.7;
+        ctx.lineWidth = (1.5 * fresh) / scale;
+        ctx.strokeStyle = color;
+        ctx.shadowColor = color;
+        ctx.shadowBlur = 8;
+        ctx.beginPath();
+        ctx.arc(node.x!, node.y!, fr, 0, 2 * Math.PI);
+        ctx.stroke();
+      }
+      // Coloured glow halo (extra bloom while fresh).
+      ctx.globalAlpha = Math.min(1, alpha + 0.4 * fresh);
       ctx.shadowColor = color;
-      ctx.shadowBlur = (2 + 5 * pulse) * (0.6 + d);
+      ctx.shadowBlur = (2 + 5 * pulse) * (0.6 + d) + 8 * fresh;
       ctx.fillStyle = color;
       ctx.beginPath();
       ctx.arc(node.x!, node.y!, r, 0, 2 * Math.PI);
@@ -404,16 +460,28 @@ export default function GraphView({ cfg, active }: { cfg: UiConfig | null; activ
               visible(l.source as GraphNode) &&
               visible(l.target as GraphNode)
             }
-            linkColor={(l: FgLink) =>
-              withAlpha(EDGE_COLORS[l.edge_type] ?? '#30363d', l.edge_type === 'co_occurred' ? 0.35 : 0.7)
+            linkColor={(l: FgLink) => {
+              const base = EDGE_COLORS[l.edge_type] ?? '#30363d';
+              const f = freshness(freshEdgeRef.current, edgeKey(l), now_ms());
+              const a = (l.edge_type === 'co_occurred' ? 0.35 : 0.7) + 0.6 * f;
+              return withAlpha(base, Math.min(1, a));
+            }}
+            linkWidth={(l: FgLink) =>
+              0.4 + Math.min(2.5, l.weight) + 2.5 * freshness(freshEdgeRef.current, edgeKey(l), now_ms())
             }
-            linkWidth={(l: FgLink) => 0.4 + Math.min(2.5, l.weight)}
             linkDirectionalArrowLength={(l: FgLink) => (DIRECTED.has(l.edge_type) ? 3 : 0)}
             linkDirectionalArrowRelPos={0.9}
             linkDirectionalArrowColor={(l: FgLink) => EDGE_COLORS[l.edge_type] ?? '#888'}
-            linkDirectionalParticles={(l: FgLink) => (animate ? (DIRECTED.has(l.edge_type) ? 2 : 1) : 0)}
+            linkDirectionalParticles={(l: FgLink) => {
+              if (!animate) return 0;
+              const f = freshness(freshEdgeRef.current, edgeKey(l), now_ms());
+              if (f > 0) return 5; // a burst along a connection that just formed
+              return DIRECTED.has(l.edge_type) ? 2 : 1;
+            }}
             linkDirectionalParticleSpeed={(l: FgLink) => 0.004 + Math.min(0.012, l.weight * 0.004)}
-            linkDirectionalParticleWidth={(l: FgLink) => (DIRECTED.has(l.edge_type) ? 2 : 1.3)}
+            linkDirectionalParticleWidth={(l: FgLink) =>
+              (DIRECTED.has(l.edge_type) ? 2 : 1.3) + 2 * freshness(freshEdgeRef.current, edgeKey(l), now_ms())
+            }
             linkDirectionalParticleColor={(l: FgLink) => EDGE_COLORS[l.edge_type] ?? '#888'}
             onNodeClick={(n: GraphNode) => setSelected(n.id === selected ? null : n.id)}
             onBackgroundClick={() => setSelected(null)}
@@ -495,6 +563,11 @@ function DetailPanel({
       <dl>
         <dt>importance</dt>
         <dd className="mono">{m.importance_score.toFixed(3)}</dd>
+        <dt>salience</dt>
+        <dd className="mono" style={m.salience >= 0.6 ? { color: 'var(--green)' } : {}}>
+          {m.salience.toFixed(3)}
+          {m.salience >= 0.6 ? ' ✦ kept' : ''}
+        </dd>
         <dt>decay (stored)</dt>
         <dd className="mono">{m.decay_score.toFixed(3)}</dd>
         <dt>recurrence</dt>

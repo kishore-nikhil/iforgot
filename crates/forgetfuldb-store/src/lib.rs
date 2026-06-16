@@ -24,6 +24,8 @@ const MIGRATIONS: &[(&str, &str)] = &[
     ("0003_consolidation_runs", include_str!("../migrations/0003_consolidation_runs.sql")),
     ("0004_store_meta", include_str!("../migrations/0004_store_meta.sql")),
     ("0005_memory_edges", include_str!("../migrations/0005_memory_edges.sql")),
+    ("0006_salience", include_str!("../migrations/0006_salience.sql")),
+    ("0007_foundation_type", include_str!("../migrations/0007_foundation_type.sql")),
 ];
 
 pub struct Store {
@@ -90,8 +92,8 @@ impl Store {
                  id, content, summary, memory_type, source, topic, entities, tags,
                  created_at, updated_at, last_accessed_at, access_count,
                  importance_score, recurrence_score, recency_score, decay_score,
-                 confidence, stale, pinned, embedding, content_hash
-             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21)",
+                 confidence, stale, pinned, embedding, content_hash, salience
+             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22)",
             params![
                 item.id,
                 item.content,
@@ -114,6 +116,7 @@ impl Store {
                 item.pinned as i64,
                 item.embedding.as_ref().map(|e| encode_embedding(e)),
                 item.content_hash,
+                item.salience,
             ],
         )?;
         Ok(())
@@ -126,7 +129,8 @@ impl Store {
                  entities = ?7, tags = ?8, updated_at = ?9, last_accessed_at = ?10,
                  access_count = ?11, importance_score = ?12, recurrence_score = ?13,
                  recency_score = ?14, decay_score = ?15, confidence = ?16,
-                 stale = ?17, pinned = ?18, embedding = ?19, content_hash = ?20
+                 stale = ?17, pinned = ?18, embedding = ?19, content_hash = ?20,
+                 salience = ?21, created_at = ?22
              WHERE id = ?1",
             params![
                 item.id,
@@ -149,6 +153,10 @@ impl Store {
                 item.pinned as i64,
                 item.embedding.as_ref().map(|e| encode_embedding(e)),
                 item.content_hash,
+                item.salience,
+                // created_at is normally immutable, but consolidation's merge
+                // moves it to the earliest of the pair, so it must persist.
+                item.created_at,
             ],
         )?;
         Ok(())
@@ -205,8 +213,16 @@ impl Store {
 
     pub fn delete_memory(&self, id: &str) -> Result<bool> {
         let n = self.conn.execute("DELETE FROM memory_items WHERE id = ?1", [id])?;
+        // Cascade: don't leave dangling links/edges pointing at a memory
+        // that no longer exists. (The consolidation edge rebuilds also clear
+        // and recompute, but deleting here keeps the graph consistent in
+        // between — and outside — those passes.)
         self.conn.execute(
             "DELETE FROM memory_links WHERE source_id = ?1 OR target_id = ?1",
+            [id],
+        )?;
+        self.conn.execute(
+            "DELETE FROM memory_edges WHERE src_id = ?1 OR dst_id = ?1",
             [id],
         )?;
         Ok(n > 0)
@@ -393,7 +409,8 @@ impl Store {
                         AVG(prompt_tokens), AVG(completion_tokens),
                         SUM(prompt_tokens), SUM(completion_tokens),
                         AVG(context_chars), AVG(context_memory_count),
-                        AVG(retrieve_duration_ms), AVG(llm_duration_ms)
+                        AVG(retrieve_duration_ms), AVG(llm_duration_ms),
+                        SUM(context_chars), SUM(context_memory_count)
                  FROM chat_turns",
                 [],
                 |r| {
@@ -407,6 +424,8 @@ impl Store {
                         avg_context_memories: r.get(6)?,
                         avg_retrieve_ms: r.get(7)?,
                         avg_llm_ms: r.get(8)?,
+                        total_context_chars: r.get::<_, Option<i64>>(9)?.unwrap_or(0),
+                        total_context_memories: r.get::<_, Option<i64>>(10)?.unwrap_or(0),
                     })
                 },
             )
@@ -448,6 +467,17 @@ impl Store {
     }
 
     // ---- store metadata (key/value) ---------------------------------------
+
+    /// SQLite's `data_version` pragma: a counter that changes whenever the
+    /// database file is modified by **another** connection (it does *not*
+    /// move for this connection's own writes). Polling it lets the server
+    /// detect writes made by a separate `iforgot` process so the UI can be
+    /// pushed an update — server-originated writes are signaled explicitly.
+    pub fn data_version(&self) -> Result<i64> {
+        self.conn
+            .query_row("PRAGMA data_version", [], |r| r.get(0))
+            .map_err(Into::into)
+    }
 
     pub fn get_meta(&self, key: &str) -> Result<Option<String>> {
         self.conn
@@ -556,6 +586,38 @@ impl Store {
     pub fn clear_edges(&self, edge_type: &str) -> Result<()> {
         self.conn.execute("DELETE FROM memory_edges WHERE edge_type = ?1", [edge_type])?;
         Ok(())
+    }
+
+    /// Incrementally strengthen `co_occurred` edges among `ids` — the
+    /// memories injected into one chat turn. Each pair's weight and count
+    /// grow by one; new pairs are created. Additive (unlike the
+    /// consolidation rebuild, which recomputes with decay), so this is the
+    /// cheap live update that runs off the conversation path. Returns the
+    /// number of pairs touched. A `+1` here equals the rebuild's
+    /// contribution for an age-0 turn, so the two stay consistent.
+    pub fn bump_cooccurrence_edges(&self, ids: &[String], now: i64) -> Result<usize> {
+        // Unique, canonical (src < dst) pairs.
+        let mut uniq: Vec<&String> = ids.iter().collect();
+        uniq.sort();
+        uniq.dedup();
+        let mut pairs = 0;
+        let tx = self.conn.unchecked_transaction()?;
+        for i in 0..uniq.len() {
+            for j in (i + 1)..uniq.len() {
+                tx.execute(
+                    "INSERT INTO memory_edges (src_id, dst_id, edge_type, weight, co_count, created_at, last_activated)
+                     VALUES (?1, ?2, 'co_occurred', 1.0, 1, ?3, ?3)
+                     ON CONFLICT(src_id, dst_id, edge_type) DO UPDATE SET
+                         weight = weight + 1.0,
+                         co_count = co_count + 1,
+                         last_activated = excluded.last_activated",
+                    params![uniq[i], uniq[j], now],
+                )?;
+                pairs += 1;
+            }
+        }
+        tx.commit()?;
+        Ok(pairs)
     }
 
     /// All weighted edges (for the graph view).
@@ -686,6 +748,39 @@ pub struct ChatMetricsSummary {
     pub avg_context_memories: Option<f64>,
     pub avg_retrieve_ms: Option<f64>,
     pub avg_llm_ms: Option<f64>,
+    /// Σ injected-context characters and memories — the cost denominator of
+    /// retention efficiency (accuracy *per injected token*).
+    pub total_context_chars: i64,
+    pub total_context_memories: i64,
+}
+
+impl ChatMetricsSummary {
+    /// Estimated injected-memory tokens (~4 chars/token), the numerator of
+    /// the retention-efficiency cost terms. A rough but consistent proxy —
+    /// the absolute value matters less than the trend as forgetting kicks in.
+    pub fn injected_tokens(&self) -> f64 {
+        self.total_context_chars as f64 / 4.0
+    }
+
+    /// Average injected-memory tokens per turn.
+    pub fn injected_tokens_per_turn(&self) -> Option<f64> {
+        (self.turns > 0).then(|| self.injected_tokens() / self.turns as f64)
+    }
+
+    /// Fraction of the prompt that is injected memory, over turns that
+    /// reported token usage (SQLite SUM ignores NULL `prompt_tokens`). The
+    /// headline "how much context am I paying for" number; lower is better at
+    /// equal accuracy.
+    pub fn injected_token_share(&self) -> Option<f64> {
+        (self.total_prompt_tokens > 0)
+            .then(|| (self.total_context_chars as f64 / 4.0) / self.total_prompt_tokens as f64)
+    }
+
+    /// Average injected tokens spent per memory recalled — the unit cost of
+    /// a memory in the prompt.
+    pub fn tokens_per_injected_memory(&self) -> Option<f64> {
+        (self.total_context_memories > 0).then(|| self.injected_tokens() / self.total_context_memories as f64)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -701,7 +796,7 @@ pub struct StoreStats {
 
 const MEMORY_COLUMNS: &str = "id, content, summary, memory_type, source, topic, entities, tags, \
     created_at, updated_at, last_accessed_at, access_count, importance_score, recurrence_score, \
-    recency_score, decay_score, confidence, stale, pinned, embedding, content_hash";
+    recency_score, decay_score, confidence, stale, pinned, embedding, content_hash, salience";
 
 fn row_to_memory(row: &Row<'_>) -> rusqlite::Result<MemoryItem> {
     let memory_type: String = row.get(3)?;
@@ -736,6 +831,7 @@ fn row_to_memory(row: &Row<'_>) -> rusqlite::Result<MemoryItem> {
         pinned: row.get::<_, i64>(18)? != 0,
         embedding: embedding.map(|b| decode_embedding(&b)),
         content_hash: row.get(20)?,
+        salience: row.get(21)?,
     })
 }
 
@@ -809,6 +905,62 @@ mod tests {
     }
 
     #[test]
+    fn cooccurrence_bump_is_additive_and_fast() {
+        let store = Store::open_in_memory().unwrap();
+        // A realistic store: 400 memories, plus a pre-existing edge web so
+        // the bump isn't measured against an empty table.
+        let ids: Vec<String> = (0..400).map(|i| format!("mem_{i:04}")).collect();
+        for id in &ids {
+            store.insert_memory(&sample_item(id, &format!("memory {id}"))).unwrap();
+        }
+        for chunk in ids.chunks(6).take(60) {
+            store.bump_cooccurrence_edges(chunk, 1_000).unwrap();
+        }
+
+        // Additive: bumping the same pair twice doubles its weight.
+        let pair = vec![ids[0].clone(), ids[1].clone()];
+        store.bump_cooccurrence_edges(&pair, 2_000).unwrap();
+        store.bump_cooccurrence_edges(&pair, 3_000).unwrap();
+        let w = store.neighbors(&ids[0], "co_occurred").unwrap();
+        let weight = w.iter().find(|(n, _)| n == &ids[1]).map(|(_, w)| *w).unwrap();
+        assert!(weight >= 2.0, "two extra bumps should add to the weight, got {weight}");
+
+        // Latency: a typical turn injects ~6 memories (15 pairs). Time many
+        // such bumps and assert the per-bump cost is tiny (it runs on the
+        // background writer, but cheap is still the point).
+        let turn: Vec<String> = ids[10..16].to_vec();
+        let iters = 200;
+        let t0 = std::time::Instant::now();
+        for k in 0..iters {
+            store.bump_cooccurrence_edges(&turn, 4_000 + k).unwrap();
+        }
+        let per = t0.elapsed().as_secs_f64() * 1000.0 / iters as f64;
+        println!("co-occurrence bump (6 ids / 15 pairs): {per:.3} ms/turn over {iters} iters");
+        assert!(per < 5.0, "bump should be well under 5ms/turn, was {per:.3} ms");
+    }
+
+    #[test]
+    fn delete_memory_cascades_to_edges_and_links() {
+        let store = Store::open_in_memory().unwrap();
+        store.insert_memory(&sample_item("mem_1", "a")).unwrap();
+        store.insert_memory(&sample_item("mem_2", "b")).unwrap();
+        store
+            .insert_link(&MemoryLink {
+                source_id: "mem_1".into(),
+                target_id: "mem_2".into(),
+                relation: LinkRelation::Updates,
+            })
+            .unwrap();
+        store.bump_cooccurrence_edges(&["mem_1".into(), "mem_2".into()], 1).unwrap();
+        assert_eq!(store.list_edges().unwrap().len(), 1);
+
+        store.delete_memory("mem_1").unwrap();
+        // No dangling links or edges reference the deleted memory.
+        assert!(store.links_for("mem_2").unwrap().is_empty());
+        assert!(store.list_edges().unwrap().is_empty(), "edges to a deleted memory must be cleaned up");
+    }
+
+    #[test]
     fn meta_roundtrip_and_set_embedding() {
         let store = Store::open_in_memory().unwrap();
         assert_eq!(store.get_meta("embedding_dim").unwrap(), None);
@@ -853,11 +1005,32 @@ mod tests {
             memory_ids: vec!["mem_a".into()],
         };
         store.insert_chat_turn(&turn).unwrap();
+        // A second turn that injected no memory (and reported tokens): it pays
+        // no memory cost but still counts toward the prompt-token denominator.
+        let bare = ChatTurn {
+            id: "turn_2".into(),
+            created_at: 2000,
+            prompt_tokens: Some(80),
+            context_memory_count: 0,
+            context_chars: 0,
+            memory_ids: vec![],
+            ..turn.clone()
+        };
+        store.insert_chat_turn(&bare).unwrap();
+
         let summary = store.chat_metrics_summary().unwrap();
-        assert_eq!(summary.turns, 1);
-        assert_eq!(summary.total_prompt_tokens, 120);
+        assert_eq!(summary.turns, 2);
+        assert_eq!(summary.total_prompt_tokens, 200);
         assert_eq!(summary.avg_completion_tokens, Some(30.0));
-        assert_eq!(summary.avg_context_memories, Some(3.0));
+        assert_eq!(summary.total_context_chars, 250);
+        assert_eq!(summary.total_context_memories, 3);
+        // Retention-efficiency cost terms: 250 chars ≈ 62.5 injected tokens.
+        assert_eq!(summary.injected_tokens(), 62.5);
+        assert_eq!(summary.injected_tokens_per_turn(), Some(31.25));
+        // Share = 62.5 injected tokens / 200 prompt tokens (both turns).
+        assert_eq!(summary.injected_token_share(), Some(62.5 / 200.0));
+        // 62.5 injected tokens across 3 recalled memories.
+        assert_eq!(summary.tokens_per_injected_memory(), Some(62.5 / 3.0));
     }
 
     #[test]

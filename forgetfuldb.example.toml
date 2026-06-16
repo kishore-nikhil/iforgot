@@ -80,13 +80,22 @@ shell_timeout_secs = 30               # kill a command that runs longer
 # Enable only on a trusted local machine.
 allow_server_execute = false
 
-# Associative memory. Co-occurrence edges (memories retrieved into the
-# same chat turn) are rebuilt during consolidation. With spreading
-# activation on, retrieving a memory boosts its frequent companions.
+# Salience — which memories resist forgetting (a distinct axis from decay).
+# U-shaped: high for both the surprising (novel) and the habitual (recurring
+# evenly over time). Scored at ingest, recomputed each consolidation.
+salience_resist = 0.7                # a fully-salient memory decays at 30% the base rate
+salience_keep_threshold = 0.6        # at/above this, kept through pruning (like an auto-pin)
+
+# Associative memory. Three edge types are rebuilt during consolidation:
+# co-occurrence (recalled together), semantic_similar (close in meaning),
+# and sequence (discussed one after another). With spreading activation on,
+# retrieving a memory boosts its frequent companions.
 spreading_activation = false         # off by default; flip to A/B it
 spreading_factor = 0.15              # boost strength (and its cap)
 edge_decay_lambda = 0.02             # older co-occurrences count for less
 edge_min_weight = 0.1                # prune weaker association edges
+semantic_edge_min_sim = 0.55         # min cosine for a semantic_similar edge
+semantic_edge_top_k = 5              # nearest neighbors linked per memory
 
 [retrieval_weights]
 semantic = 0.45

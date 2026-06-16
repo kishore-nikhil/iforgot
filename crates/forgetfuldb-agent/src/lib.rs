@@ -209,6 +209,10 @@ pub fn finish_turn(
     }
     let turn = build_chat_turn(session_id, prepared, reply, usage, backend_name, model);
     store.insert_chat_turn(&turn)?;
+    // Live "used together" associations for the proxy path too.
+    if turn.memory_ids.len() >= 2 {
+        store.bump_cooccurrence_edges(&turn.memory_ids, now_unix())?;
+    }
     Ok(turn)
 }
 
