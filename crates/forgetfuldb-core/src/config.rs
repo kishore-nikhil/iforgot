@@ -253,6 +253,16 @@ pub struct ConsolidationThresholds {
     /// Minimum cluster size before a burst is collapsed to a gist. Below this
     /// it's just a few related notes, not a flood worth compressing.
     pub burst_min_size: usize,
+    /// Epoch segmentation: cosine *distance* from an era's centroid above
+    /// which a memory counts as "drifting" toward a new era.
+    pub epoch_drift_threshold: f64,
+    /// Consecutive drifting memories needed to actually cut an epoch boundary
+    /// (hysteresis — a one-off tangent shouldn't start an era).
+    pub epoch_hysteresis_runs: usize,
+    /// A closed era must hold at least this many memories…
+    pub epoch_min_size: usize,
+    /// …and span at least this many days. Together they prevent micro-eras.
+    pub epoch_min_days: f64,
 }
 
 impl Default for ConsolidationThresholds {
@@ -267,6 +277,10 @@ impl Default for ConsolidationThresholds {
             foundation_min_neighbors: 4,
             burst_collapse_enabled: true,
             burst_min_size: 4,
+            epoch_drift_threshold: 0.35,
+            epoch_hysteresis_runs: 3,
+            epoch_min_size: 4,
+            epoch_min_days: 5.0,
         }
     }
 }
@@ -324,6 +338,17 @@ impl Config {
     pub fn save(&self, path: &Path) -> anyhow::Result<()> {
         std::fs::write(path, toml::to_string_pretty(self)?)?;
         Ok(())
+    }
+
+    /// Epoch segmentation parameters assembled from the consolidation knobs.
+    pub fn epoch_params(&self) -> crate::epochs::EpochParams {
+        let t = &self.consolidation_thresholds;
+        crate::epochs::EpochParams {
+            drift_threshold: t.epoch_drift_threshold,
+            hysteresis_runs: t.epoch_hysteresis_runs,
+            min_size: t.epoch_min_size,
+            min_days: t.epoch_min_days,
+        }
     }
 
     /// Decay lambdas assembled from the individual config fields.

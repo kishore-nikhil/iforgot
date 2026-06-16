@@ -55,6 +55,8 @@ pub struct ConsolidationReport {
     pub semantic_edges: usize,
     /// `sequence` (session-order) edges rebuilt.
     pub sequence_edges: usize,
+    /// Drift-segmented eras the timeline was partitioned into this pass.
+    pub epochs: usize,
 }
 
 /// Run a full consolidation pass. Every pass is logged to the
@@ -90,6 +92,11 @@ pub fn consolidate(store: &Store, summarizer: &dyn Summarizer, cfg: &Config) -> 
     )?;
     report.sequence_edges =
         forgetfuldb_store::pipeline::rebuild_sequence_edges(store, cfg.edge_decay_lambda, cfg.edge_min_weight, now, 2)?;
+
+    // Organize the (now-pruned) timeline into drift-segmented eras. Last,
+    // because it reads the final surviving corpus; the boundaries it writes
+    // guide the *next* pass's within-epoch consolidation.
+    segment_epochs(store, summarizer, cfg, &mut report)?;
 
     store.log_consolidation_run(&forgetfuldb_store::ConsolidationRun {
         id: new_id("run", &format!("consolidate-{now}")),
@@ -272,6 +279,9 @@ fn merge_duplicates(store: &Store, cfg: &Config, now: i64, report: &mut Consolid
         .into_iter()
         .filter(|m| m.memory_type != MemoryType::Archive && m.embedding.is_some())
         .collect();
+    // Consolidate *within* an era, preserve *across*: a near-identical memory
+    // from a different epoch is contextually distinct, so it isn't merged.
+    let epoch_starts = epoch_starts(store)?;
 
     let mut removed: Vec<bool> = vec![false; items.len()];
     for i in 0..items.len() {
@@ -280,6 +290,9 @@ fn merge_duplicates(store: &Store, cfg: &Config, now: i64, report: &mut Consolid
         }
         for j in (i + 1)..items.len() {
             if removed[j] {
+                continue;
+            }
+            if !same_epoch(&epoch_starts, items[i].created_at, items[j].created_at) {
                 continue;
             }
             let sim = cosine_similarity(
@@ -365,6 +378,9 @@ fn collapse_bursts(
     if items.len() < min_size {
         return Ok(());
     }
+    // A burst lives within one era; don't sweep memories from different epochs
+    // into the same gist (consolidate within, preserve across).
+    let epoch_starts = epoch_starts(store)?;
 
     let sim = |a: usize, b: usize| {
         cosine_similarity(items[a].embedding.as_ref().unwrap(), items[b].embedding.as_ref().unwrap())
@@ -375,13 +391,16 @@ fn collapse_bursts(
         if consumed[i] {
             continue;
         }
-        // Gather i's near-neighbors (similar, not yet consumed). Anything
-        // identical enough to merge is already gone (dedup ran first), so a
-        // cluster here is "similar but distinct" — exactly a burst.
+        // Gather i's near-neighbors (similar, same era, not yet consumed).
+        // Anything identical enough to merge is already gone (dedup ran
+        // first), so a cluster here is "similar but distinct" — exactly a burst.
         let mut cluster: Vec<usize> = vec![i];
         #[allow(clippy::needless_range_loop)] // need j to index items, consumed, and sim(i, j)
         for j in 0..items.len() {
             if j == i || consumed[j] {
+                continue;
+            }
+            if !same_epoch(&epoch_starts, items[i].created_at, items[j].created_at) {
                 continue;
             }
             if sim(i, j) >= sim_thresh {
@@ -564,6 +583,76 @@ fn promote_recurring(store: &Store, cfg: &Config, now: i64, report: &mut Consoli
     Ok(())
 }
 
+/// The `started_at` of every stored era, ascending — the boundary list the
+/// `consolidate within, preserve across` guards look memories up against.
+/// Empty until the first `segment_epochs` runs, which makes the guards no-ops
+/// on a fresh store (everything is one era).
+fn epoch_starts(store: &Store) -> Result<Vec<i64>> {
+    Ok(store.list_epochs()?.iter().map(|e| e.started_at).collect())
+}
+
+/// Whether two timestamps fall in the same era. With no epochs yet, all
+/// memories are treated as one era (so consolidation behaves as before).
+fn same_epoch(starts: &[i64], a: i64, b: i64) -> bool {
+    use forgetfuldb_core::epochs::epoch_index_at;
+    starts.is_empty() || epoch_index_at(starts, a) == epoch_index_at(starts, b)
+}
+
+/// Segment the surviving timeline into drift-bounded eras and persist them.
+/// The model has no clock, so the engine computes the eras: windowed
+/// embedding-centroid drift with hysteresis ([`forgetfuldb_core::epochs`]).
+/// Each era is labeled with an extractive summary of its most-salient members.
+fn segment_epochs(store: &Store, summarizer: &dyn Summarizer, cfg: &Config, report: &mut ConsolidationReport) -> Result<()> {
+    use forgetfuldb_core::epochs::{segment, EpochPoint};
+
+    // Active, embedded memories in time order define the era stream. Archives
+    // (de-emphasized) and unembedded rows don't shape an era's identity.
+    let mut items: Vec<MemoryItem> = store
+        .list_memories(None)?
+        .into_iter()
+        .filter(|m| m.memory_type != MemoryType::Archive && m.embedding.is_some())
+        .collect();
+    items.sort_by_key(|m| m.created_at);
+    if items.is_empty() {
+        store.replace_epochs(&[])?;
+        return Ok(());
+    }
+
+    let points: Vec<EpochPoint> = items
+        .iter()
+        .map(|m| EpochPoint { created_at: m.created_at, embedding: m.embedding.clone().unwrap() })
+        .collect();
+    let spans = segment(&points, &cfg.epoch_params());
+
+    // Spans partition the points contiguously, so walk members in lockstep.
+    let mut idx = 0usize;
+    let mut rows = Vec::with_capacity(spans.len());
+    for span in &spans {
+        let members = &items[idx..idx + span.member_count];
+        idx += span.member_count;
+        // Label/summary from the era's most-salient members — the gist of
+        // what that stretch of time was about.
+        let mut top: Vec<&MemoryItem> = members.iter().collect();
+        top.sort_by(|a, b| b.salience.total_cmp(&a.salience));
+        let texts: Vec<&str> = top.iter().take(5).map(|m| m.content.as_str()).collect();
+        let summary = summarizer.summarize(&texts);
+        rows.push(forgetfuldb_store::Epoch {
+            id: new_id("epoch", &format!("{}-{}", span.ordinal, span.started_at)),
+            ordinal: span.ordinal as i64,
+            started_at: span.started_at,
+            ended_at: span.ended_at,
+            centroid: Some(span.centroid.clone()),
+            label: Some(format!("era {}", span.ordinal + 1)),
+            summary: (!summary.is_empty()).then_some(summary),
+            member_count: span.member_count as i64,
+            drift_in: span.drift_in,
+        });
+    }
+    store.replace_epochs(&rows)?;
+    report.epochs = spans.len();
+    Ok(())
+}
+
 /// Any memory that is the target of a `contradicts` or `updates` link is
 /// out of date by definition — mark it stale (kept, but hidden from
 /// retrieval unless explicitly requested).
@@ -697,6 +786,26 @@ mod tests {
 
     fn salience_of(store: &Store, id: &str) -> f64 {
         store.get_memory(id).unwrap().unwrap().salience
+    }
+
+    /// Insert a memory with a hand-crafted embedding and creation time —
+    /// lets epoch tests control the embedding-space geometry exactly, rather
+    /// than depending on hashed_bow's fuzzy lexical cosine.
+    fn insert_emb(store: &Store, text: &str, embedding: Vec<f32>, mt: MemoryType, days_ago: i64) -> String {
+        let now = now_unix();
+        let hash = content_hash(text);
+        let mut m = MemoryItem::new(new_id("mem", &hash), text.to_string(), mt, hash, now - days_ago * 86_400);
+        m.embedding = Some(embedding);
+        m.importance_score = 0.6;
+        store.insert_memory(&m).unwrap();
+        m.id
+    }
+
+    /// A 2-D unit vector at `deg` degrees — a point on a topic circle, so the
+    /// angular gap between two memories is exactly their cosine distance.
+    fn unit2(deg: f64) -> Vec<f32> {
+        let r = deg.to_radians();
+        vec![r.cos() as f32, r.sin() as f32]
     }
 
     // ---- Eval Layer 1: behavior tests (each isolates one mechanism) ----
@@ -876,6 +985,94 @@ mod tests {
         assert!(store.get_memory(&anomaly).unwrap().is_some(), "the anomaly must survive the collapse");
         assert!(surviving_routine.is_empty(), "the routine should be gone, replaced by the gist");
         assert!(gist.is_some(), "a gist memory should capture the collapsed routine");
+    }
+
+    #[test]
+    fn eval_two_topic_stream_segments_into_two_eras() {
+        let (store, _provider, mut cfg) = setup();
+        cfg.consolidation_thresholds.burst_collapse_enabled = false; // keep the stream intact
+        // Tight on-topic points sit within the 0.92 dup angle; only collapse
+        // true duplicates so the six-per-era stream survives to be segmented.
+        cfg.consolidation_thresholds.duplicate_similarity = 0.999;
+
+        // Era A: six notes clustered near axis 0° (mutually similar but none a
+        // duplicate), spread over ~10 days starting ~40 days ago.
+        for (k, deg) in [0.0, 6.0, 12.0, 18.0, 24.0, 30.0].into_iter().enumerate() {
+            insert_emb(&store, &format!("topic a note {k}"), unit2(deg), MemoryType::Semantic, 40 - k as i64 * 2);
+        }
+        // Era B: six notes near axis 90° — a clean rotation away — ~10 days later.
+        for (k, deg) in [90.0, 96.0, 102.0, 108.0, 114.0, 120.0].into_iter().enumerate() {
+            insert_emb(&store, &format!("topic b note {k}"), unit2(deg), MemoryType::Semantic, 20 - k as i64 * 2);
+        }
+
+        let report = consolidate(&store, &ExtractiveSummarizer::default(), &cfg).unwrap();
+        assert_eq!(report.epochs, 2, "report should record two eras");
+
+        let epochs = store.list_epochs().unwrap();
+        assert_eq!(epochs.len(), 2, "a clean topic rotation over time should yield two eras, got {}", epochs.len());
+        assert_eq!(epochs[0].member_count, 6, "era A holds its six members");
+        assert!(epochs[0].ended_at.is_some(), "the first era is closed");
+        assert_eq!(epochs[1].ended_at, None, "the latest era is open");
+        assert!(epochs[1].drift_in > 0.3, "era 2 opened on real drift: {}", epochs[1].drift_in);
+    }
+
+    #[test]
+    fn eval_consolidation_preserves_near_duplicates_across_epochs() {
+        // Identical embedding, different text → cosine 1.0, normally merged.
+        let emb = vec![1.0_f32, 0.0];
+
+        // Control — same era: the two collapse to one (the merge still works).
+        {
+            let (store, _p, mut cfg) = setup();
+            cfg.consolidation_thresholds.burst_collapse_enabled = false;
+            let a = insert_emb(&store, "near dup alpha", emb.clone(), MemoryType::Semantic, 30);
+            let b = insert_emb(&store, "near dup bravo", emb.clone(), MemoryType::Semantic, 28);
+            consolidate(&store, &ExtractiveSummarizer::default(), &cfg).unwrap();
+            let surviving = [&a, &b].iter().filter(|id| store.get_memory(id).unwrap().is_some()).count();
+            assert_eq!(surviving, 1, "near-duplicates in one era should merge");
+        }
+
+        // Across two eras: the preserve-across guard keeps both.
+        {
+            let (store, _p, mut cfg) = setup();
+            cfg.consolidation_thresholds.burst_collapse_enabled = false;
+            let now = now_unix();
+            let a = insert_emb(&store, "near dup alpha", emb.clone(), MemoryType::Semantic, 30);
+            let b = insert_emb(&store, "near dup bravo", emb.clone(), MemoryType::Semantic, 10);
+            // Two eras with a boundary at day 20: a (day 30) and b (day 10)
+            // fall on opposite sides.
+            store
+                .replace_epochs(&[
+                    forgetfuldb_store::Epoch {
+                        id: "ep0".into(),
+                        ordinal: 0,
+                        started_at: now - 40 * 86_400,
+                        ended_at: Some(now - 20 * 86_400),
+                        centroid: None,
+                        label: None,
+                        summary: None,
+                        member_count: 1,
+                        drift_in: 0.0,
+                    },
+                    forgetfuldb_store::Epoch {
+                        id: "ep1".into(),
+                        ordinal: 1,
+                        started_at: now - 20 * 86_400,
+                        ended_at: None,
+                        centroid: None,
+                        label: None,
+                        summary: None,
+                        member_count: 1,
+                        drift_in: 0.5,
+                    },
+                ])
+                .unwrap();
+            consolidate(&store, &ExtractiveSummarizer::default(), &cfg).unwrap();
+            assert!(
+                store.get_memory(&a).unwrap().is_some() && store.get_memory(&b).unwrap().is_some(),
+                "near-duplicates in different eras must both survive"
+            );
+        }
     }
 
     #[test]

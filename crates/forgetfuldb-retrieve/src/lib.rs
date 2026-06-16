@@ -50,6 +50,10 @@ pub struct RetrieveOptions {
     pub since: Option<i64>,
     /// Restrict candidates to memories created at/before this unix time.
     pub until: Option<i64>,
+    /// Query a whole era by its ordinal: resolves to that epoch's time window
+    /// and implies `bypass_decay` (an era lookup wants everything from that
+    /// stretch, faded or not). Explicit `since`/`until` take precedence.
+    pub epoch_ordinal: Option<i64>,
     /// Also return near-misses: memories that scored above zero but below
     /// `min_score`, with full breakdowns. For the retrieval inspector —
     /// "what almost got injected".
@@ -74,6 +78,7 @@ impl Default for RetrieveOptions {
             memory_types: None,
             since: None,
             until: None,
+            epoch_ordinal: None,
             debug: false,
             bypass_decay: false,
         }
@@ -196,6 +201,22 @@ pub fn retrieve(
     let weights = &cfg.retrieval_weights;
     let session_tag = opts.exclude_session.as_ref().map(|s| format!("session:{s}"));
 
+    // An epoch query is a dated lookup: resolve the ordinal to its
+    // [started_at, ended_at) window and bypass decay (we want everything from
+    // that era, faded or not). Explicit since/until win over the era's bounds.
+    let (epoch_since, epoch_until, epoch_bypass) = match opts.epoch_ordinal {
+        Some(ord) => match store.list_epochs()?.into_iter().find(|e| e.ordinal == ord) {
+            // `ended_at` is exclusive (next era's start), so the inclusive
+            // `until` is one second earlier.
+            Some(e) => (Some(e.started_at), e.ended_at.map(|t| t - 1), true),
+            None => (None, None, false),
+        },
+        None => (None, None, false),
+    };
+    let since = opts.since.or(epoch_since);
+    let until = opts.until.or(epoch_until);
+    let bypass_decay = opts.bypass_decay || epoch_bypass;
+
     let mut scored: Vec<RetrievedMemory> = Vec::new();
     for item in store.list_memories(None)? {
         if item.stale && !opts.include_stale {
@@ -209,7 +230,7 @@ pub fn retrieve(
                 continue;
             }
         }
-        if opts.since.is_some_and(|s| item.created_at < s) || opts.until.is_some_and(|u| item.created_at > u) {
+        if since.is_some_and(|s| item.created_at < s) || until.is_some_and(|u| item.created_at > u) {
             continue;
         }
         // The excluded session's turns are already in the prompt as live
@@ -232,7 +253,7 @@ pub fn retrieve(
 
         let lambda = lambdas.for_type(item.memory_type);
         // Salience resists decay; a dated query bypasses decay entirely.
-        let importance = if opts.bypass_decay {
+        let importance = if bypass_decay {
             item.importance_score
         } else {
             decay::decay_score_resisted(
@@ -552,5 +573,71 @@ mod tests {
         let item = store.get_memory(&id).unwrap().unwrap();
         assert_eq!(item.access_count, 1);
         assert!(item.last_accessed_at.is_some());
+    }
+
+    #[test]
+    fn epoch_ordinal_restricts_retrieval_to_that_era() {
+        let (store, provider, cfg) = setup();
+        let now = now_unix();
+        let old = add(&store, provider.as_ref(), &cfg, "the gardening project notes from the early era", vec![]);
+        let recent = add(&store, provider.as_ref(), &cfg, "the database migration notes from the current era", vec![]);
+        // Age `old` into the past; `recent` stays at now.
+        let mut m = store.get_memory(&old).unwrap().unwrap();
+        m.created_at = now - 40 * 86_400;
+        store.update_memory(&m).unwrap();
+
+        // Era 0 = [now-50d, now-20d); era 1 = [now-20d, open).
+        store
+            .replace_epochs(&[
+                forgetfuldb_store::Epoch {
+                    id: "e0".into(),
+                    ordinal: 0,
+                    started_at: now - 50 * 86_400,
+                    ended_at: Some(now - 20 * 86_400),
+                    centroid: None,
+                    label: None,
+                    summary: None,
+                    member_count: 1,
+                    drift_in: 0.0,
+                },
+                forgetfuldb_store::Epoch {
+                    id: "e1".into(),
+                    ordinal: 1,
+                    started_at: now - 20 * 86_400,
+                    ended_at: None,
+                    centroid: None,
+                    label: None,
+                    summary: None,
+                    member_count: 1,
+                    drift_in: 0.5,
+                },
+            ])
+            .unwrap();
+
+        // Querying era 0 returns only its member — even though it's 40 days
+        // old (the era lookup bypasses decay).
+        let pack0 = retrieve(
+            &store,
+            provider.as_ref(),
+            &cfg,
+            "notes",
+            &RetrieveOptions { epoch_ordinal: Some(0), ..Default::default() },
+        )
+        .unwrap();
+        let ids0: Vec<&str> = pack0.memories.iter().map(|m| m.item.id.as_str()).collect();
+        assert!(ids0.contains(&old.as_str()), "era 0 query returns the old-era memory");
+        assert!(!ids0.contains(&recent.as_str()), "era 0 query excludes the current-era memory");
+
+        // Querying era 1 returns only the current-era memory.
+        let pack1 = retrieve(
+            &store,
+            provider.as_ref(),
+            &cfg,
+            "notes",
+            &RetrieveOptions { epoch_ordinal: Some(1), ..Default::default() },
+        )
+        .unwrap();
+        let ids1: Vec<&str> = pack1.memories.iter().map(|m| m.item.id.as_str()).collect();
+        assert!(ids1.contains(&recent.as_str()) && !ids1.contains(&old.as_str()));
     }
 }

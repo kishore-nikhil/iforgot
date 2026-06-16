@@ -220,6 +220,7 @@ fn main() -> Result<()> {
             println!("raw events     : {}", stats.raw_events);
             println!("links          : {}", stats.links);
             println!("sessions       : {}", stats.sessions);
+            println!("epochs         : {}", stats.epochs);
             Ok(())
         }
         Command::Metrics => {

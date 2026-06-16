@@ -21,11 +21,11 @@ Both installed to `~/.cargo/bin`.
 
 | Crate | Responsibility | Notable files |
 | --- | --- | --- |
-| `forgetfuldb-core` | scoring, decay, **salience**, config, types | `salience.rs` (neighbor discriminator), `decay.rs` (`decay_score_resisted`), `scoring.rs`, `config.rs` |
-| `forgetfuldb-store` | SQLite persistence, migrations, pipeline | `lib.rs`, `pipeline.rs` (ingest + edge rebuilds), `migrations/0001..0006` |
+| `forgetfuldb-core` | scoring, decay, **salience**, **epochs**, config, types | `salience.rs` (neighbor discriminator), `epochs.rs` (drift segmentation), `decay.rs` (`decay_score_resisted`), `scoring.rs`, `config.rs` |
+| `forgetfuldb-store` | SQLite persistence, migrations, pipeline | `lib.rs`, `pipeline.rs` (ingest + edge rebuilds), `migrations/0001..0008` |
 | `forgetfuldb-embed` | embedding providers | `hashed_bow` (default, lexical) + `ollama.rs` (real) |
-| `forgetfuldb-retrieve` | hybrid retrieval, spreading activation, `bypass_decay` | `lib.rs` |
-| `forgetfuldb-consolidate` | the "sleep cycle" | `lib.rs` (merge, `revise_salience`, summaries, promote, stale, archive/prune, edge rebuilds) |
+| `forgetfuldb-retrieve` | hybrid retrieval, spreading activation, `bypass_decay`, `epoch_ordinal` | `lib.rs` |
+| `forgetfuldb-consolidate` | the "sleep cycle" | `lib.rs` (merge, gist-collapse, `revise_salience`, summaries, promote, foundation, stale, archive/prune, edge rebuilds, `segment_epochs`) |
 | `forgetfuldb-prob` | bloom / CMS / HLL / reservoir (from scratch) | |
 | `forgetfuldb-tools` | shell + read-only `explore` tools | |
 | `forgetfuldb-agent` | chat loop, backend, **writer** (live edge bump), research | `lib.rs`, `writer.rs`, `research.rs` |
@@ -59,8 +59,9 @@ Both installed to `~/.cargo/bin`.
   process.
 - **`/research <folder>`** read-only exploration agent; first-token spinner.
 - **Eval Layer 1** behavior tests (selective forgetting, surprise salience,
-  decay resistance, **habit→foundation**, **burst→gist**) in
-  `forgetfuldb-consolidate`.
+  decay resistance, **habit→foundation**, **burst→gist**, **two-topic→two-
+  eras**, **preserve-across-epochs**) in `forgetfuldb-consolidate`, plus the
+  pure `epochs.rs` segmentation unit tests in `forgetfuldb-core`.
 - **Foundation tier** (`MemoryType::Foundation`): decay-exempt identity
   traits *concluded* by consolidation from `NeighborClass::Habit` evidence
   (a habit cluster collapses to a single trait). Mirrors the pin exemption
@@ -77,8 +78,16 @@ Both installed to `~/.cargo/bin`.
 - **Nightly consolidation timer** (`forgetfuldb schedule install|status|
   uninstall`): writes a per-user launchd agent that runs `consolidate`
   nightly. Opt-in (the user runs it); macOS-only (Linux prints the cron line).
+- **Epochs** (`core::epochs`, migration `0008`, `segment_epochs`): the
+  timeline is partitioned into drift-segmented eras (windowed embedding-
+  centroid drift + hysteresis, model-free). Rebuilt each consolidation into
+  the `epochs` table (no `epoch_id` on `memory_items` — membership is a
+  time-range lookup). Drives "consolidate within, preserve across" (merge &
+  gist-collapse skip cross-epoch pairs) and `retrieve(epoch_ordinal=N)`
+  (resolves to the era's window + `bypass_decay`). Surfaced at `/epochs`, in
+  `stats`, and as the UI Metrics "epochs" strip.
 
-State: ~130 tests pass, clippy clean, tsc clean.
+State: ~142 tests pass, clippy clean, tsc clean.
 
 ## Commands
 
@@ -130,13 +139,14 @@ iforgot                                      # chat; /embed /research /consolida
 ## What's next (deferred, specced in memory-architecture.md)
 
 Done since the last handoff: **Foundation tier**, **gist-collapse**, the
-**retention-efficiency metric** (cost denominator), and the **launchd nightly
-timer**. Remaining, in dependency order: **epochs** (drift-segmented eras,
-cite ES-Mem arXiv 2601.07582) → **multi-hop traversal + subgraph injection**
-(retrieval that *thinks* along the edges) → **contradiction inference** (the
-staleness attack) → **goal-conditioned retrieval** → **dreaming** (offline
-recombination, the only mechanism that *creates*) → **ANN index**,
-**MCP server**.
+**retention-efficiency metric** (cost denominator), the **launchd nightly
+timer**, and **epochs** (drift-segmented eras, ES-Mem arXiv 2601.07582).
+Remaining, in dependency order: **multi-hop traversal + subgraph injection**
+(retrieval that *thinks* along the edges — generalize the one-hop spreading
+activation, inject a connected subgraph; the `epoch-multihop` branch is named
+for it) → **contradiction inference** (the staleness attack) →
+**goal-conditioned retrieval** → **dreaming** (offline recombination, the only
+mechanism that *creates*) → **ANN index**, **MCP server**.
 
 **Eval philosophy**: do NOT optimize LoCoMo/LongMemEval (they reward
 hoarding); use **retention efficiency** (accuracy per injected token). The

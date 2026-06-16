@@ -33,8 +33,8 @@ Each is a distinct axis over the same memories. The one-line thesis:
 | **Decay** | Forgets the unused — exponential `exp(-λt)`, per-type half-lives | ✅ shipped |
 | **Salience** | Keeps the formative — U-shaped (surprise ∨ habit), resists decay | ✅ shipped |
 | **Abstraction** | Turns repetition into traits (raw → episodic → semantic → foundation) | ✅ shipped (episodic→semantic, habit→foundation, burst→gist) |
-| **Epochs** | Organizes a lifetime into eras (drift-segmented + calendar) | ○ planned |
-| **Edges** | Connects memories (typed graph + traversal) | ◐ partial (4 edge types; traversal planned) |
+| **Epochs** | Organizes a lifetime into eras (drift-segmented) | ✅ shipped (drift segmentation; calendar grid still planned) |
+| **Edges** | Connects memories (typed graph + traversal) | ◐ partial (4 edge types + one-hop activation; multi-hop traversal planned) |
 | **Dreaming** | *Creates* memories/connections offline (recombination) | ○ planned |
 
 A unifying insight used throughout: **one neighbor-density-over-time
@@ -108,12 +108,29 @@ Dated / epoch queries (`bypass_decay`) skip decay and read raw importance:
 decay governs *ambient* recall, but "what happened in this interval" is a
 different operation, an index lookup.
 
+### Epochs — drift-segmented eras (`core::epochs`, migration 0008)
+The model has no clock, so the engine computes "when". A single online pass
+over the time-ordered embedding stream tracks each era's centroid and cuts a
+boundary when memories drift past `epoch_drift_threshold` and *stay* drifted
+for `epoch_hysteresis_runs` in a row (one on-topic memory resets the run — the
+hysteresis that keeps a tangent from splitting an era), subject to
+`epoch_min_size`/`epoch_min_days`. Pure and deterministic, like the salience
+discriminator. Rebuilt each consolidation into the `epochs` table; membership
+is a time-range lookup, so `memory_items` is untouched. Three consumers:
+- **`retrieve(epoch_ordinal=N)`** resolves an era to its `[start, end)` window
+  and bypasses decay — "everything from that era, faded or not".
+- **Consolidate within, preserve across:** dedup-merge and gist-collapse skip
+  pairs from different epochs, so a near-identical memory in a later era isn't
+  folded into an earlier one.
+- **Observability:** `/epochs`, the `stats` count, and the Metrics "epochs"
+  strip (each era's span, size, summary and the drift that opened it).
+
 ### Consolidation — the "sleep cycle"
 Dedup-merge → **burst-collapse (gist, keep the anomaly)** → recurrence
 refresh → **salience revision** → cluster summaries → episodic→semantic
 promotion → **habit→foundation promotion** → contradiction-staling →
-archive/prune → **rebuild all three edge graphs**. Logged per run. Triggered
-manually, or nightly via the opt-in launchd timer
+archive/prune → **rebuild all three edge graphs** → **segment epochs**. Logged
+per run. Triggered manually, or nightly via the opt-in launchd timer
 (`forgetfuldb schedule install`).
 
 ### Foundation tier (`MemoryType::Foundation`)
@@ -146,9 +163,9 @@ this server or by a separate `iforgot` process (detected via SQLite
 
 Ordered by the critical path. Each is specced enough to build cleanly.
 
-> ✅ **Done:** the **Foundation tier** and **gist-collapse keeping the
-> anomaly** (items 1–2 below) now ship — see "What's implemented today". The
-> remaining critical path starts at **epochs**.
+> ✅ **Done:** the **Foundation tier**, **gist-collapse keeping the anomaly**,
+> and **epochs** (items 1–3 below) now ship — see "What's implemented today".
+> The remaining critical path starts at **multi-hop traversal**.
 
 1. ~~**Foundation tier**~~ — *shipped.* Decay-exempt trait memories
    *concluded* by consolidation from accumulated habit evidence ("user
@@ -156,10 +173,11 @@ Ordered by the critical path. Each is specced enough to build cleanly.
 2. ~~**Gist collapse keeping the anomaly**~~ — *shipped.* When the
    discriminator finds a *burst*, collapse the routine into one gist but
    **keep the outlier** (inverts the keep-the-central-member dedup).
-3. **Epochs** — organic drift-segmented eras (windowed embedding-centroid
-   drift + hysteresis, model-free) running orthogonally to a calendar grid.
-   Prior art: **ES-Mem** (arXiv 2601.07582). Consolidate *within* an epoch,
-   preserve *across*.
+3. ~~**Epochs**~~ — *shipped (drift segmentation).* Organic drift-segmented
+   eras (windowed embedding-centroid drift + hysteresis, model-free). Prior
+   art: **ES-Mem** (arXiv 2601.07582). Consolidate *within* an epoch, preserve
+   *across*. Still planned: a calendar grid running orthogonally to the
+   organic eras.
 4. **Multi-hop edge traversal + subgraph injection** — retrieval becomes a
    path-walk of the typed graph with per-hop activation decay, and injects
    a *connected subgraph with paths* (so the model can reason over the

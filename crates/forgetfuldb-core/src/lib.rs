@@ -14,6 +14,7 @@
 
 pub mod config;
 pub mod decay;
+pub mod epochs;
 pub mod ids;
 pub mod ingest;
 pub mod salience;
