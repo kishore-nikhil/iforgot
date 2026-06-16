@@ -11,6 +11,8 @@
 //! (tens of thousands of rows). An ANN index can slot in behind the same
 //! function signature later.
 
+pub mod traverse;
+
 use anyhow::Result;
 use forgetfuldb_core::config::Config;
 use forgetfuldb_core::ingest::tokenize;
@@ -20,7 +22,7 @@ use forgetfuldb_core::{age_days, decay, now_unix};
 use forgetfuldb_embed::{cosine_similarity, EmbeddingProvider};
 use forgetfuldb_store::Store;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -106,6 +108,73 @@ pub struct ContextPack {
     /// gate. Never injected into prompts.
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub near_misses: Vec<RetrievedMemory>,
+    /// The connected subgraph among the injected memories (multi-hop only):
+    /// the paths that link them, so the prompt can show *how* they relate.
+    /// `None` unless `spreading.inject_subgraph` is on.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub subgraph: Option<ContextSubgraph>,
+}
+
+/// The relationship structure among injected memories — a set of paths
+/// through the typed graph, each a chain of memory ids and the edge type
+/// joining each step.
+#[derive(Debug, Clone, Serialize)]
+pub struct ContextSubgraph {
+    pub paths: Vec<ContextPath>,
+}
+
+/// One path: `nodes[i]` connects to `nodes[i+1]` via `edges[i]`, so
+/// `edges.len() == nodes.len() - 1`.
+#[derive(Debug, Clone, Serialize)]
+pub struct ContextPath {
+    pub nodes: Vec<String>,
+    pub edges: Vec<String>,
+}
+
+impl ContextPack {
+    /// Render the injected subgraph as a compact "connections" block for the
+    /// prompt — `"A" —(led to)→ "B" —(related to)→ "C"` — resolving ids to
+    /// short snippets from the pack's own memories. `None` if there's nothing
+    /// to show.
+    pub fn render_subgraph(&self) -> Option<String> {
+        let sg = self.subgraph.as_ref()?;
+        let snippet = |id: &str| -> Option<String> {
+            self.memories.iter().find(|m| m.item.id == id).map(|m| {
+                let text = m.item.summary.as_deref().unwrap_or(&m.item.content);
+                let short: String = text.chars().take(60).collect();
+                format!("\"{}\"", short.trim())
+            })
+        };
+        let phrase = |edge: &str| match edge {
+            "sequence" => "led to",
+            "co_occurred" => "recalled with",
+            "semantic_similar" => "related to",
+            _ => "linked to",
+        };
+        let mut lines = Vec::new();
+        for path in &sg.paths {
+            let mut parts = Vec::new();
+            let mut renderable = true;
+            for (i, id) in path.nodes.iter().enumerate() {
+                match snippet(id) {
+                    Some(s) => {
+                        if i > 0 {
+                            parts.push(format!("—({})→", phrase(&path.edges[i - 1])));
+                        }
+                        parts.push(s);
+                    }
+                    None => {
+                        renderable = false;
+                        break;
+                    }
+                }
+            }
+            if renderable && parts.len() > 1 {
+                lines.push(parts.join(" "));
+            }
+        }
+        (!lines.is_empty()).then(|| lines.join("\n"))
+    }
 }
 
 /// Jaccard-style overlap between query tokens and memory tokens/tags/topic.
@@ -140,42 +209,72 @@ pub fn keyword_overlap(query_tokens: &HashSet<String>, item: &MemoryItem) -> f64
 /// Cap on near-misses returned in debug mode.
 const MAX_NEAR_MISSES: usize = 20;
 
-/// Add a one-hop spreading-activation boost in place: each candidate gains
-/// `spreading_factor · Σ (neighbor_base_score · w/(1+w))` over its
-/// co-occurrence edges, capped at `spreading_factor` so associations
-/// never dominate genuine relevance. Uses pre-boost scores throughout.
-fn apply_spreading_activation(store: &Store, cfg: &Config, scored: &mut [RetrievedMemory]) -> Result<()> {
-    use std::collections::HashMap;
+/// Multi-hop spreading activation. From the top-scoring seeds, activation
+/// spreads over the typed graph (all three edge types) with per-hop decay,
+/// and each reached candidate gains a boost `= spreading_factor · activation`,
+/// **capped at `spreading_factor`** so an associated memory can never outrank
+/// a genuine hit (conversational dominance). At `max_hops = 1` this is the
+/// original one-hop boost. Returns the full reach map (paths + activation) so
+/// the caller can also assemble the injected subgraph. Uses pre-boost scores
+/// as seed strengths, so the spread can't cascade off its own boosts.
+fn apply_spreading_activation(
+    store: &Store,
+    cfg: &Config,
+    scored: &mut [RetrievedMemory],
+) -> Result<HashMap<String, traverse::Reach>> {
+    use forgetfuldb_store::pipeline::EDGE_SEQUENCE;
+
     let edges = store.list_edges()?;
     if edges.is_empty() {
-        return Ok(());
+        return Ok(HashMap::new());
     }
-    // Undirected adjacency for the co-occurrence edges.
-    let mut adj: HashMap<&str, Vec<(&str, f64)>> = HashMap::new();
+    // Adjacency over all edge types. co_occurred / semantic_similar are
+    // undirected; sequence is directional (earlier → later), so it's followed
+    // forward only.
+    let mut adj: HashMap<String, Vec<traverse::AdjEdge>> = HashMap::new();
     for e in &edges {
-        if e.edge_type != forgetfuldb_store::pipeline::EDGE_CO_OCCURRED {
-            continue;
+        adj.entry(e.src_id.clone()).or_default().push(traverse::AdjEdge {
+            dst: e.dst_id.clone(),
+            edge_type: e.edge_type.clone(),
+            weight: e.weight,
+        });
+        if e.edge_type != EDGE_SEQUENCE {
+            adj.entry(e.dst_id.clone()).or_default().push(traverse::AdjEdge {
+                dst: e.src_id.clone(),
+                edge_type: e.edge_type.clone(),
+                weight: e.weight,
+            });
         }
-        adj.entry(&e.src_id).or_default().push((&e.dst_id, e.weight));
-        adj.entry(&e.dst_id).or_default().push((&e.src_id, e.weight));
     }
-    // Snapshot pre-boost scores (owned keys, so the mutable pass below is
-    // free of the borrow) so the spread can't cascade across hits.
-    let base: HashMap<String, f64> = scored.iter().map(|m| (m.item.id.clone(), m.score.total)).collect();
+
+    let s = &cfg.spreading;
+    let params = traverse::TraverseParams {
+        max_hops: s.max_hops.max(1),
+        hop_decay: s.hop_decay,
+        activation_floor: s.activation_floor,
+        co_occurred_factor: s.co_occurred_factor,
+        semantic_factor: s.semantic_factor,
+        sequence_factor: s.sequence_factor,
+    };
+
+    // Seeds: the strongest base hits (pre-boost scores).
+    let mut seeds: Vec<(String, f64)> =
+        scored.iter().filter(|m| m.score.total > 0.0).map(|m| (m.item.id.clone(), m.score.total)).collect();
+    seeds.sort_by(|a, b| b.1.total_cmp(&a.1));
+    seeds.truncate(s.seed_count.max(1));
+
+    let reach = traverse::traverse(&seeds, &adj, &params);
 
     for m in scored.iter_mut() {
-        let Some(neighbors) = adj.get(m.item.id.as_str()) else { continue };
-        let raw: f64 = neighbors
-            .iter()
-            .filter_map(|(nbr, w)| base.get(*nbr).map(|s| s * (w / (1.0 + w))))
-            .sum();
-        let boost = (cfg.spreading_factor * raw).min(cfg.spreading_factor);
-        if boost > 0.0 {
-            m.score.association_boost = boost;
-            m.score.total += boost;
+        if let Some(r) = reach.get(&m.item.id) {
+            let boost = (cfg.spreading_factor * r.activation).min(cfg.spreading_factor);
+            if boost > 0.0 {
+                m.score.association_boost = boost;
+                m.score.total += boost;
+            }
         }
     }
-    Ok(())
+    Ok(reach)
 }
 
 /// A verbatim conversational turn: chat-sourced and never distilled into
@@ -292,13 +391,16 @@ pub fn retrieve(
         scored.push(RetrievedMemory { item, score: breakdown });
     }
 
-    // Spreading activation: a memory that co-occurs (in past chat turns)
-    // with strong hits gets an additive boost, so retrieving one memory
-    // surfaces its companions. One hop, computed from pre-boost scores so
-    // it can't cascade. Off unless enabled in config.
-    if cfg.spreading_activation && cfg.spreading_factor > 0.0 {
-        apply_spreading_activation(store, cfg, &mut scored)?;
-    }
+    // Spreading activation: from the strongest hits, activation spreads over
+    // the typed graph (K hops, per-hop decay), so retrieving one memory
+    // surfaces its companions — and the paths that connect them. Computed
+    // from pre-boost scores so it can't cascade off its own boosts. Off
+    // unless enabled in config.
+    let reach = if cfg.spreading_activation && cfg.spreading_factor > 0.0 {
+        apply_spreading_activation(store, cfg, &mut scored)?
+    } else {
+        HashMap::new()
+    };
 
     scored.sort_by(|a, b| b.score.total.partial_cmp(&a.score.total).unwrap_or(std::cmp::Ordering::Equal));
     let mut near_misses = Vec::new();
@@ -315,6 +417,11 @@ pub fn retrieve(
     }
     scored.truncate(opts.top_k);
 
+    // Multi-hop subgraph: pull the connective memories (linked to the hits but
+    // not themselves top-k) into the result and record the paths. Mutates
+    // `scored`, so it runs before the touch loop below.
+    let subgraph = inject_subgraph(store, &mut scored, &reach, cfg)?;
+
     // Retrieval counts as access: it slows future decay-driven cleanup.
     // Near-misses are NOT touched — looking at what almost matched must
     // not rehearse it.
@@ -328,7 +435,87 @@ pub fn retrieve(
         memories: scored,
         min_score: opts.min_score,
         near_misses,
+        subgraph,
     })
+}
+
+/// Assemble the injected subgraph from the walk, and pull the connective
+/// memories it found into the result. These are memories *linked* to the hits
+/// but not themselves top-k by similarity — the whole point of multi-hop — so
+/// they're appended to `memories` (ranked after the direct hits, scored purely
+/// by association) and their content becomes part of the prompt. Paths are
+/// kept maximal (a prefix of a longer chain is dropped) and bounded by
+/// `subgraph_max_nodes` newly-injected memories.
+fn inject_subgraph(
+    store: &Store,
+    memories: &mut Vec<RetrievedMemory>,
+    reach: &HashMap<String, traverse::Reach>,
+    cfg: &Config,
+) -> Result<Option<ContextSubgraph>> {
+    if !cfg.spreading.inject_subgraph {
+        return Ok(None);
+    }
+    let present: HashSet<String> = memories.iter().map(|m| m.item.id.clone()).collect();
+
+    // Traversed-in paths, longest first (so the maximal chain wins the budget
+    // and its prefixes fold into it), then strongest.
+    let mut cands: Vec<&traverse::Reach> =
+        reach.values().filter(|r| r.depth >= 1 && !r.edges.is_empty()).collect();
+    cands.sort_by(|a, b| b.path.len().cmp(&a.path.len()).then(b.activation.total_cmp(&a.activation)));
+
+    let max_nodes = cfg.spreading.subgraph_max_nodes;
+    let mut paths: Vec<ContextPath> = Vec::new();
+    let mut inject: Vec<String> = Vec::new(); // new connective ids, in order
+    let mut injected: HashSet<String> = HashSet::new();
+
+    for r in cands {
+        if paths.iter().any(|q| q.nodes.len() > r.path.len() && q.nodes.starts_with(&r.path)) {
+            continue; // prefix of a chain we already kept
+        }
+        let extra: Vec<String> =
+            r.path.iter().filter(|id| !present.contains(*id) && !injected.contains(*id)).cloned().collect();
+        if inject.len() + extra.len() > max_nodes {
+            continue;
+        }
+        for id in extra {
+            injected.insert(id.clone());
+            inject.push(id);
+        }
+        paths.push(ContextPath { nodes: r.path.clone(), edges: r.edges.clone() });
+    }
+    if paths.is_empty() {
+        return Ok(None);
+    }
+
+    // Inject the connective memories so the prompt actually contains them and
+    // the token-cost metric counts them. Skip stale/archived ones.
+    for id in &inject {
+        if let Some(item) = store.get_memory(id)? {
+            if item.stale || item.memory_type == MemoryType::Archive {
+                continue;
+            }
+            let activation = reach.get(id).map(|r| r.activation).unwrap_or(0.0);
+            memories.push(RetrievedMemory { item, score: association_score(activation) });
+        }
+    }
+    Ok(Some(ContextSubgraph { paths }))
+}
+
+/// A score breakdown for a memory pulled in purely by graph association — its
+/// only nonzero term is the activation it accumulated.
+fn association_score(activation: f64) -> ScoreBreakdown {
+    ScoreBreakdown {
+        semantic_similarity: 0.0,
+        importance: 0.0,
+        recurrence: 0.0,
+        recency: 0.0,
+        pinned_boost: 0.0,
+        staleness_penalty: 0.0,
+        conversational_damping: 1.0,
+        association_boost: activation,
+        salience: 0.0,
+        total: activation,
+    }
 }
 
 #[cfg(test)]
@@ -563,6 +750,149 @@ mod tests {
             boosted.score.total,
             base_companion
         );
+    }
+
+    #[test]
+    fn multi_hop_surfaces_linked_memories_below_direct_hits() {
+        let (store, provider, mut cfg) = setup();
+        let hit = add(&store, provider.as_ref(), &cfg, "the standup is at nine thirty on mondays", vec![]);
+        let mid = add(&store, provider.as_ref(), &cfg, "the sprint demo is on friday afternoon", vec![]);
+        let far = add(&store, provider.as_ref(), &cfg, "we ordered pizza for the team retro lunch", vec![]);
+
+        let edge = |a: &str, b: &str| forgetfuldb_store::MemoryEdge {
+            src_id: a.min(b).to_string(),
+            dst_id: a.max(b).to_string(),
+            edge_type: forgetfuldb_store::pipeline::EDGE_CO_OCCURRED.to_string(),
+            weight: 5.0,
+            co_count: 5,
+            created_at: 0,
+            last_activated: 0,
+        };
+        store.upsert_edge(&edge(&hit, &mid)).unwrap(); // hit — mid (1 hop)
+        store.upsert_edge(&edge(&mid, &far)).unwrap(); // mid — far (2 hops from hit)
+
+        cfg.spreading_activation = true;
+        cfg.spreading.seed_count = 1; // only the direct hit seeds the walk
+
+        // One hop: only the direct neighbor is reached; far gets nothing.
+        cfg.spreading.max_hops = 1;
+        let one = retrieve(&store, provider.as_ref(), &cfg, "standup time", &RetrieveOptions::default()).unwrap();
+        let far_one = one.memories.iter().find(|m| m.item.id == far).unwrap();
+        assert_eq!(far_one.score.association_boost, 0.0, "two hops away gets nothing at max_hops=1");
+
+        // Two hops: far is reached and lifted — but never above the direct hit.
+        cfg.spreading.max_hops = 2;
+        let two = retrieve(&store, provider.as_ref(), &cfg, "standup time", &RetrieveOptions::default()).unwrap();
+        let far_two = two.memories.iter().find(|m| m.item.id == far).unwrap();
+        let hit_two = two.memories.iter().find(|m| m.item.id == hit).unwrap();
+        assert!(far_two.score.association_boost > 0.0, "the 2-hop memory is reached and boosted");
+        assert!(
+            hit_two.score.total > far_two.score.total,
+            "the direct hit must still outrank the traversed-in memory ({} vs {})",
+            hit_two.score.total,
+            far_two.score.total
+        );
+    }
+
+    #[test]
+    fn subgraph_injection_renders_connection_paths() {
+        let (store, provider, mut cfg) = setup();
+        let hit = add(&store, provider.as_ref(), &cfg, "the standup is at nine thirty on mondays", vec![]);
+        let mid = add(&store, provider.as_ref(), &cfg, "the sprint demo is on friday afternoon", vec![]);
+        let far = add(&store, provider.as_ref(), &cfg, "we ordered pizza for the team retro lunch", vec![]);
+
+        // Directional sequence edges: hit → mid → far (a reasoning path).
+        let seq = |a: &str, b: &str| forgetfuldb_store::MemoryEdge {
+            src_id: a.to_string(),
+            dst_id: b.to_string(),
+            edge_type: forgetfuldb_store::pipeline::EDGE_SEQUENCE.to_string(),
+            weight: 5.0,
+            co_count: 5,
+            created_at: 0,
+            last_activated: 0,
+        };
+        store.upsert_edge(&seq(&hit, &mid)).unwrap();
+        store.upsert_edge(&seq(&mid, &far)).unwrap();
+
+        cfg.spreading_activation = true;
+        cfg.spreading.seed_count = 1;
+        cfg.spreading.max_hops = 2;
+        cfg.spreading.inject_subgraph = true;
+
+        let pack = retrieve(&store, provider.as_ref(), &cfg, "standup time", &RetrieveOptions::default()).unwrap();
+        let sg = pack.subgraph.as_ref().expect("a subgraph is injected");
+        // The full chain is one maximal path; the hit→mid prefix is folded in.
+        assert!(
+            sg.paths.iter().any(|p| p.nodes == vec![hit.clone(), mid.clone(), far.clone()]),
+            "the 2-hop chain is a path"
+        );
+        assert!(!sg.paths.iter().any(|p| p.nodes == vec![hit.clone(), mid.clone()]), "the prefix path is dropped");
+
+        let rendered = pack.render_subgraph().expect("renders to text");
+        assert!(rendered.contains("led to"), "sequence edges render as 'led to': {rendered}");
+        assert!(rendered.contains("pizza"), "the far memory's snippet appears: {rendered}");
+    }
+
+    #[test]
+    fn subgraph_injects_connective_memories_beyond_top_k() {
+        let (store, provider, mut cfg) = setup();
+        let hit = add(&store, provider.as_ref(), &cfg, "the standup is at nine thirty on mondays", vec![]);
+        let b = add(&store, provider.as_ref(), &cfg, "office plants need watering on tuesdays", vec![]);
+        let c = add(&store, provider.as_ref(), &cfg, "the parking garage closes at midnight", vec![]);
+        // Noise so a top_k=1 flat result excludes b and c.
+        for i in 0..5 {
+            add(&store, provider.as_ref(), &cfg, &format!("filler memory number {i} about nothing in particular"), vec![]);
+        }
+        let seq = |a: &str, d: &str| forgetfuldb_store::MemoryEdge {
+            src_id: a.to_string(),
+            dst_id: d.to_string(),
+            edge_type: forgetfuldb_store::pipeline::EDGE_SEQUENCE.to_string(),
+            weight: 6.0,
+            co_count: 6,
+            created_at: 0,
+            last_activated: 0,
+        };
+        store.upsert_edge(&seq(&hit, &b)).unwrap(); // hit → b → c
+        store.upsert_edge(&seq(&b, &c)).unwrap();
+
+        cfg.spreading_activation = true;
+        cfg.spreading.seed_count = 1;
+        cfg.spreading.max_hops = 2;
+        cfg.spreading.inject_subgraph = true;
+
+        // Flat top-k is just the hit; the chain's other links aren't top-k.
+        let opts = RetrieveOptions { top_k: 1, ..Default::default() };
+        let pack = retrieve(&store, provider.as_ref(), &cfg, "standup time", &opts).unwrap();
+
+        let ids: HashSet<&str> = pack.memories.iter().map(|m| m.item.id.as_str()).collect();
+        assert!(ids.contains(hit.as_str()), "the direct hit is present");
+        assert!(
+            ids.contains(b.as_str()) && ids.contains(c.as_str()),
+            "the connective memories are injected past top_k=1"
+        );
+        assert!(pack.memories.len() > opts.top_k, "subgraph injection grows the result beyond top_k");
+        assert!(pack.render_subgraph().unwrap().contains("led to"), "the chain renders");
+    }
+
+    #[test]
+    fn no_subgraph_unless_opted_in() {
+        let (store, provider, mut cfg) = setup();
+        let a = add(&store, provider.as_ref(), &cfg, "alpha standup note", vec![]);
+        let b = add(&store, provider.as_ref(), &cfg, "bravo unrelated note", vec![]);
+        store
+            .upsert_edge(&forgetfuldb_store::MemoryEdge {
+                src_id: a.clone().min(b.clone()),
+                dst_id: a.clone().max(b.clone()),
+                edge_type: forgetfuldb_store::pipeline::EDGE_CO_OCCURRED.to_string(),
+                weight: 5.0,
+                co_count: 5,
+                created_at: 0,
+                last_activated: 0,
+            })
+            .unwrap();
+        cfg.spreading_activation = true; // boosts on, but subgraph off
+        let pack = retrieve(&store, provider.as_ref(), &cfg, "standup", &RetrieveOptions::default()).unwrap();
+        assert!(pack.subgraph.is_none(), "no subgraph unless inject_subgraph is set");
     }
 
     #[test]

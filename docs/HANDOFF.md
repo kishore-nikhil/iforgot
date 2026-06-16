@@ -24,7 +24,7 @@ Both installed to `~/.cargo/bin`.
 | `forgetfuldb-core` | scoring, decay, **salience**, **epochs**, config, types | `salience.rs` (neighbor discriminator), `epochs.rs` (drift segmentation), `decay.rs` (`decay_score_resisted`), `scoring.rs`, `config.rs` |
 | `forgetfuldb-store` | SQLite persistence, migrations, pipeline | `lib.rs`, `pipeline.rs` (ingest + edge rebuilds), `migrations/0001..0008` |
 | `forgetfuldb-embed` | embedding providers | `hashed_bow` (default, lexical) + `ollama.rs` (real) |
-| `forgetfuldb-retrieve` | hybrid retrieval, spreading activation, `bypass_decay`, `epoch_ordinal` | `lib.rs` |
+| `forgetfuldb-retrieve` | hybrid retrieval, multi-hop spreading activation + subgraph injection, `bypass_decay`, `epoch_ordinal` | `lib.rs`, `traverse.rs` (pure K-hop walk) |
 | `forgetfuldb-consolidate` | the "sleep cycle" | `lib.rs` (merge, gist-collapse, `revise_salience`, summaries, promote, foundation, stale, archive/prune, edge rebuilds, `segment_epochs`) |
 | `forgetfuldb-prob` | bloom / CMS / HLL / reservoir (from scratch) | |
 | `forgetfuldb-tools` | shell + read-only `explore` tools | |
@@ -86,8 +86,18 @@ Both installed to `~/.cargo/bin`.
   gist-collapse skip cross-epoch pairs) and `retrieve(epoch_ordinal=N)`
   (resolves to the era's window + `bypass_decay`). Surfaced at `/epochs`, in
   `stats`, and as the UI Metrics "epochs" strip.
+- **Multi-hop traversal + subgraph injection** (`retrieve::traverse`, the
+  `[spreading]` config block): spreading activation generalized from one hop /
+  co-occurred-only to a K-hop walk over all three edge types with per-hop
+  decay, per-edge-type factors, and an activation floor (`traverse.rs`, pure +
+  unit-tested). `max_hops = 1` reproduces the old one-hop boost, so it's
+  opt-in. With `inject_subgraph`, the walk pulls the *connective* memories
+  (linked to the hits but not themselves top-k) into the result and attaches
+  the paths (`ContextPack.subgraph`); the agent renders them as a "how these
+  connect" block (`render_subgraph`), counted in `context_chars`. Capped at
+  `spreading_factor` so association never outranks a direct hit.
 
-State: ~142 tests pass, clippy clean, tsc clean.
+State: ~154 tests pass, clippy clean, tsc clean.
 
 ## Commands
 
@@ -132,21 +142,26 @@ iforgot                                      # chat; /embed /research /consolida
    semantic behavior needs `embeddinggemma`. Behavior tests assert *relative*
    not absolute values for this reason. The tokenizer drops 1-char tokens
    (bit me once: numeric suffixes collapsed and merged).
-6. **`spreading_activation` reads `list_edges()` on the sync retrieval path** —
-   cheap now, watch it if the edge table gets huge (ANN/indexing is the fix).
+6. **Multi-hop traversal reads `list_edges()` on the sync retrieval path** —
+   bounded by `max_hops` + the activation floor, cheap now; watch it if the
+   edge table gets huge (an edge index / ANN is the fix). Multi-hop is
+   **off by default** (`spreading_activation = false`, `spreading.max_hops = 1`).
 7. Date in this project's history is ~2026-06; consolidate relative dates.
 
 ## What's next (deferred, specced in memory-architecture.md)
 
 Done since the last handoff: **Foundation tier**, **gist-collapse**, the
 **retention-efficiency metric** (cost denominator), the **launchd nightly
-timer**, and **epochs** (drift-segmented eras, ES-Mem arXiv 2601.07582).
-Remaining, in dependency order: **multi-hop traversal + subgraph injection**
-(retrieval that *thinks* along the edges — generalize the one-hop spreading
-activation, inject a connected subgraph; the `epoch-multihop` branch is named
-for it) → **contradiction inference** (the staleness attack) →
-**goal-conditioned retrieval** → **dreaming** (offline recombination, the only
-mechanism that *creates*) → **ANN index**, **MCP server**.
+timer**, **epochs** (drift-segmented eras, ES-Mem arXiv 2601.07582), and
+**multi-hop traversal + subgraph injection** (retrieval that *thinks* along
+the edges). Remaining, in dependency order: **contradiction inference** (the
+staleness attack — read text, conclude "A supersedes B", write a contrastive
+edge) → **goal-conditioned retrieval** → **dreaming** (offline recombination,
+the only mechanism that *creates*) → **ANN index**, **MCP server**.
+
+Multi-hop follow-ups deferred: a UI view of the injected subgraph / activation
+cascade (RetrievalView + GraphView), and tuning `spreading_factor`/`hop_decay`
+against the retention-efficiency metric before turning it on by default.
 
 **Eval philosophy**: do NOT optimize LoCoMo/LongMemEval (they reward
 hoarding); use **retention efficiency** (accuracy per injected token). The

@@ -61,6 +61,13 @@ pub fn memory_context_block(pack: &ContextPack) -> String {
     for m in &pack.memories {
         out.push_str(&format!("- [{}] {}\n", m.item.memory_type, m.item.content));
     }
+    // Multi-hop only: how the memories above connect, so the model can reason
+    // over the chain. Framed as hints to keep conversational dominance.
+    if let Some(connections) = pack.render_subgraph() {
+        out.push_str("\nHow some of these connect (hints, not facts):\n");
+        out.push_str(&connections);
+        out.push('\n');
+    }
     out
 }
 
@@ -123,7 +130,10 @@ pub fn prepare_turn(
     };
     let pack = forgetfuldb_retrieve::retrieve(store, provider, cfg, &query, &opts)?;
     let retrieve_duration_ms = t0.elapsed().as_millis() as i64;
-    let context_chars: i64 = pack.memories.iter().map(|m| m.item.content.chars().count() as i64).sum();
+    // Count the injected memory content *and* the connections block, so the
+    // retention-efficiency metric reflects the true token cost of multi-hop.
+    let context_chars: i64 = pack.memories.iter().map(|m| m.item.content.chars().count() as i64).sum::<i64>()
+        + pack.render_subgraph().map(|s| s.chars().count() as i64).unwrap_or(0);
 
     // Static system prompt + verbatim history + memories attached to the
     // new user message: everything before the new message is identical to
@@ -444,6 +454,7 @@ impl Agent {
                 memories: vec![],
                 min_score: 0.0,
                 near_misses: vec![],
+                subgraph: None,
             },
             context_chars: 0,
             retrieve_duration_ms: 0,
