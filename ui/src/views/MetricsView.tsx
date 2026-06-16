@@ -21,7 +21,11 @@ const GRID = '#21262d';
 export default function MetricsView({ cfg }: { cfg: UiConfig | null }) {
   const { data: turnsData } = usePoll(() => api.turns(300), 5000);
   const { data: stats } = usePoll(() => api.stats(), 5000);
+  const { data: metrics } = usePoll(() => api.metrics(), 5000);
   const { data: graph } = usePoll(() => api.graph({ since: 0 }), 10_000);
+
+  const fmt1 = (v: number | null | undefined) => (v == null ? undefined : v.toFixed(1));
+  const pct = (v: number | null | undefined) => (v == null ? undefined : `${(v * 100).toFixed(1)}%`);
 
   const turns = useMemo(
     () =>
@@ -72,6 +76,17 @@ export default function MetricsView({ cfg }: { cfg: UiConfig | null }) {
         <Tile k="edges" v={stats?.links} />
         <Tile k="chat turns" v={turnsData?.turns.length} />
         <Tile k="db size" v={cfg ? fmtBytes(cfg.db_size_bytes) : undefined} />
+      </div>
+
+      <h3 className="section">
+        retention efficiency{' '}
+        <span className="hint">accuracy ÷ injected tokens — this is the cost denominator (lower is cheaper)</span>
+      </h3>
+      <div className="tiles">
+        <Tile k="injected tok / turn" v={fmt1(metrics?.injected_tokens_per_turn)} />
+        <Tile k="memory share of prompt" v={pct(metrics?.injected_token_share)} />
+        <Tile k="tok / injected memory" v={fmt1(metrics?.tokens_per_injected_memory)} />
+        <Tile k="total injected tok" v={metrics ? Math.round(metrics.injected_tokens) : undefined} />
       </div>
 
       <div className="charts">

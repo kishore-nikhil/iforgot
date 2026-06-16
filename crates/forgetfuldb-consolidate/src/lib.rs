@@ -33,9 +33,15 @@ use std::collections::HashMap;
 #[derive(Debug, Default, Clone, Serialize)]
 pub struct ConsolidationReport {
     pub duplicates_merged: usize,
+    /// Bursts (dense, temporally-tight clusters of similar events) collapsed
+    /// into a gist while keeping the one anomalous outlier.
+    pub bursts_collapsed: usize,
     pub recurrence_updated: usize,
     pub clusters_summarized: usize,
     pub promoted_to_semantic: usize,
+    /// Semantic/preference memories concluded as decay-exempt Foundation
+    /// traits from accumulated habit evidence this pass.
+    pub promoted_to_foundation: usize,
     pub marked_stale: usize,
     pub archived: usize,
     pub deleted: usize,
@@ -59,10 +65,12 @@ pub fn consolidate(store: &Store, summarizer: &dyn Summarizer, cfg: &Config) -> 
     let now = now_unix();
 
     merge_duplicates(store, cfg, now, &mut report)?;
+    collapse_bursts(store, summarizer, cfg, now, &mut report)?;
     refresh_recurrence(store, now, &mut report)?;
     revise_salience(store, now, &mut report)?;
     summarize_clusters(store, summarizer, cfg, now, &mut report)?;
     promote_recurring(store, cfg, now, &mut report)?;
+    promote_to_foundation(store, cfg, now, &mut report)?;
     mark_contradicted_stale(store, &mut report)?;
     archive_and_prune(store, cfg, now, &mut report)?;
 
@@ -89,7 +97,7 @@ pub fn consolidate(store: &Store, summarizer: &dyn Summarizer, cfg: &Config) -> 
         duplicates_merged: report.duplicates_merged as i64,
         recurrence_updated: report.recurrence_updated as i64,
         clusters_summarized: report.clusters_summarized as i64,
-        promoted: report.promoted_to_semantic as i64,
+        promoted: (report.promoted_to_semantic + report.promoted_to_foundation) as i64,
         marked_stale: report.marked_stale as i64,
         archived: report.archived as i64,
         pruned: report.deleted as i64,
@@ -106,18 +114,39 @@ pub fn consolidate(store: &Store, summarizer: &dyn Summarizer, cfg: &Config) -> 
 /// it. O(n^2) over active memories — fine at personal scale (the sleep
 /// cycle is off the conversation path).
 fn revise_salience(store: &Store, now: i64, report: &mut ConsolidationReport) -> Result<()> {
-    use forgetfuldb_core::salience::{analyze_neighbors, salience, Neighbor, NeighborParams};
+    use forgetfuldb_core::salience::salience;
 
-    // Archives are de-emphasized copies of pruned memories, kept for the
-    // record but out of the active retrieval corpus — so they neither get a
-    // salience nor count as neighbors for active memories.
+    for (item, stats) in analyze_active(store, now)? {
+        let relevance = forgetfuldb_core::salience::content_relevance(item.content.chars().count(), item.entities.len());
+        let new_salience = salience(&stats, relevance);
+        if (new_salience - item.salience).abs() > 1e-6 {
+            let mut updated = item.clone();
+            updated.salience = new_salience;
+            updated.updated_at = now;
+            store.update_memory(&updated)?;
+            report.salience_revised += 1;
+        }
+    }
+    Ok(())
+}
+
+/// Run the shared neighbor discriminator over every active (non-archive,
+/// embedded) memory and return each item paired with its neighbor structure.
+/// One O(n²) read of the corpus that the salience and Foundation passes both
+/// consume — the "compute once, read many ways" primitive from the spec.
+/// Archives are excluded: they're de-emphasized copies of pruned memories,
+/// out of the active corpus, so they neither get analyzed nor count as
+/// neighbors.
+fn analyze_active(store: &Store, now: i64) -> Result<Vec<(MemoryItem, forgetfuldb_core::salience::NeighborStats)>> {
+    use forgetfuldb_core::salience::{analyze_neighbors, Neighbor, NeighborParams};
+
     let items: Vec<MemoryItem> = store
         .list_memories(None)?
         .into_iter()
         .filter(|m| m.memory_type != MemoryType::Archive && m.embedding.is_some())
         .collect();
     if items.len() < 2 {
-        return Ok(());
+        return Ok(Vec::new());
     }
     // History span: age of the oldest memory, the window spread is measured
     // against.
@@ -125,6 +154,7 @@ fn revise_salience(store: &Store, now: i64, report: &mut ConsolidationReport) ->
     let history_span_days = age_days(oldest, now).max(1.0);
     let params = NeighborParams::default();
 
+    let mut out = Vec::with_capacity(items.len());
     for item in &items {
         let emb = item.embedding.as_ref().unwrap();
         let neighbors: Vec<Neighbor> = items
@@ -138,15 +168,69 @@ fn revise_salience(store: &Store, now: i64, report: &mut ConsolidationReport) ->
             })
             .collect();
         let stats = analyze_neighbors(&neighbors, history_span_days, &params);
-        let relevance = forgetfuldb_core::salience::content_relevance(item.content.chars().count(), item.entities.len());
-        let new_salience = salience(&stats, relevance);
-        if (new_salience - item.salience).abs() > 1e-6 {
-            let mut updated = item.clone();
-            updated.salience = new_salience;
-            updated.updated_at = now;
-            store.update_memory(&updated)?;
-            report.salience_revised += 1;
+        out.push((item.clone(), stats));
+    }
+    Ok(out)
+}
+
+/// Conclude Foundation traits from accumulated habit. A semantic/preference
+/// memory whose near-neighbors form a *habit* — many of them, spread over a
+/// long stretch of history — is no longer just a fact; it's an
+/// identity-level trait ("initiated tic-tac-toe 4× over 3 months → likes
+/// games"). Promote it to the decay-exempt Foundation tier. This is the
+/// temporal inverse of a burst: only patterns that have proven themselves
+/// over time graduate.
+///
+/// A habit is usually a *cluster* of similar memories; promoting every member
+/// would mint a dozen copies of one trait. So we collapse each habit to a
+/// single Foundation: strongest member first, and skip any candidate already
+/// close to a memory we've made Foundational.
+fn promote_to_foundation(store: &Store, cfg: &Config, now: i64, report: &mut ConsolidationReport) -> Result<()> {
+    use forgetfuldb_core::salience::{NeighborClass, NeighborParams};
+
+    let min_spread = cfg.consolidation_thresholds.foundation_min_temporal_spread;
+    let min_neighbors = cfg.consolidation_thresholds.foundation_min_neighbors;
+    let near = NeighborParams::default().similarity_threshold as f32;
+
+    let analyzed = analyze_active(store, now)?;
+    // Embeddings of memories already Foundational — the seeds a new trait must
+    // not duplicate. Seeded with existing Foundations, grown as we promote.
+    let mut foundation_embeddings: Vec<Vec<f32>> = analyzed
+        .iter()
+        .filter(|(m, _)| m.memory_type == MemoryType::Foundation)
+        .filter_map(|(m, _)| m.embedding.clone())
+        .collect();
+
+    // Strongest candidates first, so the representative member of a habit
+    // cluster is the one that becomes the trait.
+    let mut candidates: Vec<(MemoryItem, NeighborClass, f64, usize)> = analyzed
+        .into_iter()
+        .filter(|(m, _)| !m.stale && !m.pinned)
+        .filter(|(m, _)| matches!(m.memory_type, MemoryType::Semantic | MemoryType::Preference))
+        .map(|(m, s)| (m, s.class, s.temporal_spread, s.count))
+        .filter(|(_, class, spread, count)| {
+            *class == NeighborClass::Habit && *spread >= min_spread && *count >= min_neighbors
+        })
+        .collect();
+    candidates.sort_by(|a, b| b.0.importance_score.total_cmp(&a.0.importance_score));
+
+    for (item, _, _, _) in candidates {
+        let emb = match &item.embedding {
+            Some(e) => e,
+            None => continue,
+        };
+        // Skip if this trait is already represented (an existing or
+        // just-promoted Foundation sits within the near-neighbor radius).
+        if foundation_embeddings.iter().any(|fe| cosine_similarity(emb, fe) >= near) {
+            continue;
         }
+        let mut updated = item.clone();
+        updated.memory_type = MemoryType::Foundation;
+        updated.importance_score = (updated.importance_score + 0.1).min(1.0);
+        updated.updated_at = now;
+        store.update_memory(&updated)?;
+        foundation_embeddings.push(emb.clone());
+        report.promoted_to_foundation += 1;
     }
     Ok(())
 }
@@ -203,15 +287,20 @@ fn merge_duplicates(store: &Store, cfg: &Config, now: i64, report: &mut Consolid
                 items[j].embedding.as_ref().unwrap(),
             );
             if sim >= threshold {
-                // Keep the higher-importance item; tie goes to the newer one.
-                let (keep_idx, dup_idx) = if items[i].importance_score > items[j].importance_score
-                    || (items[i].importance_score == items[j].importance_score
-                        && items[i].created_at >= items[j].created_at)
-                {
-                    (i, j)
+                // A Foundation trait always absorbs the duplicate, never the
+                // reverse — merge_pair keeps the survivor's type, so the
+                // decay-exempt trait must be the survivor. Otherwise keep the
+                // higher-importance item; tie goes to the newer one.
+                let i_found = items[i].memory_type.is_decay_exempt();
+                let j_found = items[j].memory_type.is_decay_exempt();
+                let keep_i = if i_found != j_found {
+                    i_found
                 } else {
-                    (j, i)
+                    items[i].importance_score > items[j].importance_score
+                        || (items[i].importance_score == items[j].importance_score
+                            && items[i].created_at >= items[j].created_at)
                 };
+                let (keep_idx, dup_idx) = if keep_i { (i, j) } else { (j, i) };
                 let merged = merge_pair(items[keep_idx].clone(), &items[dup_idx], now);
                 store.update_memory(&merged)?;
                 store.insert_link(&MemoryLink {
@@ -227,6 +316,138 @@ fn merge_duplicates(store: &Store, cfg: &Config, now: i64, report: &mut Consolid
                 }
             }
         }
+    }
+    Ok(())
+}
+
+/// Collapse *bursts* into a gist, keeping the anomaly. A burst is a dense
+/// cluster of similar event memories packed into a tight time window — a
+/// flurry, not a habit (which is the same density spread over time, and is
+/// promoted instead of collapsed). The routine members are summarized into a
+/// single gist and deleted; the one **outlier** — the member least like the
+/// rest — survives, because the surprising thing in a flood is the part that
+/// didn't fit.
+///
+/// This inverts the dedup-merge above, which keeps the *central* member: when
+/// the cluster is a transient burst, the center is the disposable routine and
+/// the edge is what's worth keeping.
+fn collapse_bursts(
+    store: &Store,
+    summarizer: &dyn Summarizer,
+    cfg: &Config,
+    now: i64,
+    report: &mut ConsolidationReport,
+) -> Result<()> {
+    use forgetfuldb_core::salience::NeighborParams;
+
+    if !cfg.consolidation_thresholds.burst_collapse_enabled {
+        return Ok(());
+    }
+    let min_size = cfg.consolidation_thresholds.burst_min_size;
+    let params = NeighborParams::default();
+    let sim_thresh = params.similarity_threshold as f32;
+
+    // History span is measured against the whole corpus, so "tight" means
+    // tight relative to the store's lifetime — same yardstick the salience
+    // discriminator uses.
+    let all = store.list_memories(None)?;
+    let oldest = all.iter().map(|m| m.created_at).min().unwrap_or(now);
+    let history_span_days = age_days(oldest, now).max(1.0);
+
+    // Only transient event-level memories are collapsible. Distilled
+    // knowledge (semantic/preference/foundation), pins, and stale rows are
+    // never swept into a gist.
+    let items: Vec<MemoryItem> = all
+        .into_iter()
+        .filter(|m| matches!(m.memory_type, MemoryType::RawEvent | MemoryType::Episodic))
+        .filter(|m| !m.pinned && !m.stale && m.embedding.is_some())
+        .collect();
+    if items.len() < min_size {
+        return Ok(());
+    }
+
+    let sim = |a: usize, b: usize| {
+        cosine_similarity(items[a].embedding.as_ref().unwrap(), items[b].embedding.as_ref().unwrap())
+    };
+
+    let mut consumed = vec![false; items.len()];
+    for i in 0..items.len() {
+        if consumed[i] {
+            continue;
+        }
+        // Gather i's near-neighbors (similar, not yet consumed). Anything
+        // identical enough to merge is already gone (dedup ran first), so a
+        // cluster here is "similar but distinct" — exactly a burst.
+        let mut cluster: Vec<usize> = vec![i];
+        #[allow(clippy::needless_range_loop)] // need j to index items, consumed, and sim(i, j)
+        for j in 0..items.len() {
+            if j == i || consumed[j] {
+                continue;
+            }
+            if sim(i, j) >= sim_thresh {
+                cluster.push(j);
+            }
+        }
+        if cluster.len() < min_size {
+            continue;
+        }
+        // A burst is temporally *tight*: the members fall within a short slice
+        // of the store's history. A cluster spread across time is a habit and
+        // is left for Foundation promotion, not collapsed.
+        let ages: Vec<f64> = cluster.iter().map(|&k| age_days(items[k].created_at, now)).collect();
+        let lo = ages.iter().cloned().fold(f64::MAX, f64::min);
+        let hi = ages.iter().cloned().fold(f64::MIN, f64::max);
+        if (hi - lo) / history_span_days > params.tight_spread {
+            continue;
+        }
+
+        // The outlier is the member with the lowest mean similarity to the
+        // rest — the part of the flood that didn't fit the pattern.
+        let mean_sim = |k: usize| -> f64 {
+            let others = cluster.iter().filter(|&&o| o != k);
+            let (sum, n) = others.fold((0.0, 0usize), |(s, n), &o| (s + sim(k, o) as f64, n + 1));
+            if n == 0 { 1.0 } else { sum / n as f64 }
+        };
+        let outlier = *cluster.iter().min_by(|&&a, &&b| mean_sim(a).total_cmp(&mean_sim(b))).unwrap();
+        let routine: Vec<usize> = cluster.iter().cloned().filter(|&k| k != outlier).collect();
+
+        // Build the gist from the routine members and store it as one
+        // episodic memory. The routine is then deleted — thinned, with the
+        // gist as its trace — and the outlier kept and sharpened.
+        let texts: Vec<&str> = routine.iter().map(|&k| items[k].content.as_str()).collect();
+        let body = summarizer.summarize(&texts);
+        let summary = if body.is_empty() {
+            format!("Gist of {} similar events", routine.len())
+        } else {
+            format!("Gist of {} similar events: {body}", routine.len())
+        };
+        let hash = content_hash(&summary);
+        if store.get_memory_by_hash(&hash)?.is_none() {
+            let mut gist = MemoryItem::new(new_id("mem", &hash), summary.clone(), MemoryType::Episodic, hash, now);
+            gist.summary = Some(summary);
+            gist.source = Some("consolidation".to_string());
+            // Sit the gist at the burst's own moment, not "now".
+            gist.created_at = routine.iter().map(|&k| items[k].created_at).max().unwrap_or(now);
+            gist.topic = items[outlier].topic.clone();
+            gist.importance_score = 0.4;
+            gist.decay_score = 0.4;
+            store.insert_memory(&gist)?;
+        }
+
+        // Keep the anomaly, and bump it so it stands out now that the routine
+        // around it is gone.
+        let mut keep = items[outlier].clone();
+        keep.importance_score = (keep.importance_score + 0.1).min(1.0);
+        keep.salience = keep.salience.max(0.6);
+        keep.updated_at = now;
+        store.update_memory(&keep)?;
+
+        for &k in &routine {
+            store.delete_memory(&items[k].id)?;
+            consumed[k] = true;
+        }
+        consumed[outlier] = true;
+        report.bursts_collapsed += 1;
     }
     Ok(())
 }
@@ -371,8 +592,8 @@ fn archive_and_prune(store: &Store, cfg: &Config, now: i64, report: &mut Consoli
     let max_decay = cfg.consolidation_thresholds.archive_max_decay;
 
     for item in store.list_memories(None)? {
-        if item.pinned {
-            continue; // pinned memories never decay or get pruned
+        if item.pinned || item.memory_type.is_decay_exempt() {
+            continue; // pins and Foundation traits never decay or get pruned
         }
         if item.salience >= cfg.salience_keep_threshold {
             continue; // formative (high-salience) memories are kept, like pins
@@ -483,10 +704,11 @@ mod tests {
     #[test]
     fn eval_surprise_a_novel_memory_outscores_routine_on_salience() {
         let (store, provider, mut cfg) = setup();
-        // Isolate the salience mechanism: disable dedup-merging so the
-        // routine cluster stays intact (merging it to one would erase the
-        // "many similar neighbors" signal this test is about).
+        // Isolate the salience mechanism: disable dedup-merging *and*
+        // burst-collapse so the routine cluster stays intact (either one
+        // would erase the "many similar neighbors" signal this test is about).
         cfg.consolidation_thresholds.duplicate_similarity = 0.999;
+        cfg.consolidation_thresholds.burst_collapse_enabled = false;
         // A cluster of mutually-similar routine memories (distinct trailing
         // word so they don't collapse to one identical token set)...
         for room in ["alpha", "bravo", "charlie", "delta", "echo", "foxtrot"] {
@@ -571,6 +793,89 @@ mod tests {
             })
             .count();
         assert!(archived >= 4, "most routine memories should be archived/forgotten, got {archived}/6");
+    }
+
+    #[test]
+    fn eval_habit_concludes_a_foundation_trait() {
+        let (store, provider, mut cfg) = setup();
+        // Keep the recurring memories distinct so dedup-merge doesn't collapse
+        // the cluster before the habit can be observed.
+        cfg.consolidation_thresholds.duplicate_similarity = 0.999;
+
+        // One trait expressed many times, evenly across a long history (the
+        // user keeps starting games) — a habit, not a one-off burst.
+        let mut ids = Vec::new();
+        for (day, when) in [(100, "monday"), (80, "tuesday"), (60, "wednesday"), (40, "thursday"), (20, "friday"), (1, "weekend")] {
+            let id = add(
+                &store,
+                provider.as_ref(),
+                &cfg,
+                &format!("the user enjoys starting a game of tic tac toe on {when}"),
+                MemoryType::Semantic,
+            );
+            backdate(&store, &id, day);
+            ids.push(id);
+        }
+
+        consolidate(&store, &ExtractiveSummarizer::default(), &cfg).unwrap();
+
+        // The habit graduates to exactly one decay-exempt Foundation trait;
+        // the rest of the cluster stays put (collapse-to-a-single-trait).
+        let foundations: Vec<_> = ids
+            .iter()
+            .filter(|id| {
+                store.get_memory(id).unwrap().map(|m| m.memory_type == MemoryType::Foundation).unwrap_or(false)
+            })
+            .collect();
+        assert_eq!(
+            foundations.len(),
+            1,
+            "a long-standing habit should mint exactly one Foundation trait, got {}",
+            foundations.len()
+        );
+
+        // And a Foundation trait is decay-exempt: it survives a prune pass
+        // unconditionally, like a pin.
+        let lambdas = cfg.decay_lambdas();
+        assert_eq!(lambdas.for_type(MemoryType::Foundation), 0.0, "Foundation must not decay");
+    }
+
+    #[test]
+    fn eval_burst_collapses_to_gist_keeping_the_anomaly() {
+        let (store, provider, cfg) = setup();
+        // A tight burst of similar-but-distinct routine events. They share a
+        // long common prefix (so they cluster) but differ in one word (so
+        // they're not exact duplicates the dedup pass would merge first).
+        let mut routine = Vec::new();
+        for topic in ["roadmap", "staffing", "budget", "tooling", "metrics"] {
+            let id = add(
+                &store,
+                provider.as_ref(),
+                &cfg,
+                &format!("the weekly leadership sync covered the usual updates and discussed the {topic} plan"),
+                MemoryType::Episodic,
+            );
+            routine.push(id);
+        }
+        // One anomaly in the same burst: shares the opening so it joins the
+        // cluster, but it's the member least like the rest — the one to keep.
+        let anomaly = add(
+            &store,
+            provider.as_ref(),
+            &cfg,
+            "the weekly leadership sync covered the usual updates until a major outage derailed everything",
+            MemoryType::Episodic,
+        );
+
+        let report = consolidate(&store, &ExtractiveSummarizer::default(), &cfg).unwrap();
+        let surviving_routine: Vec<_> =
+            routine.iter().filter(|id| store.get_memory(id).unwrap().is_some()).cloned().collect();
+        let gist = store.list_memories(None).unwrap().into_iter().find(|m| m.content.starts_with("Gist of"));
+
+        assert_eq!(report.bursts_collapsed, 1, "the burst should collapse exactly once");
+        assert!(store.get_memory(&anomaly).unwrap().is_some(), "the anomaly must survive the collapse");
+        assert!(surviving_routine.is_empty(), "the routine should be gone, replaced by the gist");
+        assert!(gist.is_some(), "a gist memory should capture the collapsed routine");
     }
 
     #[test]

@@ -25,6 +25,7 @@ const MIGRATIONS: &[(&str, &str)] = &[
     ("0004_store_meta", include_str!("../migrations/0004_store_meta.sql")),
     ("0005_memory_edges", include_str!("../migrations/0005_memory_edges.sql")),
     ("0006_salience", include_str!("../migrations/0006_salience.sql")),
+    ("0007_foundation_type", include_str!("../migrations/0007_foundation_type.sql")),
 ];
 
 pub struct Store {
@@ -129,7 +130,7 @@ impl Store {
                  access_count = ?11, importance_score = ?12, recurrence_score = ?13,
                  recency_score = ?14, decay_score = ?15, confidence = ?16,
                  stale = ?17, pinned = ?18, embedding = ?19, content_hash = ?20,
-                 salience = ?21
+                 salience = ?21, created_at = ?22
              WHERE id = ?1",
             params![
                 item.id,
@@ -153,6 +154,9 @@ impl Store {
                 item.embedding.as_ref().map(|e| encode_embedding(e)),
                 item.content_hash,
                 item.salience,
+                // created_at is normally immutable, but consolidation's merge
+                // moves it to the earliest of the pair, so it must persist.
+                item.created_at,
             ],
         )?;
         Ok(())
@@ -405,7 +409,8 @@ impl Store {
                         AVG(prompt_tokens), AVG(completion_tokens),
                         SUM(prompt_tokens), SUM(completion_tokens),
                         AVG(context_chars), AVG(context_memory_count),
-                        AVG(retrieve_duration_ms), AVG(llm_duration_ms)
+                        AVG(retrieve_duration_ms), AVG(llm_duration_ms),
+                        SUM(context_chars), SUM(context_memory_count)
                  FROM chat_turns",
                 [],
                 |r| {
@@ -419,6 +424,8 @@ impl Store {
                         avg_context_memories: r.get(6)?,
                         avg_retrieve_ms: r.get(7)?,
                         avg_llm_ms: r.get(8)?,
+                        total_context_chars: r.get::<_, Option<i64>>(9)?.unwrap_or(0),
+                        total_context_memories: r.get::<_, Option<i64>>(10)?.unwrap_or(0),
                     })
                 },
             )
@@ -741,6 +748,39 @@ pub struct ChatMetricsSummary {
     pub avg_context_memories: Option<f64>,
     pub avg_retrieve_ms: Option<f64>,
     pub avg_llm_ms: Option<f64>,
+    /// Σ injected-context characters and memories — the cost denominator of
+    /// retention efficiency (accuracy *per injected token*).
+    pub total_context_chars: i64,
+    pub total_context_memories: i64,
+}
+
+impl ChatMetricsSummary {
+    /// Estimated injected-memory tokens (~4 chars/token), the numerator of
+    /// the retention-efficiency cost terms. A rough but consistent proxy —
+    /// the absolute value matters less than the trend as forgetting kicks in.
+    pub fn injected_tokens(&self) -> f64 {
+        self.total_context_chars as f64 / 4.0
+    }
+
+    /// Average injected-memory tokens per turn.
+    pub fn injected_tokens_per_turn(&self) -> Option<f64> {
+        (self.turns > 0).then(|| self.injected_tokens() / self.turns as f64)
+    }
+
+    /// Fraction of the prompt that is injected memory, over turns that
+    /// reported token usage (SQLite SUM ignores NULL `prompt_tokens`). The
+    /// headline "how much context am I paying for" number; lower is better at
+    /// equal accuracy.
+    pub fn injected_token_share(&self) -> Option<f64> {
+        (self.total_prompt_tokens > 0)
+            .then(|| (self.total_context_chars as f64 / 4.0) / self.total_prompt_tokens as f64)
+    }
+
+    /// Average injected tokens spent per memory recalled — the unit cost of
+    /// a memory in the prompt.
+    pub fn tokens_per_injected_memory(&self) -> Option<f64> {
+        (self.total_context_memories > 0).then(|| self.injected_tokens() / self.total_context_memories as f64)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -965,11 +1005,32 @@ mod tests {
             memory_ids: vec!["mem_a".into()],
         };
         store.insert_chat_turn(&turn).unwrap();
+        // A second turn that injected no memory (and reported tokens): it pays
+        // no memory cost but still counts toward the prompt-token denominator.
+        let bare = ChatTurn {
+            id: "turn_2".into(),
+            created_at: 2000,
+            prompt_tokens: Some(80),
+            context_memory_count: 0,
+            context_chars: 0,
+            memory_ids: vec![],
+            ..turn.clone()
+        };
+        store.insert_chat_turn(&bare).unwrap();
+
         let summary = store.chat_metrics_summary().unwrap();
-        assert_eq!(summary.turns, 1);
-        assert_eq!(summary.total_prompt_tokens, 120);
+        assert_eq!(summary.turns, 2);
+        assert_eq!(summary.total_prompt_tokens, 200);
         assert_eq!(summary.avg_completion_tokens, Some(30.0));
-        assert_eq!(summary.avg_context_memories, Some(3.0));
+        assert_eq!(summary.total_context_chars, 250);
+        assert_eq!(summary.total_context_memories, 3);
+        // Retention-efficiency cost terms: 250 chars ≈ 62.5 injected tokens.
+        assert_eq!(summary.injected_tokens(), 62.5);
+        assert_eq!(summary.injected_tokens_per_turn(), Some(31.25));
+        // Share = 62.5 injected tokens / 200 prompt tokens (both turns).
+        assert_eq!(summary.injected_token_share(), Some(62.5 / 200.0));
+        // 62.5 injected tokens across 3 recalled memories.
+        assert_eq!(summary.tokens_per_injected_memory(), Some(62.5 / 3.0));
     }
 
     #[test]

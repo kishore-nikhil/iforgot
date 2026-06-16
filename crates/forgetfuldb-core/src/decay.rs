@@ -20,6 +20,9 @@ pub struct DecayLambdas {
     pub semantic: f64,
     pub procedural: f64,
     pub preference: f64,
+    /// Foundation traits do not decay — lambda 0. Configurable only so the
+    /// exemption stays visible and overridable, not because it should change.
+    pub foundation: f64,
     pub archive: f64,
 }
 
@@ -35,6 +38,8 @@ impl Default for DecayLambdas {
             procedural: 0.01,
             // half-life ~35 days
             preference: 0.02,
+            // identity layer: never forgotten
+            foundation: 0.0,
             // already archived; decays like raw events for pruning purposes
             archive: 0.35,
         }
@@ -49,6 +54,7 @@ impl DecayLambdas {
             MemoryType::Semantic => self.semantic,
             MemoryType::Procedural => self.procedural,
             MemoryType::Preference => self.preference,
+            MemoryType::Foundation => self.foundation,
             MemoryType::Archive => self.archive,
         }
     }

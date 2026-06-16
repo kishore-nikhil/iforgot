@@ -7,6 +7,7 @@ export type MemoryTypeName =
   | 'semantic'
   | 'procedural'
   | 'preference'
+  | 'foundation'
   | 'archive';
 
 export const MEMORY_TYPES: MemoryTypeName[] = [
@@ -15,6 +16,7 @@ export const MEMORY_TYPES: MemoryTypeName[] = [
   'semantic',
   'procedural',
   'preference',
+  'foundation',
   'archive',
 ];
 
@@ -24,6 +26,7 @@ export const TYPE_COLORS: Record<MemoryTypeName, string> = {
   semantic: '#3fb950',
   procedural: '#d29922',
   preference: '#bc8cff',
+  foundation: '#e3b341', // decay-exempt identity trait — gold for bedrock
   archive: '#484f58',
 };
 
@@ -190,6 +193,24 @@ export interface StoreStats {
   sessions: number;
 }
 
+/** Aggregate chat metrics from /metrics, including retention-efficiency
+ *  cost terms (the per-token price of injected memory). */
+export interface ChatMetrics {
+  turns: number;
+  avg_prompt_tokens: number | null;
+  avg_completion_tokens: number | null;
+  total_prompt_tokens: number;
+  total_completion_tokens: number;
+  avg_context_chars: number | null;
+  avg_context_memories: number | null;
+  avg_retrieve_ms: number | null;
+  avg_llm_ms: number | null;
+  injected_tokens: number;
+  injected_tokens_per_turn: number | null;
+  injected_token_share: number | null;
+  tokens_per_injected_memory: number | null;
+}
+
 async function getJson<T>(url: string): Promise<T> {
   const res = await fetch(url);
   if (!res.ok) throw new Error(`${url}: ${res.status} ${await res.text()}`);
@@ -206,6 +227,7 @@ export const api = {
   },
   uiconfig: () => getJson<UiConfig>('/uiconfig'),
   stats: () => getJson<StoreStats>('/stats'),
+  metrics: () => getJson<ChatMetrics>('/metrics'),
   turns: (limit = 300) => getJson<{ turns: ChatTurn[] }>(`/turns?limit=${limit}`),
   consolidations: (limit = 20) => getJson<{ runs: ConsolidationRun[] }>(`/consolidations?limit=${limit}`),
   memory: (id: string) => getJson<MemoryDetail>(`/memory/${id}`),

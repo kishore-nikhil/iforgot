@@ -36,6 +36,11 @@ pub struct Config {
     pub decay_lambda_semantic: f64,
     pub decay_lambda_procedural: f64,
     pub decay_lambda_preference: f64,
+    /// Decay rate for Foundation traits. Defaults to 0 (never decays);
+    /// `serde(default)` keeps configs written before the Foundation tier
+    /// loadable.
+    #[serde(default)]
+    pub decay_lambda_foundation: f64,
     pub retrieval_weights: RetrievalWeights,
     pub consolidation_thresholds: ConsolidationThresholds,
     /// Enable spreading activation: after base scoring, boost memories
@@ -233,6 +238,21 @@ pub struct ConsolidationThresholds {
     /// How many pruned raw events to keep as a representative sample
     /// (reservoir sampling) when deleting.
     pub prune_sample_size: usize,
+    /// Promote a semantic/preference memory to a Foundation trait once its
+    /// near-neighbors form a *habit* (the discriminator's class) spread over
+    /// at least this fraction of the store's history — evidence of a
+    /// long-standing pattern, not a recent flurry.
+    pub foundation_min_temporal_spread: f64,
+    /// …and only with at least this many near-neighbors, so a couple of
+    /// repeats can't mint a lifelong trait.
+    pub foundation_min_neighbors: usize,
+    /// Collapse *bursts* — dense clusters of similar event memories packed
+    /// into a tight time window — into a single gist while keeping the one
+    /// outlier (the anomaly). The temporal inverse of Foundation promotion.
+    pub burst_collapse_enabled: bool,
+    /// Minimum cluster size before a burst is collapsed to a gist. Below this
+    /// it's just a few related notes, not a flood worth compressing.
+    pub burst_min_size: usize,
 }
 
 impl Default for ConsolidationThresholds {
@@ -243,6 +263,10 @@ impl Default for ConsolidationThresholds {
             promote_min_access_count: 3,
             archive_max_decay: 0.05,
             prune_sample_size: 5,
+            foundation_min_temporal_spread: 0.5,
+            foundation_min_neighbors: 4,
+            burst_collapse_enabled: true,
+            burst_min_size: 4,
         }
     }
 }
@@ -262,6 +286,7 @@ impl Default for Config {
             decay_lambda_semantic: lambdas.semantic,
             decay_lambda_procedural: lambdas.procedural,
             decay_lambda_preference: lambdas.preference,
+            decay_lambda_foundation: lambdas.foundation,
             retrieval_weights: RetrievalWeights::default(),
             consolidation_thresholds: ConsolidationThresholds::default(),
             spreading_activation: false,
@@ -309,6 +334,7 @@ impl Config {
             semantic: self.decay_lambda_semantic,
             procedural: self.decay_lambda_procedural,
             preference: self.decay_lambda_preference,
+            foundation: self.decay_lambda_foundation,
             archive: self.decay_lambda_raw,
         }
     }

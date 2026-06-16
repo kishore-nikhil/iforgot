@@ -20,18 +20,24 @@ pub enum MemoryType {
     Procedural,
     /// User preferences ("I like dark mode").
     Preference,
+    /// A decay-exempt trait *concluded* by consolidation from accumulated
+    /// habit evidence ("initiated tic-tac-toe 4× over 3 months → likes
+    /// games"). The identity layer: like a pin, it never decays and is never
+    /// pruned, but it is reached automatically, not set by hand.
+    Foundation,
     /// Compressed/retired memory kept for the record, excluded from
     /// normal retrieval.
     Archive,
 }
 
 impl MemoryType {
-    pub const ALL: [MemoryType; 6] = [
+    pub const ALL: [MemoryType; 7] = [
         MemoryType::RawEvent,
         MemoryType::Episodic,
         MemoryType::Semantic,
         MemoryType::Procedural,
         MemoryType::Preference,
+        MemoryType::Foundation,
         MemoryType::Archive,
     ];
 
@@ -42,8 +48,16 @@ impl MemoryType {
             MemoryType::Semantic => "semantic",
             MemoryType::Procedural => "procedural",
             MemoryType::Preference => "preference",
+            MemoryType::Foundation => "foundation",
             MemoryType::Archive => "archive",
         }
+    }
+
+    /// Decay-exempt by type: a Foundation trait never fades, mirroring a pin
+    /// but reached by consolidation rather than set by hand. Used everywhere
+    /// decay or pruning would otherwise erode a memory.
+    pub fn is_decay_exempt(&self) -> bool {
+        matches!(self, MemoryType::Foundation)
     }
 }
 
@@ -56,6 +70,7 @@ impl FromStr for MemoryType {
             "semantic" => Ok(MemoryType::Semantic),
             "procedural" => Ok(MemoryType::Procedural),
             "preference" => Ok(MemoryType::Preference),
+            "foundation" => Ok(MemoryType::Foundation),
             "archive" => Ok(MemoryType::Archive),
             other => Err(format!("unknown memory type: {other}")),
         }

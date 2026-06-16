@@ -241,6 +241,12 @@ async fn metrics_handler(State(state): State<SharedState>) -> Result<Json<serde_
         "avg_context_memories": m.avg_context_memories,
         "avg_retrieve_ms": m.avg_retrieve_ms,
         "avg_llm_ms": m.avg_llm_ms,
+        // Retention-efficiency cost terms: the per-token price of memory,
+        // the denominator every accuracy number should be paired against.
+        "injected_tokens": m.injected_tokens(),
+        "injected_tokens_per_turn": m.injected_tokens_per_turn(),
+        "injected_token_share": m.injected_token_share(),
+        "tokens_per_injected_memory": m.tokens_per_injected_memory(),
     })))
 }
 

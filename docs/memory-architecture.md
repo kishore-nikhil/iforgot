@@ -32,7 +32,7 @@ Each is a distinct axis over the same memories. The one-line thesis:
 | --- | --- | --- |
 | **Decay** | Forgets the unused — exponential `exp(-λt)`, per-type half-lives | ✅ shipped |
 | **Salience** | Keeps the formative — U-shaped (surprise ∨ habit), resists decay | ✅ shipped |
-| **Abstraction** | Turns repetition into traits (raw → episodic → semantic → foundation) | ◐ partial (episodic→semantic; foundation planned) |
+| **Abstraction** | Turns repetition into traits (raw → episodic → semantic → foundation) | ✅ shipped (episodic→semantic, habit→foundation, burst→gist) |
 | **Epochs** | Organizes a lifetime into eras (drift-segmented + calendar) | ○ planned |
 | **Edges** | Connects memories (typed graph + traversal) | ◐ partial (4 edge types; traversal planned) |
 | **Dreaming** | *Creates* memories/connections offline (recombination) | ○ planned |
@@ -109,9 +109,27 @@ decay governs *ambient* recall, but "what happened in this interval" is a
 different operation, an index lookup.
 
 ### Consolidation — the "sleep cycle"
-Dedup-merge → recurrence refresh → **salience revision** → cluster
-summaries → episodic→semantic promotion → contradiction-staling →
-archive/prune → **rebuild all three edge graphs**. Logged per run.
+Dedup-merge → **burst-collapse (gist, keep the anomaly)** → recurrence
+refresh → **salience revision** → cluster summaries → episodic→semantic
+promotion → **habit→foundation promotion** → contradiction-staling →
+archive/prune → **rebuild all three edge graphs**. Logged per run. Triggered
+manually, or nightly via the opt-in launchd timer
+(`forgetfuldb schedule install`).
+
+### Foundation tier (`MemoryType::Foundation`)
+Decay-exempt identity traits *concluded* from accumulated habit evidence: a
+semantic/preference memory whose near-neighbors form a `Habit` (the
+discriminator's class) spread over a long stretch of history graduates to
+Foundation, which never decays and is never pruned — a pin reached
+automatically rather than by hand. A habit *cluster* collapses to a single
+trait (strongest member wins; near-twins are skipped).
+
+### Gist-collapse keeping the anomaly (`collapse_bursts`)
+The temporal inverse of Foundation promotion. A `Burst` — a dense cluster of
+similar events packed into a tight window — is summarized into one gist and
+the routine deleted, but the **outlier** (the member least like the rest, the
+part of the flood that didn't fit) is kept and sharpened. Where dedup keeps
+the *center*, a burst keeps the *edge*.
 
 ### Observability UI + live updates
 A read-only React SPA (embedded in the binary) over the whole engine:
@@ -128,13 +146,16 @@ this server or by a separate `iforgot` process (detected via SQLite
 
 Ordered by the critical path. Each is specced enough to build cleanly.
 
-1. **Foundation tier** (`MemoryType::Foundation`) — decay-exempt trait
-   memories *concluded* by consolidation from accumulated habit evidence
-   ("user initiated tic-tac-toe 4× over 3 months → trait"). The identity
-   layer. (Ripples through `MemoryType::ALL`; mirror the pin exemption.)
-2. **Gist collapse keeping the anomaly** — when the discriminator finds a
-   *burst*, collapse the routine into one gist but **keep the outlier**
-   (inverts today's keep-the-central-member dedup).
+> ✅ **Done:** the **Foundation tier** and **gist-collapse keeping the
+> anomaly** (items 1–2 below) now ship — see "What's implemented today". The
+> remaining critical path starts at **epochs**.
+
+1. ~~**Foundation tier**~~ — *shipped.* Decay-exempt trait memories
+   *concluded* by consolidation from accumulated habit evidence ("user
+   initiated tic-tac-toe 4× over 3 months → trait"). The identity layer.
+2. ~~**Gist collapse keeping the anomaly**~~ — *shipped.* When the
+   discriminator finds a *burst*, collapse the routine into one gist but
+   **keep the outlier** (inverts the keep-the-central-member dedup).
 3. **Epochs** — organic drift-segmented eras (windowed embedding-centroid
    drift + hysteresis, model-free) running orthogonally to a calendar grid.
    Prior art: **ES-Mem** (arXiv 2601.07582). Consolidate *within* an epoch,
@@ -175,9 +196,12 @@ instead:
    `forgetfuldb-consolidate` behavior tests + the discriminator unit tests.
 2. **Retention efficiency — the real top-line metric.** Accuracy *per token
    of memory injected*. Every accuracy number paired with its token cost.
-   Computable today from `chat_turns` (prompt tokens + injected IDs). This
-   is the number that flatters forgetting: near-equal accuracy at a
-   fraction of the tokens.
+   *Shipped (cost side):* `chat_metrics_summary` computes the per-turn
+   injected-token cost — injected tokens/turn, memory share of prompt,
+   tokens/injected-memory — surfaced in `/metrics`, the CLI, and the UI
+   Metrics view. This is the denominator that flatters forgetting: near-equal
+   accuracy at a fraction of the tokens. The accuracy numerator comes from
+   Layer 1 / Layer 3.
 3. **Targeted external benchmarks** — MemoryAgentBench (report *only* the
    selective-forgetting axis), "Recall to Forgetting" — reported as
    efficiency-vs-recall *pairs*, never a raw recall chase.
