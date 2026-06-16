@@ -33,8 +33,8 @@ Each is a distinct axis over the same memories. The one-line thesis:
 | **Decay** | Forgets the unused — exponential `exp(-λt)`, per-type half-lives | ✅ shipped |
 | **Salience** | Keeps the formative — U-shaped (surprise ∨ habit), resists decay | ✅ shipped |
 | **Abstraction** | Turns repetition into traits (raw → episodic → semantic → foundation) | ✅ shipped (episodic→semantic, habit→foundation, burst→gist) |
-| **Epochs** | Organizes a lifetime into eras (drift-segmented + calendar) | ○ planned |
-| **Edges** | Connects memories (typed graph + traversal) | ◐ partial (4 edge types; traversal planned) |
+| **Epochs** | Organizes a lifetime into eras (drift-segmented) | ✅ shipped (drift segmentation; calendar grid still planned) |
+| **Edges** | Connects memories (typed graph + traversal) | ◐ partial (4 edge types + one-hop activation; multi-hop traversal planned) |
 | **Dreaming** | *Creates* memories/connections offline (recombination) | ○ planned |
 
 A unifying insight used throughout: **one neighbor-density-over-time

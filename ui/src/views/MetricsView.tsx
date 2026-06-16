@@ -12,7 +12,7 @@ import {
   XAxis,
   YAxis,
 } from 'recharts';
-import { api, fmtBytes, MEMORY_TYPES, TYPE_COLORS, UiConfig } from '../api';
+import { api, fmtBytes, fmtTs, MEMORY_TYPES, TYPE_COLORS, UiConfig } from '../api';
 import { usePoll } from '../usePoll';
 
 const AXIS = { stroke: '#8b949e', fontSize: 11 };
@@ -22,7 +22,10 @@ export default function MetricsView({ cfg }: { cfg: UiConfig | null }) {
   const { data: turnsData } = usePoll(() => api.turns(300), 5000);
   const { data: stats } = usePoll(() => api.stats(), 5000);
   const { data: metrics } = usePoll(() => api.metrics(), 5000);
+  const { data: epochsData } = usePoll(() => api.epochs(), 10_000);
   const { data: graph } = usePoll(() => api.graph({ since: 0 }), 10_000);
+
+  const epochs = epochsData?.epochs ?? [];
 
   const fmt1 = (v: number | null | undefined) => (v == null ? undefined : v.toFixed(1));
   const pct = (v: number | null | undefined) => (v == null ? undefined : `${(v * 100).toFixed(1)}%`);
@@ -75,8 +78,33 @@ export default function MetricsView({ cfg }: { cfg: UiConfig | null }) {
         <Tile k="stale" v={stats?.stale} />
         <Tile k="edges" v={stats?.links} />
         <Tile k="chat turns" v={turnsData?.turns.length} />
+        <Tile k="eras" v={stats?.epochs} />
         <Tile k="db size" v={cfg ? fmtBytes(cfg.db_size_bytes) : undefined} />
       </div>
+
+      {epochs.length > 0 && (
+        <>
+          <h3 className="section">
+            epochs{' '}
+            <span className="hint">drift-segmented eras — the engine's exact sense of "when" (the model has no clock)</span>
+          </h3>
+          <div className="eras">
+            {epochs.map((e) => (
+              <div className="era-card" key={e.id}>
+                <div className="era-head">
+                  <span className="era-name">{e.label ?? `era ${e.ordinal + 1}`}</span>
+                  <span className="era-count">{e.member_count} mem</span>
+                </div>
+                <div className="era-span">
+                  {fmtTs(e.started_at)} → {e.ended_at ? fmtTs(e.ended_at) : 'now'}
+                </div>
+                {e.summary && <div className="era-summary">{e.summary}</div>}
+                {e.ordinal > 0 && <div className="era-drift">drift in: {(e.drift_in * 100).toFixed(0)}%</div>}
+              </div>
+            ))}
+          </div>
+        </>
+      )}
 
       <h3 className="section">
         retention efficiency{' '}

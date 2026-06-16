@@ -26,6 +26,7 @@ const MIGRATIONS: &[(&str, &str)] = &[
     ("0005_memory_edges", include_str!("../migrations/0005_memory_edges.sql")),
     ("0006_salience", include_str!("../migrations/0006_salience.sql")),
     ("0007_foundation_type", include_str!("../migrations/0007_foundation_type.sql")),
+    ("0008_epochs", include_str!("../migrations/0008_epochs.sql")),
 ];
 
 pub struct Store {
@@ -655,6 +656,61 @@ impl Store {
         Ok(rows)
     }
 
+    // ---- epochs (drift-segmented eras) ------------------------------------
+
+    /// Replace the whole epochs table in one transaction. Epochs are derived
+    /// data, recomputed from scratch each consolidation, so a rebuild is a
+    /// clean swap rather than an incremental update.
+    pub fn replace_epochs(&self, epochs: &[Epoch]) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute("DELETE FROM epochs", [])?;
+        for e in epochs {
+            tx.execute(
+                "INSERT INTO epochs
+                     (id, ordinal, started_at, ended_at, centroid, label, summary, member_count, drift_in)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+                params![
+                    e.id,
+                    e.ordinal,
+                    e.started_at,
+                    e.ended_at,
+                    e.centroid.as_ref().map(|c| encode_embedding(c)),
+                    e.label,
+                    e.summary,
+                    e.member_count,
+                    e.drift_in,
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Every era in time order (ordinal ascending).
+    pub fn list_epochs(&self) -> Result<Vec<Epoch>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, ordinal, started_at, ended_at, centroid, label, summary, member_count, drift_in
+             FROM epochs ORDER BY ordinal",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                let centroid: Option<Vec<u8>> = r.get(4)?;
+                Ok(Epoch {
+                    id: r.get(0)?,
+                    ordinal: r.get(1)?,
+                    started_at: r.get(2)?,
+                    ended_at: r.get(3)?,
+                    centroid: centroid.map(|b| decode_embedding(&b)),
+                    label: r.get(5)?,
+                    summary: r.get(6)?,
+                    member_count: r.get(7)?,
+                    drift_in: r.get(8)?,
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
     // ---- stats -----------------------------------------------------------
 
     pub fn stats(&self) -> Result<StoreStats> {
@@ -677,7 +733,8 @@ impl Store {
         let raw_events: i64 = self.conn.query_row("SELECT COUNT(*) FROM raw_events", [], |r| r.get(0))?;
         let links: i64 = self.conn.query_row("SELECT COUNT(*) FROM memory_links", [], |r| r.get(0))?;
         let sessions: i64 = self.conn.query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0))?;
-        Ok(StoreStats { total_memories: total, by_type, stale, pinned, raw_events, links, sessions })
+        let epochs: i64 = self.conn.query_row("SELECT COUNT(*) FROM epochs", [], |r| r.get(0))?;
+        Ok(StoreStats { total_memories: total, by_type, stale, pinned, raw_events, links, sessions, epochs })
     }
 }
 
@@ -792,6 +849,24 @@ pub struct StoreStats {
     pub raw_events: i64,
     pub links: i64,
     pub sessions: i64,
+    pub epochs: i64,
+}
+
+/// One drift-segmented era from the `epochs` table. The `centroid` (a large
+/// vector) is skipped in JSON output to keep API payloads compact.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Epoch {
+    pub id: String,
+    pub ordinal: i64,
+    pub started_at: i64,
+    pub ended_at: Option<i64>,
+    #[serde(skip_serializing)]
+    #[serde(default)]
+    pub centroid: Option<Vec<f32>>,
+    pub label: Option<String>,
+    pub summary: Option<String>,
+    pub member_count: i64,
+    pub drift_in: f64,
 }
 
 const MEMORY_COLUMNS: &str = "id, content, summary, memory_type, source, topic, entities, tags, \
@@ -1037,5 +1112,47 @@ mod tests {
     fn embedding_codec_roundtrip() {
         let v = vec![0.5f32, -1.25, 3.75];
         assert_eq!(decode_embedding(&encode_embedding(&v)), v);
+    }
+
+    #[test]
+    fn epochs_replace_and_list_roundtrip() {
+        let store = Store::open_in_memory().unwrap();
+        let epochs = vec![
+            Epoch {
+                id: "ep_0".into(),
+                ordinal: 0,
+                started_at: 1000,
+                ended_at: Some(2000),
+                centroid: Some(vec![1.0, 0.0]),
+                label: Some("era one".into()),
+                summary: Some("the beginning".into()),
+                member_count: 5,
+                drift_in: 0.0,
+            },
+            Epoch {
+                id: "ep_1".into(),
+                ordinal: 1,
+                started_at: 2000,
+                ended_at: None,
+                centroid: Some(vec![0.0, 1.0]),
+                label: None,
+                summary: None,
+                member_count: 3,
+                drift_in: 0.7,
+            },
+        ];
+        store.replace_epochs(&epochs).unwrap();
+        let back = store.list_epochs().unwrap();
+        assert_eq!(back.len(), 2);
+        assert_eq!(back[0].label.as_deref(), Some("era one"));
+        assert_eq!(back[0].ended_at, Some(2000));
+        assert_eq!(back[0].centroid, Some(vec![1.0, 0.0]));
+        assert_eq!(back[1].ended_at, None); // current era
+        assert!((back[1].drift_in - 0.7).abs() < 1e-9);
+        assert_eq!(store.stats().unwrap().epochs, 2);
+
+        // Replace is a clean swap, not an append.
+        store.replace_epochs(&epochs[..1]).unwrap();
+        assert_eq!(store.list_epochs().unwrap().len(), 1);
     }
 }

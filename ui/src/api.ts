@@ -191,6 +191,19 @@ export interface StoreStats {
   raw_events: number;
   links: number;
   sessions: number;
+  epochs: number;
+}
+
+/** A drift-segmented era from /epochs (centroid omitted server-side). */
+export interface Epoch {
+  id: string;
+  ordinal: number;
+  started_at: number;
+  ended_at: number | null;
+  label: string | null;
+  summary: string | null;
+  member_count: number;
+  drift_in: number;
 }
 
 /** Aggregate chat metrics from /metrics, including retention-efficiency
@@ -228,6 +241,7 @@ export const api = {
   uiconfig: () => getJson<UiConfig>('/uiconfig'),
   stats: () => getJson<StoreStats>('/stats'),
   metrics: () => getJson<ChatMetrics>('/metrics'),
+  epochs: () => getJson<{ epochs: Epoch[] }>('/epochs'),
   turns: (limit = 300) => getJson<{ turns: ChatTurn[] }>(`/turns?limit=${limit}`),
   consolidations: (limit = 20) => getJson<{ runs: ConsolidationRun[] }>(`/consolidations?limit=${limit}`),
   memory: (id: string) => getJson<MemoryDetail>(`/memory/${id}`),

@@ -13,6 +13,7 @@
 //! - `GET  /uiconfig`     decay lambdas, retrieval weights, chat knobs
 //! - `GET  /turns`        ?limit — recent chat_turns rows (oldest first)
 //! - `GET  /consolidations` ?limit — logged consolidation runs
+//! - `GET  /epochs`       drift-segmented eras in time order
 //! - `GET  /memory/:id`
 //! - `POST /memory/:id/pin`     {"pinned": bool}
 //! - `POST /memory/:id/archive`
@@ -119,6 +120,9 @@ struct RetrieveBody {
     memory_types: Option<Vec<String>>,
     since: Option<i64>,
     until: Option<i64>,
+    /// Query a whole era by ordinal (resolves to its time window + bypasses
+    /// decay). Explicit since/until win.
+    epoch_ordinal: Option<i64>,
 }
 
 fn parse_types(names: &[String]) -> Result<Option<Vec<MemoryType>>, ApiError> {
@@ -183,6 +187,7 @@ async fn retrieve_handler(
         memory_types: parse_types(&body.memory_types.unwrap_or_default())?,
         since: body.since,
         until: body.until,
+        epoch_ordinal: body.epoch_ordinal,
         debug: body.debug,
         ..Default::default()
     };
@@ -225,7 +230,17 @@ async fn stats_handler(State(state): State<SharedState>) -> Result<Json<serde_js
         "raw_events": stats.raw_events,
         "links": stats.links,
         "sessions": stats.sessions,
+        "epochs": stats.epochs,
     })))
+}
+
+/// The drift-segmented eras, in time order — each with its time span, size,
+/// label, summary and the drift that opened it. The centroid blob is omitted
+/// (skipped in `Epoch`'s serialization) to keep the payload small.
+async fn epochs_handler(State(state): State<SharedState>) -> Result<Json<serde_json::Value>, ApiError> {
+    let app = state.lock().expect("state mutex poisoned");
+    let epochs = app.store.list_epochs()?;
+    Ok(Json(json!({ "epochs": epochs })))
 }
 
 async fn metrics_handler(State(state): State<SharedState>) -> Result<Json<serde_json::Value>, ApiError> {
@@ -581,6 +596,7 @@ fn build_router(state: SharedState, ui_dir: Option<&std::path::Path>) -> Router 
         .route("/uiconfig", get(uiconfig_handler))
         .route("/turns", get(turns_handler))
         .route("/consolidations", get(consolidations_handler))
+        .route("/epochs", get(epochs_handler))
         .route("/memory/:id", get(memory_handler))
         .route("/memory/:id/pin", post(pin_handler))
         .route("/memory/:id/archive", post(archive_handler))
