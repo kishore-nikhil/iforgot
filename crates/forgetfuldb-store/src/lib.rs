@@ -284,6 +284,17 @@ impl Store {
         Ok(())
     }
 
+    /// Delete the supersession links (`updates` / `contradicts`) pointing at
+    /// `target_id`. Used when a staled memory is reasserted and revived, so it
+    /// isn't re-staled on the next pass. Returns how many were removed.
+    pub fn clear_supersession_links_to(&self, target_id: &str) -> Result<usize> {
+        let n = self.conn.execute(
+            "DELETE FROM memory_links WHERE target_id = ?1 AND relation IN ('updates','contradicts')",
+            params![target_id],
+        )?;
+        Ok(n)
+    }
+
     pub fn links_for(&self, memory_id: &str) -> Result<Vec<MemoryLink>> {
         let mut stmt = self.conn.prepare(
             "SELECT source_id, target_id, relation FROM memory_links

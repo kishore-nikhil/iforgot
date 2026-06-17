@@ -113,6 +113,21 @@ pub struct ContextPack {
     /// `None` unless `spreading.inject_subgraph` is on.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub subgraph: Option<ContextSubgraph>,
+    /// Conflicts resolved this turn by "default to latest": each superseded
+    /// (older) memory was dropped from the context above in favor of the newer
+    /// one. The durable staling is the offline pass / the LLM tool; this is the
+    /// query-scoped floor. Only set when `contradiction.enabled`.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub resolved_conflicts: Vec<ResolvedConflict>,
+}
+
+/// A query-time supersession: `dropped_id` (older) was removed from this turn's
+/// context in favor of `kept_id` (newer).
+#[derive(Debug, Clone, Serialize)]
+pub struct ResolvedConflict {
+    pub kept_id: String,
+    pub dropped_id: String,
+    pub reason: String,
 }
 
 /// The relationship structure among injected memories — a set of paths
@@ -417,6 +432,12 @@ pub fn retrieve(
     }
     scored.truncate(opts.top_k);
 
+    // Default-to-latest: drop a clearly-superseded older memory from this
+    // turn's context in favor of the newer one (the deterministic floor that
+    // needs no LLM). Before subgraph injection so a dropped memory can't be
+    // pulled back in.
+    let resolved_conflicts = resolve_latest(&mut scored, cfg);
+
     // Multi-hop subgraph: pull the connective memories (linked to the hits but
     // not themselves top-k) into the result and record the paths. Mutates
     // `scored`, so it runs before the touch loop below.
@@ -436,7 +457,57 @@ pub fn retrieve(
         min_score: opts.min_score,
         near_misses,
         subgraph,
+        resolved_conflicts,
     })
+}
+
+/// "Default to latest" — the deterministic, LLM-free conflict floor. Among the
+/// retrieved memories, when an older one is *clearly* superseded by a newer one
+/// in the same slot (a correction cue, high confidence — subtle value swaps are
+/// left to the offline pass that has the full slot history), drop the older
+/// from this turn's context and record it. Query-scoped: it doesn't stale the
+/// memory in the store (that's the offline pass / the supersede tool's job).
+fn resolve_latest(memories: &mut Vec<RetrievedMemory>, cfg: &Config) -> Vec<ResolvedConflict> {
+    use forgetfuldb_core::contradiction::{judge, Cardinality};
+
+    if !cfg.contradiction.enabled || memories.len() < 2 {
+        return Vec::new();
+    }
+    let lo = cfg.contradiction.candidate_min_sim as f32;
+    let hi = cfg.consolidation_thresholds.duplicate_similarity as f32;
+    let threshold = cfg.contradiction.confidence_threshold;
+
+    let mut dropped: HashSet<String> = HashSet::new();
+    let mut resolved = Vec::new();
+    for i in 0..memories.len() {
+        for j in (i + 1)..memories.len() {
+            let (a, b) = (&memories[i], &memories[j]);
+            if dropped.contains(&a.item.id) || dropped.contains(&b.item.id) {
+                continue;
+            }
+            let same_subject = (a.item.topic.is_some() && a.item.topic == b.item.topic)
+                || a.item.entities.iter().any(|e| b.item.entities.contains(e));
+            if !same_subject {
+                continue;
+            }
+            let (Some(ea), Some(eb)) = (a.item.embedding.as_ref(), b.item.embedding.as_ref()) else {
+                continue;
+            };
+            let sim = cosine_similarity(ea, eb);
+            if !(sim >= lo && sim < hi) {
+                continue;
+            }
+            let (older, newer) = if a.item.created_at <= b.item.created_at { (a, b) } else { (b, a) };
+            if let Some(v) = judge(&older.item, &newer.item, Cardinality::Unknown) {
+                if v.confidence >= threshold {
+                    dropped.insert(v.loser_id.clone());
+                    resolved.push(ResolvedConflict { kept_id: v.winner_id, dropped_id: v.loser_id, reason: v.reason });
+                }
+            }
+        }
+    }
+    memories.retain(|m| !dropped.contains(&m.item.id));
+    resolved
 }
 
 /// Assemble the injected subgraph from the walk, and pull the connective
@@ -893,6 +964,45 @@ mod tests {
         cfg.spreading_activation = true; // boosts on, but subgraph off
         let pack = retrieve(&store, provider.as_ref(), &cfg, "standup", &RetrieveOptions::default()).unwrap();
         assert!(pack.subgraph.is_none(), "no subgraph unless inject_subgraph is set");
+    }
+
+    #[test]
+    fn default_to_latest_drops_a_superseded_memory() {
+        let (store, provider, mut cfg) = setup();
+        cfg.contradiction.enabled = true;
+        cfg.contradiction.candidate_min_sim = 0.5; // hashed_bow range
+        let old = add(&store, provider.as_ref(), &cfg, "the main database runs on Postgres", vec!["db".into()]);
+        let new = add(&store, provider.as_ref(), &cfg, "the main database migrated from Postgres to SQLite", vec!["db".into()]);
+        // Age `old` so it's clearly older.
+        let mut m = store.get_memory(&old).unwrap().unwrap();
+        m.created_at = now_unix() - 10 * 86_400;
+        store.update_memory(&m).unwrap();
+
+        let pack = retrieve(&store, provider.as_ref(), &cfg, "what database do we use", &RetrieveOptions::default()).unwrap();
+        let ids: Vec<&str> = pack.memories.iter().map(|m| m.item.id.as_str()).collect();
+        assert!(ids.contains(&new.as_str()), "the current (newest) memory stays");
+        assert!(!ids.contains(&old.as_str()), "the superseded one is dropped from this turn");
+        assert_eq!(pack.resolved_conflicts.len(), 1);
+        assert_eq!(pack.resolved_conflicts[0].dropped_id, old);
+        // Query-scoped: the store row is NOT staled (offline/tool does that).
+        assert!(!store.get_memory(&old).unwrap().unwrap().stale);
+    }
+
+    #[test]
+    fn default_to_latest_keeps_coexisting_values() {
+        let (store, provider, mut cfg) = setup();
+        cfg.contradiction.enabled = true;
+        cfg.contradiction.candidate_min_sim = 0.5;
+        let a = add(&store, provider.as_ref(), &cfg, "I really prefer drinking coffee in the morning", vec!["drinks".into()]);
+        let b = add(&store, provider.as_ref(), &cfg, "I really prefer drinking tea in the morning", vec!["drinks".into()]);
+        let mut m = store.get_memory(&a).unwrap().unwrap();
+        m.created_at = now_unix() - 10 * 86_400;
+        store.update_memory(&m).unwrap();
+
+        let pack = retrieve(&store, provider.as_ref(), &cfg, "what do I drink", &RetrieveOptions::default()).unwrap();
+        let ids: Vec<&str> = pack.memories.iter().map(|m| m.item.id.as_str()).collect();
+        assert!(ids.contains(&a.as_str()) && ids.contains(&b.as_str()), "no cue → both coexist, nothing dropped");
+        assert!(pack.resolved_conflicts.is_empty());
     }
 
     #[test]

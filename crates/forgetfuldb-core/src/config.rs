@@ -57,6 +57,10 @@ pub struct Config {
     /// strengths). At `max_hops = 1` this is the original one-hop boost.
     #[serde(default)]
     pub spreading: SpreadingConfig,
+    /// Inferred contradiction / supersession detection (the staleness attack).
+    /// Off by default — it stales memories, so it's opt-in.
+    #[serde(default)]
+    pub contradiction: ContradictionConfig,
     /// Per-day decay applied to a co-occurrence when summing edge weight,
     /// so recent shared turns matter more than old ones.
     #[serde(default = "default_edge_decay_lambda")]
@@ -272,6 +276,26 @@ impl Default for SpreadingConfig {
     }
 }
 
+/// Inferred contradiction detection parameters.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ContradictionConfig {
+    /// Master switch — off by default because it stales memories.
+    pub enabled: bool,
+    /// Lower bound of the candidate cosine band ("same statement"). The upper
+    /// bound is `consolidation_thresholds.duplicate_similarity` (above it the
+    /// pair is a duplicate, handled by merge).
+    pub candidate_min_sim: f64,
+    /// Minimum verdict confidence to actually write a supersession edge.
+    pub confidence_threshold: f64,
+}
+
+impl Default for ContradictionConfig {
+    fn default() -> Self {
+        ContradictionConfig { enabled: false, candidate_min_sim: 0.80, confidence_threshold: 0.7 }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ConsolidationThresholds {
@@ -302,6 +326,14 @@ pub struct ConsolidationThresholds {
     /// Minimum cluster size before a burst is collapsed to a gist. Below this
     /// it's just a few related notes, not a flood worth compressing.
     pub burst_min_size: usize,
+    /// Refine each memory's (noisy, single-token) `topic` from its cluster:
+    /// memories that are similar or share a chat session adopt the cluster's
+    /// dominant entity / explicit tag. Improves summaries, foundation, and
+    /// contradiction candidate-gen. Explicit `project:`/`topic:` tags are
+    /// never overwritten.
+    pub topic_refine_enabled: bool,
+    /// Cosine at/above which two memories join the same topic cluster.
+    pub topic_cluster_sim: f64,
     /// Epoch segmentation: cosine *distance* from an era's centroid above
     /// which a memory counts as "drifting" toward a new era.
     pub epoch_drift_threshold: f64,
@@ -326,6 +358,8 @@ impl Default for ConsolidationThresholds {
             foundation_min_neighbors: 4,
             burst_collapse_enabled: true,
             burst_min_size: 4,
+            topic_refine_enabled: true,
+            topic_cluster_sim: 0.6,
             epoch_drift_threshold: 0.35,
             epoch_hysteresis_runs: 3,
             epoch_min_size: 4,
@@ -355,6 +389,7 @@ impl Default for Config {
             spreading_activation: false,
             spreading_factor: default_spreading_factor(),
             spreading: SpreadingConfig::default(),
+            contradiction: ContradictionConfig::default(),
             edge_decay_lambda: default_edge_decay_lambda(),
             edge_min_weight: default_edge_min_weight(),
             salience_resist: default_salience_resist(),

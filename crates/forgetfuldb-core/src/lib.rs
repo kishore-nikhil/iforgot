@@ -13,6 +13,7 @@
 //! trivially unit-testable.
 
 pub mod config;
+pub mod contradiction;
 pub mod decay;
 pub mod epochs;
 pub mod ids;

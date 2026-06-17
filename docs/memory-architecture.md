@@ -135,10 +135,37 @@ is a time-range lookup, so `memory_items` is untouched. Three consumers:
 - **Observability:** `/epochs`, the `stats` count, and the Metrics "epochs"
   strip (each era's span, size, summary and the drift that opened it).
 
+### Inferred contradiction detection (the staleness attack)
+The hardest failure mode of long-lived memory — old facts staying confidently
+retrievable — is the only one decay can't fix (it's time-based, not
+truth-based). Two layers, both opt-in and reversible (stale is a flag, never a
+delete):
+- **Deterministic offline** (`core::contradiction` + the consolidation pass).
+  Candidate pairs are cheap: cosine in the band *below* the dedup threshold
+  (similar but not a duplicate) ∧ same subject (a refined topic or a shared
+  entity). Each is judged structurally — a **correction cue** ("migrated from
+  X to Y", "no longer", "instead of"), or a **singular-slot value change**
+  whose values *replace* rather than *accumulate* over time. A confident
+  verdict writes an `Updates` edge; the existing `mark_contradicted_stale`
+  stales the loser; `revive_reasserted` later un-stales it if its value is
+  reasserted as current. It is **silent when unsure** — false negatives are
+  safe, false positives (forgetting something true) are not.
+- **Runtime precision** (`agent::supersede`). A `supersede_memory` tool the
+  chat model can call when it notices a conflict among the memories injected
+  this turn — free, query-aware inference, gated by an id-membership check (no
+  hallucinated ids) and reversible. The deterministic path is the testable
+  backbone; the LLM is the opt-in booster, never the sole authority.
+
+A subtler prerequisite that shipped alongside: **topic refinement**
+(`refine_topics`) turns the noisy single-token `topic` into a cluster-level
+label (from chat-session cohesion + similarity), which sharpens contradiction
+candidate-gen *and* summaries and foundation promotion.
+
 ### Consolidation — the "sleep cycle"
 Dedup-merge → **burst-collapse (gist, keep the anomaly)** → recurrence
-refresh → **salience revision** → cluster summaries → episodic→semantic
-promotion → **habit→foundation promotion** → contradiction-staling →
+refresh → **salience revision** → **topic refinement** → cluster summaries →
+episodic→semantic promotion → **habit→foundation promotion** →
+**infer contradictions** → contradiction-staling → **revive reasserted** →
 archive/prune → **rebuild all three edge graphs** → **segment epochs**. Logged
 per run. Triggered manually, or nightly via the opt-in launchd timer
 (`forgetfuldb schedule install`).
@@ -174,9 +201,10 @@ this server or by a separate `iforgot` process (detected via SQLite
 Ordered by the critical path. Each is specced enough to build cleanly.
 
 > ✅ **Done:** the **Foundation tier**, **gist-collapse keeping the anomaly**,
-> **epochs**, and **multi-hop traversal + subgraph injection** (items 1–4
-> below) now ship — see "What's implemented today". The remaining critical
-> path starts at **inferred contradiction detection**.
+> **epochs**, **multi-hop traversal + subgraph injection**, and **inferred
+> contradiction detection** (items 1–5 below) now ship — see "What's
+> implemented today". The remaining critical path starts at **goal-conditioned
+> retrieval**.
 
 1. ~~**Foundation tier**~~ — *shipped.* Decay-exempt trait memories
    *concluded* by consolidation from accumulated habit evidence ("user
@@ -195,9 +223,12 @@ Ordered by the critical path. Each is specced enough to build cleanly.
    reason over the chain), not a flat list — capped so it never overrides the
    live conversation. Follow-ups: a UI view of the cascade, and tuning before
    it's on by default.
-5. **Inferred contradiction detection** — read text, conclude
-   "A supersedes B", write a contrastive edge — the direct attack on
-   *staleness*, the hardest open problem in agent memory.
+5. ~~**Inferred contradiction detection**~~ — *shipped.* Read similar
+   memories, conclude "A supersedes B", write the `Updates` edge — the direct
+   attack on *staleness*. Deterministic offline (cue / singular-slot
+   value-change-over-time), reversible, opt-in; a runtime `supersede_memory`
+   tool is the LLM precision layer. Follow-up: the runtime tool's live chat
+   wiring and an optional offline LLM verdict sweep.
 6. **Goal-conditioned retrieval** — bias scoring by a current intent
    vector; also supplies a real goal-relevance term for salience.
 7. **Dreaming** — offline, sample *unconnected* memory pairs and test
@@ -220,9 +251,12 @@ instead:
 
 1. **Synthetic behavior tests (in CI, against real SQLite).** Deterministic
    streams with known answers, each isolating one mechanism — selective
-   forgetting (anomaly survives, routine collapses), staleness, surprise
-   salience, habit-vs-burst, epoch-boundary-with-hysteresis. *Shipped:*
-   `forgetfuldb-consolidate` behavior tests + the discriminator unit tests.
+   forgetting (anomaly survives, routine collapses), **staleness** (a
+   migration stales the old value; coexisting preferences don't; a
+   reassertion revives), surprise salience, habit-vs-burst, habit→foundation,
+   burst→gist, epoch-boundary-with-hysteresis, two-topic segmentation,
+   multi-hop reach. *Shipped:* `forgetfuldb-consolidate` / `-retrieve`
+   behavior tests + the `core` discriminator/cue/traversal unit tests.
 2. **Retention efficiency — the real top-line metric.** Accuracy *per token
    of memory injected*. Every accuracy number paired with its token cost.
    *Shipped (cost side):* `chat_metrics_summary` computes the per-turn
