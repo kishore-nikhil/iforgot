@@ -5,11 +5,13 @@ import GraphView from './views/GraphView';
 import RetrievalView from './views/RetrievalView';
 import ConsolidationView from './views/ConsolidationView';
 import MetricsView from './views/MetricsView';
+import ConflictsView from './views/ConflictsView';
 
 const VIEWS = [
   { key: 'graph', label: 'Memory Graph' },
   { key: 'retrieval', label: 'Retrieval Inspector' },
   { key: 'consolidation', label: 'Consolidation' },
+  { key: 'conflicts', label: 'Conflicts' },
   { key: 'metrics', label: 'Metrics' },
 ] as const;
 
@@ -52,6 +54,7 @@ export default function App() {
         </div>
         {view === 'retrieval' && <RetrievalView cfg={cfg} />}
         {view === 'consolidation' && <ConsolidationView />}
+        {view === 'conflicts' && <ConflictsView />}
         {view === 'metrics' && <MetricsView cfg={cfg} />}
       </main>
     </>

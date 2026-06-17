@@ -21,14 +21,14 @@ Both installed to `~/.cargo/bin`.
 
 | Crate | Responsibility | Notable files |
 | --- | --- | --- |
-| `forgetfuldb-core` | scoring, decay, **salience**, **epochs**, config, types | `salience.rs` (neighbor discriminator), `epochs.rs` (drift segmentation), `decay.rs` (`decay_score_resisted`), `scoring.rs`, `config.rs` |
+| `forgetfuldb-core` | scoring, decay, **salience**, **epochs**, **contradiction**, config, types | `salience.rs` (neighbor discriminator), `epochs.rs` (drift segmentation), `contradiction.rs` (cue/value/verdict), `decay.rs` (`decay_score_resisted`), `scoring.rs`, `config.rs` |
 | `forgetfuldb-store` | SQLite persistence, migrations, pipeline | `lib.rs`, `pipeline.rs` (ingest + edge rebuilds), `migrations/0001..0008` |
 | `forgetfuldb-embed` | embedding providers | `hashed_bow` (default, lexical) + `ollama.rs` (real) |
 | `forgetfuldb-retrieve` | hybrid retrieval, multi-hop spreading activation + subgraph injection, `bypass_decay`, `epoch_ordinal` | `lib.rs`, `traverse.rs` (pure K-hop walk) |
-| `forgetfuldb-consolidate` | the "sleep cycle" | `lib.rs` (merge, gist-collapse, `revise_salience`, summaries, promote, foundation, stale, archive/prune, edge rebuilds, `segment_epochs`) |
+| `forgetfuldb-consolidate` | the "sleep cycle" | `lib.rs` (merge, gist-collapse, `revise_salience`, `refine_topics`, summaries, promote, foundation, `infer_contradictions`, `revive_reasserted`, archive/prune, edge rebuilds, `segment_epochs`) |
 | `forgetfuldb-prob` | bloom / CMS / HLL / reservoir (from scratch) | |
 | `forgetfuldb-tools` | shell + read-only `explore` tools | |
-| `forgetfuldb-agent` | chat loop, backend, **writer** (live edge bump), research | `lib.rs`, `writer.rs`, `research.rs` |
+| `forgetfuldb-agent` | chat loop, backend, **writer** (live edge bump), research, **supersede** (runtime contradiction tool) | `lib.rs`, `writer.rs`, `research.rs`, `supersede.rs` |
 | `forgetfuldb-server` | axum API + **SSE** + embedded UI | `lib.rs` (build.rs embeds `ui/dist`) |
 | `forgetfuldb-cli` | the `forgetfuldb` binary + `demo` seeder | `main.rs`, `demo.rs` |
 | `iforgot-chat` | the `iforgot` binary | `main.rs`, `spinner.rs` |
@@ -96,8 +96,32 @@ Both installed to `~/.cargo/bin`.
   the paths (`ContextPack.subgraph`); the agent renders them as a "how these
   connect" block (`render_subgraph`), counted in `context_chars`. Capped at
   `spreading_factor` so association never outranks a direct hit.
+- **Inferred contradiction detection** (the staleness attack), two layers,
+  opt-in (`[contradiction] enabled=false` — it mutates memory):
+  - *Deterministic offline* (the Rust sleep-cycle pass): `refine_topics`
+    (cluster-level topic from session + similarity) → `infer_contradictions`
+    (candidate pairs in the cosine band below dedup ∧ same subject, judged by
+    `core::contradiction`: correction cue, or singular-slot value change
+    backed by replacement-over-time) → writes an `Updates` edge so the
+    existing `mark_contradicted_stale` stales the loser. `revive_reasserted`
+    un-stales a memory whose value is reasserted as current (self-heal).
+    Silent-when-unsure — false negatives safe, false positives not.
+  - *Query-time "default to latest"* (`retrieve::resolve_latest`): when a
+    cue-clear supersession is among the retrieved memories, the older one is
+    dropped from *this turn's* context (recorded in
+    `ContextPack.resolved_conflicts`). The deterministic floor that needs no
+    LLM; query-scoped (doesn't stale the row).
+  - *Runtime precision* (`agent::supersede`): `apply_supersede` (validated —
+    ids must be from this turn — reversible, logged) + `resolve_pair`/
+    `resolution_prompt` (the gated structured call, mock-tested end-to-end).
+  - *Dashboard* (`/conflicts`, `/memory/:id/revive`, the UI **Conflicts**
+    tab): active supersessions with a manual **Revive** override.
+  - **Remaining live-LLM wiring:** fire `resolve_pair` with a real Ollama
+    closure from inside the two chat binaries (iforgot-chat + proxy) after the
+    response streams. Flow is built + mock-tested; only the live call is
+    unwired (needs a running model).
 
-State: ~154 tests pass, clippy clean, tsc clean.
+State: ~178 tests pass, clippy clean, tsc clean.
 
 ## Commands
 
@@ -152,16 +176,20 @@ iforgot                                      # chat; /embed /research /consolida
 
 Done since the last handoff: **Foundation tier**, **gist-collapse**, the
 **retention-efficiency metric** (cost denominator), the **launchd nightly
-timer**, **epochs** (drift-segmented eras, ES-Mem arXiv 2601.07582), and
+timer**, **epochs** (drift-segmented eras, ES-Mem arXiv 2601.07582),
 **multi-hop traversal + subgraph injection** (retrieval that *thinks* along
-the edges). Remaining, in dependency order: **contradiction inference** (the
-staleness attack — read text, conclude "A supersedes B", write a contrastive
-edge) → **goal-conditioned retrieval** → **dreaming** (offline recombination,
-the only mechanism that *creates*) → **ANN index**, **MCP server**.
+the edges), and **inferred contradiction detection** (the staleness attack).
+Remaining, in dependency order: **goal-conditioned retrieval** (bias scoring
+by a current intent vector) → **dreaming** (offline recombination, the only
+mechanism that *creates*) → **ANN index**, **MCP server**.
 
-Multi-hop follow-ups deferred: a UI view of the injected subgraph / activation
-cascade (RetrievalView + GraphView), and tuning `spreading_factor`/`hop_decay`
-against the retention-efficiency metric before turning it on by default.
+Deferred follow-ups: (a) **multi-hop** — a UI view of the injected subgraph /
+activation cascade, and tuning `spreading_factor`/`hop_decay` before default-on;
+(b) **contradiction** — the runtime gated-resolution **live-LLM wiring** (call
+`agent::supersede::resolve_pair` with a real Ollama closure from iforgot-chat +
+the proxy after the response streams; the flow is built + mock-tested, only the
+live call is unwired), and the optional offline LLM verdict sweep (Option B)
+for the never-queried long tail.
 
 **Eval philosophy**: do NOT optimize LoCoMo/LongMemEval (they reward
 hoarding); use **retention efficiency** (accuracy per injected token). The

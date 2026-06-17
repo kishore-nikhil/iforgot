@@ -194,6 +194,13 @@ export interface StoreStats {
   epochs: number;
 }
 
+/** One active supersession from /conflicts (the loser is currently stale). */
+export interface Conflict {
+  relation: string;
+  winner: { id: string; content: string; created_at: number };
+  loser: { id: string; content: string; created_at: number };
+}
+
 /** A drift-segmented era from /epochs (centroid omitted server-side). */
 export interface Epoch {
   id: string;
@@ -242,6 +249,7 @@ export const api = {
   stats: () => getJson<StoreStats>('/stats'),
   metrics: () => getJson<ChatMetrics>('/metrics'),
   epochs: () => getJson<{ epochs: Epoch[] }>('/epochs'),
+  conflicts: () => getJson<{ conflicts: Conflict[] }>('/conflicts'),
   turns: (limit = 300) => getJson<{ turns: ChatTurn[] }>(`/turns?limit=${limit}`),
   consolidations: (limit = 20) => getJson<{ runs: ConsolidationRun[] }>(`/consolidations?limit=${limit}`),
   memory: (id: string) => getJson<MemoryDetail>(`/memory/${id}`),
@@ -272,6 +280,10 @@ export const api = {
   },
   archive: async (id: string) => {
     const res = await fetch(`/memory/${id}/archive`, { method: 'POST' });
+    if (!res.ok) throw new Error(await res.text());
+  },
+  revive: async (id: string) => {
+    const res = await fetch(`/memory/${id}/revive`, { method: 'POST' });
     if (!res.ok) throw new Error(await res.text());
   },
 };

@@ -21,6 +21,7 @@
 
 pub mod backend;
 pub mod research;
+pub mod supersede;
 pub mod writer;
 
 pub use backend::{ChatBackend, ChatMessage, ChatUsage};
@@ -455,6 +456,7 @@ impl Agent {
                 min_score: 0.0,
                 near_misses: vec![],
                 subgraph: None,
+                resolved_conflicts: vec![],
             },
             context_chars: 0,
             retrieve_duration_ms: 0,

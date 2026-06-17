@@ -36,7 +36,7 @@ use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::{Stream, StreamExt};
 use forgetfuldb_consolidate::ExtractiveSummarizer;
 use forgetfuldb_core::config::Config;
-use forgetfuldb_core::types::MemoryType;
+use forgetfuldb_core::types::{LinkRelation, MemoryType};
 use forgetfuldb_core::{age_days, decay, now_unix};
 use forgetfuldb_embed::EmbeddingProvider;
 use forgetfuldb_retrieve::RetrieveOptions;
@@ -519,6 +519,48 @@ async fn archive_handler(
     Ok(Json(json!({ "id": id, "memory_type": "archive" })))
 }
 
+/// Active supersessions for the dashboard: each `updates`/`contradicts` link
+/// whose target (loser) is currently stale, with both memories' content so the
+/// user can eyeball and override a wrong call.
+async fn conflicts_handler(State(state): State<SharedState>) -> Result<Json<serde_json::Value>, ApiError> {
+    let app = state.lock().expect("state mutex poisoned");
+    let mut conflicts = Vec::new();
+    for link in app.store.all_links()? {
+        if !matches!(link.relation, LinkRelation::Updates | LinkRelation::Contradicts) {
+            continue;
+        }
+        let (Some(winner), Some(loser)) =
+            (app.store.get_memory(&link.source_id)?, app.store.get_memory(&link.target_id)?)
+        else {
+            continue;
+        };
+        if !loser.stale {
+            continue; // only active supersessions
+        }
+        conflicts.push(json!({
+            "relation": link.relation.as_str(),
+            "winner": { "id": winner.id, "content": winner.content, "created_at": winner.created_at },
+            "loser": { "id": loser.id, "content": loser.content, "created_at": loser.created_at },
+        }));
+    }
+    Ok(Json(json!({ "conflicts": conflicts })))
+}
+
+/// Manual override: revive a staled memory (un-stale it and drop the
+/// supersession edges that targeted it, so the offline pass won't re-stale it).
+async fn revive_handler(
+    State(state): State<SharedState>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let app = state.lock().expect("state mutex poisoned");
+    if !app.store.set_stale(&id, false)? {
+        return Err(anyhow::anyhow!("memory not found: {id}").into());
+    }
+    app.store.clear_supersession_links_to(&id)?;
+    app.notify_change();
+    Ok(Json(json!({ "id": id, "revived": true })))
+}
+
 /// The observability UI embedded into the binary at build time (see
 /// build.rs). Lets `forgetfuldb server` serve `/ui` from any directory
 /// with no `--ui` path. Compiled out entirely when the `embed-ui` feature
@@ -600,6 +642,8 @@ fn build_router(state: SharedState, ui_dir: Option<&std::path::Path>) -> Router 
         .route("/memory/:id", get(memory_handler))
         .route("/memory/:id/pin", post(pin_handler))
         .route("/memory/:id/archive", post(archive_handler))
+        .route("/memory/:id/revive", post(revive_handler))
+        .route("/conflicts", get(conflicts_handler))
         .route("/stats", get(stats_handler))
         .route("/metrics", get(metrics_handler))
         .route("/events", get(events_handler))

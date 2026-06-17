@@ -19,12 +19,16 @@ Concretely, it gives a local AI assistant:
   *surprising* (novel) and the *habitual* (recurring evenly over time)
   resist forgetting, while routine fades
 - **consolidation** — a "sleep cycle" that dedups, compresses clusters into
-  gist, promotes rehearsed episodes to durable facts, and marks
-  contradicted memories stale instead of keeping lies
+  gist (keeping the anomaly), promotes rehearsed episodes to durable facts,
+  concludes habits into decay-exempt **foundation** traits, segments time into
+  **epochs**, and **infers contradictions** — reading two similar memories,
+  concluding one supersedes the other, and marking the stale value out of date
+  instead of keeping lies (reversible, with a dashboard override)
 - **a typed association graph** — memories connected three ways:
   co-occurrence (recalled together), semantic similarity (close in
-  meaning), and sequence (discussed one after another) — with
-  spreading-activation retrieval that pulls in companions
+  meaning), and sequence (discussed one after another) — with **multi-hop
+  spreading activation** that walks the graph from the hits and injects the
+  *connecting paths*, so the model can reason over the chain
 - **real local embeddings** (via Ollama) so semantic distance is meaningful
 - **time the model can't see** — every "now / 3 years ago / during 2026" is
   computed by the engine from stored timestamps, so it can be exact

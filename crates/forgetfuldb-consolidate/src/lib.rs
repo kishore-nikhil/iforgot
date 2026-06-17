@@ -42,6 +42,12 @@ pub struct ConsolidationReport {
     /// Semantic/preference memories concluded as decay-exempt Foundation
     /// traits from accumulated habit evidence this pass.
     pub promoted_to_foundation: usize,
+    /// Supersession (`Updates`) edges inferred from similar memories this pass
+    /// (the staleness attack). Their targets are staled by `mark_contradicted_stale`.
+    pub contradictions_inferred: usize,
+    /// Previously-staled memories revived because their value was reasserted
+    /// as the current one (the staleness call self-healed).
+    pub revived: usize,
     pub marked_stale: usize,
     pub archived: usize,
     pub deleted: usize,
@@ -51,6 +57,8 @@ pub struct ConsolidationReport {
     pub associations: usize,
     /// Memories whose salience was revised by the neighbor discriminator.
     pub salience_revised: usize,
+    /// Memories whose noisy `topic` was refined from its cluster.
+    pub topics_refined: usize,
     /// `semantic_similar` (cosine kNN) edges rebuilt.
     pub semantic_edges: usize,
     /// `sequence` (session-order) edges rebuilt.
@@ -70,10 +78,13 @@ pub fn consolidate(store: &Store, summarizer: &dyn Summarizer, cfg: &Config) -> 
     collapse_bursts(store, summarizer, cfg, now, &mut report)?;
     refresh_recurrence(store, now, &mut report)?;
     revise_salience(store, now, &mut report)?;
+    refine_topics(store, cfg, now, &mut report)?;
     summarize_clusters(store, summarizer, cfg, now, &mut report)?;
     promote_recurring(store, cfg, now, &mut report)?;
     promote_to_foundation(store, cfg, now, &mut report)?;
+    infer_contradictions(store, cfg, &mut report)?;
     mark_contradicted_stale(store, &mut report)?;
+    revive_reasserted(store, cfg, &mut report)?;
     archive_and_prune(store, cfg, now, &mut report)?;
 
     // Rebuild the association graph from scratch. Done last, after pruning,
@@ -583,6 +594,112 @@ fn promote_recurring(store: &Store, cfg: &Config, now: i64, report: &mut Consoli
     Ok(())
 }
 
+/// Refine each memory's noisy single-token `topic` into a cluster-level
+/// label. Memories that are similar *or* share a chat session are clustered
+/// (union-find), and each cluster's members adopt its dominant signal — an
+/// explicit `project:`/`topic:` tag (weighted) or the most-common entity. This
+/// turns "topic = alphabetically-first word" into "topic = what this group is
+/// about", which sharpens summaries, foundation promotion, and contradiction
+/// candidate-gen. Explicit tags are never overwritten; deterministic
+/// (vote count, then alphabetical) so labels converge instead of thrashing.
+fn refine_topics(store: &Store, cfg: &Config, now: i64, report: &mut ConsolidationReport) -> Result<()> {
+    if !cfg.consolidation_thresholds.topic_refine_enabled {
+        return Ok(());
+    }
+    let sim_thresh = cfg.consolidation_thresholds.topic_cluster_sim as f32;
+
+    let items: Vec<MemoryItem> = store
+        .list_memories(None)?
+        .into_iter()
+        .filter(|m| m.memory_type != MemoryType::Archive && m.embedding.is_some())
+        .collect();
+    let n = items.len();
+    if n < 2 {
+        return Ok(());
+    }
+
+    fn find(parent: &mut [usize], mut x: usize) -> usize {
+        while parent[x] != x {
+            parent[x] = parent[parent[x]];
+            x = parent[x];
+        }
+        x
+    }
+    fn union(parent: &mut [usize], a: usize, b: usize) {
+        let (ra, rb) = (find(parent, a), find(parent, b));
+        if ra != rb {
+            parent[ra] = rb;
+        }
+    }
+    let mut parent: Vec<usize> = (0..n).collect();
+
+    // Session cohesion: same chat session → same cluster.
+    let mut by_session: HashMap<&str, Vec<usize>> = HashMap::new();
+    for (i, m) in items.iter().enumerate() {
+        for t in m.tags.iter().filter(|t| t.starts_with("session:")) {
+            by_session.entry(t.as_str()).or_default().push(i);
+        }
+    }
+    for idxs in by_session.values() {
+        for w in idxs.windows(2) {
+            union(&mut parent, w[0], w[1]);
+        }
+    }
+    // Semantic cohesion.
+    for i in 0..n {
+        for j in (i + 1)..n {
+            let sim = cosine_similarity(items[i].embedding.as_ref().unwrap(), items[j].embedding.as_ref().unwrap());
+            if sim >= sim_thresh {
+                union(&mut parent, i, j);
+            }
+        }
+    }
+
+    let mut clusters: HashMap<usize, Vec<usize>> = HashMap::new();
+    for i in 0..n {
+        let r = find(&mut parent, i);
+        clusters.entry(r).or_default().push(i);
+    }
+
+    let explicit_topic = |m: &MemoryItem| -> Option<String> {
+        m.tags
+            .iter()
+            .find_map(|t| t.strip_prefix("project:").or_else(|| t.strip_prefix("topic:")).filter(|s| !s.is_empty()).map(String::from))
+    };
+
+    for members in clusters.values() {
+        if members.len() < 2 {
+            continue; // a singleton keeps whatever it had
+        }
+        // Vote: explicit tag (weight 2) + each entity (weight 1). The label
+        // shared across the cluster wins; alphabetical tie-break for stability.
+        let mut votes: HashMap<String, i32> = HashMap::new();
+        for &i in members {
+            if let Some(t) = explicit_topic(&items[i]) {
+                *votes.entry(t).or_insert(0) += 2;
+            }
+            for e in &items[i].entities {
+                *votes.entry(e.clone()).or_insert(0) += 1;
+            }
+        }
+        let mut tally: Vec<(String, i32)> = votes.into_iter().collect();
+        tally.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        let Some((canonical, _)) = tally.first() else { continue };
+
+        for &i in members {
+            if explicit_topic(&items[i]).is_some() || items[i].topic.as_deref() == Some(canonical.as_str()) {
+                continue;
+            }
+            let mut updated = items[i].clone();
+            updated.topic = Some(canonical.clone());
+            updated.updated_at = now;
+            store.update_memory(&updated)?;
+            report.topics_refined += 1;
+        }
+    }
+    Ok(())
+}
+
 /// The `started_at` of every stored era, ascending — the boundary list the
 /// `consolidate within, preserve across` guards look memories up against.
 /// Empty until the first `segment_epochs` runs, which makes the guards no-ops
@@ -650,6 +767,168 @@ fn segment_epochs(store: &Store, summarizer: &dyn Summarizer, cfg: &Config, repo
     }
     store.replace_epochs(&rows)?;
     report.epochs = spans.len();
+    Ok(())
+}
+
+/// Same-subject precision filter for contradiction candidacy: two memories
+/// share a topic or an entity (embedding closeness alone can be coincidental).
+fn same_subject(a: &MemoryItem, b: &MemoryItem) -> bool {
+    (a.topic.is_some() && a.topic == b.topic) || a.entities.iter().any(|e| b.entities.contains(e))
+}
+
+/// Infer supersession from similar memories — the staleness attack. Candidate
+/// pairs (cosine in the band below dedup, sharing a topic or entity) are
+/// clustered; within each cluster the newest memory is the potential winner,
+/// and an older member is superseded when the [`contradiction`] core judges it
+/// so with enough confidence (a correction cue, or a singular-slot value change
+/// backed by replacement-over-time). Writes an `Updates` edge winner→loser;
+/// `mark_contradicted_stale` (next step) stales the loser. Reversible, opt-in,
+/// and silent when unsure — false negatives are safe, false positives are not.
+fn infer_contradictions(store: &Store, cfg: &Config, report: &mut ConsolidationReport) -> Result<()> {
+    use forgetfuldb_core::contradiction::{classify_cardinality, judge, value_tokens};
+
+    if !cfg.contradiction.enabled {
+        return Ok(());
+    }
+    let lo = cfg.contradiction.candidate_min_sim as f32;
+    let hi = cfg.consolidation_thresholds.duplicate_similarity as f32;
+    let conf_threshold = cfg.contradiction.confidence_threshold;
+
+    let items: Vec<MemoryItem> = store
+        .list_memories(None)?
+        .into_iter()
+        .filter(|m| m.memory_type != MemoryType::Archive && !m.stale && m.embedding.is_some())
+        .collect();
+    let n = items.len();
+    if n < 2 {
+        return Ok(());
+    }
+
+    // Cluster candidate pairs (cosine in band ∧ same subject) by union-find.
+    fn find(parent: &mut [usize], mut x: usize) -> usize {
+        while parent[x] != x {
+            parent[x] = parent[parent[x]];
+            x = parent[x];
+        }
+        x
+    }
+    let mut parent: Vec<usize> = (0..n).collect();
+    for i in 0..n {
+        for j in (i + 1)..n {
+            let sim = cosine_similarity(items[i].embedding.as_ref().unwrap(), items[j].embedding.as_ref().unwrap());
+            if sim >= lo && sim < hi && same_subject(&items[i], &items[j]) {
+                let (ri, rj) = (find(&mut parent, i), find(&mut parent, j));
+                if ri != rj {
+                    parent[ri] = rj;
+                }
+            }
+        }
+    }
+    let mut clusters: HashMap<usize, Vec<usize>> = HashMap::new();
+    for i in 0..n {
+        let r = find(&mut parent, i);
+        clusters.entry(r).or_default().push(i);
+    }
+
+    for members in clusters.values() {
+        if members.len() < 2 {
+            continue;
+        }
+        // Cardinality from how the slot's distinct values sit in time:
+        // grouped by value signature, replacement (sequential) vs accumulation.
+        let mut spans: HashMap<Vec<String>, (i64, i64)> = HashMap::new();
+        for &i in members {
+            let sig = value_tokens(&items[i].content);
+            let e = spans.entry(sig).or_insert((items[i].created_at, items[i].created_at));
+            e.0 = e.0.min(items[i].created_at);
+            e.1 = e.1.max(items[i].created_at);
+        }
+        let cardinality = classify_cardinality(&spans.values().copied().collect::<Vec<_>>(), 0.2);
+
+        // The newest member is the candidate winner; older differing members
+        // are superseded when the verdict clears the confidence bar.
+        let winner = *members.iter().max_by_key(|&&i| items[i].created_at).unwrap();
+        for &i in members {
+            if i == winner || items[i].created_at > items[winner].created_at {
+                continue;
+            }
+            if let Some(v) = judge(&items[i], &items[winner], cardinality) {
+                if v.confidence >= conf_threshold {
+                    store.insert_link(&MemoryLink {
+                        source_id: v.winner_id,
+                        target_id: v.loser_id,
+                        relation: LinkRelation::Updates,
+                    })?;
+                    report.contradictions_inferred += 1;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Reversibility: a memory staled by a supersession edge is **revived** when
+/// its value is reasserted as the *current* one — the newest live, same-subject
+/// memory in its slot asserts the same value again ("actually, back to
+/// Postgres"). This is the self-heal that makes an over-eager staling safe; it
+/// also removes the supersession edge so the next pass doesn't re-stale it.
+fn revive_reasserted(store: &Store, cfg: &Config, report: &mut ConsolidationReport) -> Result<()> {
+    use forgetfuldb_core::contradiction::{correction_cue, value_tokens};
+
+    // A memory's *current* asserted value: the cue's "new" target if it's a
+    // correction ("from Postgres to SQLite" → SQLite), else its value tokens.
+    // Without this, a migration statement that names the old value would look
+    // like it reasserts it.
+    let effective_value = |text: &str| -> Vec<String> {
+        match correction_cue(text).and_then(|c| c.new) {
+            Some(n) => vec![n.to_lowercase()],
+            None => value_tokens(text),
+        }
+    };
+
+    if !cfg.contradiction.enabled {
+        return Ok(());
+    }
+    let lo = cfg.contradiction.candidate_min_sim as f32;
+
+    let all: Vec<MemoryItem> = store
+        .list_memories(None)?
+        .into_iter()
+        .filter(|m| m.memory_type != MemoryType::Archive && m.embedding.is_some())
+        .collect();
+
+    // Memories staled *by a supersession edge* (vs. some other reason).
+    let staled_targets: std::collections::HashSet<String> = store
+        .all_links()?
+        .into_iter()
+        .filter(|l| matches!(l.relation, LinkRelation::Updates | LinkRelation::Contradicts))
+        .map(|l| l.target_id)
+        .collect();
+
+    for s in all.iter().filter(|m| m.stale && staled_targets.contains(&m.id)) {
+        let sv = value_tokens(&s.content);
+        if sv.is_empty() {
+            continue; // can't confirm reassertion of a non-value-like value
+        }
+        let s_emb = s.embedding.as_ref().unwrap();
+        // The current truth in this slot: the newest live, same-subject memory.
+        let newest_live = all
+            .iter()
+            .filter(|m| !m.stale && m.id != s.id && m.created_at >= s.created_at)
+            .filter(|m| same_subject(s, m))
+            .filter(|m| cosine_similarity(s_emb, m.embedding.as_ref().unwrap()) >= lo)
+            .max_by_key(|m| m.created_at);
+
+        if let Some(w) = newest_live {
+            let wv = effective_value(&w.content);
+            // Revive only if that current memory reasserts s's value.
+            if sv.iter().all(|t| wv.contains(t)) {
+                store.set_stale(&s.id, false)?;
+                store.clear_supersession_links_to(&s.id)?;
+                report.revived += 1;
+            }
+        }
+    }
     Ok(())
 }
 
@@ -767,6 +1046,30 @@ mod tests {
                 tags: vec!["project:test".to_string()],
                 memory_type: Some(mt),
                 session_id: None,
+                role: None,
+            },
+        )
+        .unwrap()
+        .memory()
+        .id
+        .clone()
+    }
+
+    /// Ingest with a `session:<id>` tag (and no `project:` tag), so the
+    /// memory's topic is the noisy guessed one — what topic-refinement fixes.
+    fn add_session(store: &Store, provider: &dyn EmbeddingProvider, cfg: &Config, text: &str, session: &str) -> String {
+        let mut bloom = warm_bloom(store).unwrap();
+        ingest(
+            store,
+            &mut bloom,
+            provider,
+            cfg,
+            IngestRequest {
+                text: text.to_string(),
+                source: None,
+                tags: vec![format!("session:{session}")],
+                memory_type: Some(MemoryType::Episodic),
+                session_id: Some(session.to_string()),
                 role: None,
             },
         )
@@ -1073,6 +1376,114 @@ mod tests {
                 "near-duplicates in different eras must both survive"
             );
         }
+    }
+
+    #[test]
+    fn refine_topics_converges_a_session_to_one_topic() {
+        let (store, provider, mut cfg) = setup();
+        cfg.consolidation_thresholds.burst_collapse_enabled = false; // keep the three intact
+        // Same session, all about "payments", but guess_topic gives each a
+        // *different* alphabetically-first word (alpha / complete / dashboard).
+        let ids: Vec<String> = ["alpha release shipped for payments", "complete payments gateway integration", "dashboard for payments needs work"]
+            .iter()
+            .map(|t| add_session(&store, provider.as_ref(), &cfg, t, "s1"))
+            .collect();
+
+        consolidate(&store, &ExtractiveSummarizer::default(), &cfg).unwrap();
+
+        let topics: Vec<String> =
+            ids.iter().map(|id| store.get_memory(id).unwrap().unwrap().topic.unwrap_or_default()).collect();
+        assert!(
+            topics.iter().all(|t| t == "payments"),
+            "session members converge on the shared entity, not their noisy first word: {topics:?}"
+        );
+    }
+
+    #[test]
+    fn refine_topics_keeps_explicit_tags_and_is_stable() {
+        let (store, provider, mut cfg) = setup();
+        cfg.consolidation_thresholds.burst_collapse_enabled = false;
+        // `add` tags everything project:test → explicit topic "test".
+        let a = add(&store, provider.as_ref(), &cfg, "the billing invoice flow needs a review", MemoryType::Semantic);
+        add(&store, provider.as_ref(), &cfg, "billing invoice formatting bug was fixed", MemoryType::Semantic);
+
+        consolidate(&store, &ExtractiveSummarizer::default(), &cfg).unwrap();
+        assert_eq!(
+            store.get_memory(&a).unwrap().unwrap().topic.as_deref(),
+            Some("test"),
+            "an explicit project tag is never overwritten"
+        );
+
+        // Converged → a second pass refines nothing new (stable, no thrash).
+        let second = consolidate(&store, &ExtractiveSummarizer::default(), &cfg).unwrap();
+        assert_eq!(second.topics_refined, 0, "topics have converged; no churn on re-run");
+    }
+
+    #[test]
+    fn infer_contradiction_stales_the_superseded_memory() {
+        let (store, provider, mut cfg) = setup();
+        cfg.contradiction.enabled = true;
+        // The 0.80 default band floor is tuned for real embeddings; hashed_bow
+        // (lexical) runs lower, so lower the floor for the test (gotcha #5).
+        cfg.contradiction.candidate_min_sim = 0.5;
+        let old = add(&store, provider.as_ref(), &cfg, "the main database runs on Postgres", MemoryType::Semantic);
+        let new = add(&store, provider.as_ref(), &cfg, "the main database migrated from Postgres to SQLite", MemoryType::Semantic);
+        backdate(&store, &old, 10);
+
+        let report = consolidate(&store, &ExtractiveSummarizer::default(), &cfg).unwrap();
+        assert!(report.contradictions_inferred >= 1, "the migration should be inferred as a supersession");
+        assert!(store.get_memory(&old).unwrap().unwrap().stale, "the old Postgres memory is staled");
+        assert!(!store.get_memory(&new).unwrap().unwrap().stale, "the new memory survives");
+    }
+
+    #[test]
+    fn coexisting_preferences_are_not_staled() {
+        let (store, provider, mut cfg) = setup();
+        cfg.contradiction.enabled = true;
+        cfg.contradiction.candidate_min_sim = 0.5; // hashed_bow range (see above)
+        cfg.consolidation_thresholds.duplicate_similarity = 0.999; // keep both (don't merge)
+        let coffee = add(&store, provider.as_ref(), &cfg, "I really prefer drinking coffee in the morning", MemoryType::Preference);
+        let tea = add(&store, provider.as_ref(), &cfg, "I really prefer drinking tea in the morning", MemoryType::Preference);
+        backdate(&store, &coffee, 10);
+
+        let report = consolidate(&store, &ExtractiveSummarizer::default(), &cfg).unwrap();
+        assert_eq!(report.contradictions_inferred, 0, "coffee and tea coexist — no cue, no replacement");
+        assert!(!store.get_memory(&coffee).unwrap().unwrap().stale);
+        assert!(!store.get_memory(&tea).unwrap().unwrap().stale);
+    }
+
+    #[test]
+    fn reasserting_a_value_revives_the_staled_memory() {
+        let (store, provider, mut cfg) = setup();
+        cfg.contradiction.enabled = true;
+        cfg.contradiction.candidate_min_sim = 0.5;
+        // A: Postgres. B: migrated to SQLite → stales A.
+        let a = add(&store, provider.as_ref(), &cfg, "the main database runs on Postgres", MemoryType::Semantic);
+        let b = add(&store, provider.as_ref(), &cfg, "the main database migrated from Postgres to SQLite", MemoryType::Semantic);
+        backdate(&store, &a, 30);
+        backdate(&store, &b, 20);
+        consolidate(&store, &ExtractiveSummarizer::default(), &cfg).unwrap();
+        assert!(store.get_memory(&a).unwrap().unwrap().stale, "A is staled by the migration");
+
+        // C: moved back to Postgres (newest) → supersedes B and reasserts A.
+        let c = add(&store, provider.as_ref(), &cfg, "the main database moved back from SQLite to Postgres", MemoryType::Semantic);
+        backdate(&store, &c, 5);
+        let report = consolidate(&store, &ExtractiveSummarizer::default(), &cfg).unwrap();
+
+        assert!(report.revived >= 1, "A should be revived");
+        assert!(!store.get_memory(&a).unwrap().unwrap().stale, "A revived — Postgres is current again");
+        assert!(store.get_memory(&b).unwrap().unwrap().stale, "B (SQLite) is now the superseded one");
+    }
+
+    #[test]
+    fn contradiction_is_off_by_default() {
+        let (store, provider, cfg) = setup(); // enabled = false
+        let old = add(&store, provider.as_ref(), &cfg, "the main database runs on Postgres", MemoryType::Semantic);
+        add(&store, provider.as_ref(), &cfg, "the main database migrated from Postgres to SQLite", MemoryType::Semantic);
+        backdate(&store, &old, 10);
+        let report = consolidate(&store, &ExtractiveSummarizer::default(), &cfg).unwrap();
+        assert_eq!(report.contradictions_inferred, 0, "opt-in: nothing inferred unless enabled");
+        assert!(!store.get_memory(&old).unwrap().unwrap().stale);
     }
 
     #[test]
