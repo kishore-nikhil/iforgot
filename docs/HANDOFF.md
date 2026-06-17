@@ -106,13 +106,22 @@ Both installed to `~/.cargo/bin`.
     existing `mark_contradicted_stale` stales the loser. `revive_reasserted`
     un-stales a memory whose value is reasserted as current (self-heal).
     Silent-when-unsure — false negatives safe, false positives not.
-  - *Runtime precision* (`agent::supersede`): a `supersede_memory` tool the
-    chat model can call when it spots a conflict among injected memories —
-    validated (ids must be from this turn), reversible, logged. **Actuator
-    built + tested; live chat wiring (render ids in the context block + the
-    two chat frontends dispatching the call) is the remaining follow-up.**
+  - *Query-time "default to latest"* (`retrieve::resolve_latest`): when a
+    cue-clear supersession is among the retrieved memories, the older one is
+    dropped from *this turn's* context (recorded in
+    `ContextPack.resolved_conflicts`). The deterministic floor that needs no
+    LLM; query-scoped (doesn't stale the row).
+  - *Runtime precision* (`agent::supersede`): `apply_supersede` (validated —
+    ids must be from this turn — reversible, logged) + `resolve_pair`/
+    `resolution_prompt` (the gated structured call, mock-tested end-to-end).
+  - *Dashboard* (`/conflicts`, `/memory/:id/revive`, the UI **Conflicts**
+    tab): active supersessions with a manual **Revive** override.
+  - **Remaining live-LLM wiring:** fire `resolve_pair` with a real Ollama
+    closure from inside the two chat binaries (iforgot-chat + proxy) after the
+    response streams. Flow is built + mock-tested; only the live call is
+    unwired (needs a running model).
 
-State: ~174 tests pass, clippy clean, tsc clean.
+State: ~178 tests pass, clippy clean, tsc clean.
 
 ## Commands
 
@@ -176,9 +185,11 @@ mechanism that *creates*) → **ANN index**, **MCP server**.
 
 Deferred follow-ups: (a) **multi-hop** — a UI view of the injected subgraph /
 activation cascade, and tuning `spreading_factor`/`hop_decay` before default-on;
-(b) **contradiction** — the runtime `supersede_memory` live wiring (id
-rendering in the context block + frontend dispatch), and the optional offline
-LLM verdict sweep (Option B) for the never-queried long tail.
+(b) **contradiction** — the runtime gated-resolution **live-LLM wiring** (call
+`agent::supersede::resolve_pair` with a real Ollama closure from iforgot-chat +
+the proxy after the response streams; the flow is built + mock-tested, only the
+live call is unwired), and the optional offline LLM verdict sweep (Option B)
+for the never-queried long tail.
 
 **Eval philosophy**: do NOT optimize LoCoMo/LongMemEval (they reward
 hoarding); use **retention efficiency** (accuracy per injected token). The

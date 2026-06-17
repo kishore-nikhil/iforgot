@@ -138,8 +138,13 @@ is a time-range lookup, so `memory_items` is untouched. Three consumers:
 ### Inferred contradiction detection (the staleness attack)
 The hardest failure mode of long-lived memory — old facts staying confidently
 retrievable — is the only one decay can't fix (it's time-based, not
-truth-based). Two layers, both opt-in and reversible (stale is a flag, never a
-delete):
+truth-based). Three tiers, opt-in and reversible (stale is a flag, never a
+delete), in precision-first order so the cheap, deterministic path is the
+authority and the LLM is a bounded booster:
+- **Query-time "default to latest"** (`retrieve::resolve_latest`) — the floor
+  that needs no model: when two retrieved memories are a cue-clear
+  supersession, only the newest is injected this turn. Query-scoped (doesn't
+  stale the row), so it always works even with the LLM off.
 - **Deterministic offline** (`core::contradiction` + the consolidation pass).
   Candidate pairs are cheap: cosine in the band *below* the dedup threshold
   (similar but not a duplicate) ∧ same subject (a refined topic or a shared
@@ -150,11 +155,18 @@ delete):
   stales the loser; `revive_reasserted` later un-stales it if its value is
   reasserted as current. It is **silent when unsure** — false negatives are
   safe, false positives (forgetting something true) are not.
-- **Runtime precision** (`agent::supersede`). A `supersede_memory` tool the
-  chat model can call when it notices a conflict among the memories injected
-  this turn — free, query-aware inference, gated by an id-membership check (no
-  hallucinated ids) and reversible. The deterministic path is the testable
-  backbone; the LLM is the opt-in booster, never the sole authority.
+- **Runtime precision** (`agent::supersede`). For the ambiguous conflicts the
+  cheap tiers leave alone, a gated structured call (`resolve_pair`) asks the
+  model — query-aware, id-validated (no hallucinated ids), reversible — fired
+  *only when a conflict is detected*, never in the streaming path. The
+  deterministic path is the testable backbone; the LLM is the opt-in booster,
+  never the sole authority. *(The actuator, prompt and resolution flow are
+  built + tested; the one unwired piece is firing it with a live local model
+  from the two chat binaries.)*
+
+Every active supersession is inspectable and overridable in the dashboard
+(`/conflicts` + the **Conflicts** view): the user sees current vs. superseded
+and can **Revive** a wrongly-staled memory.
 
 A subtler prerequisite that shipped alongside: **topic refinement**
 (`refine_topics`) turns the noisy single-token `topic` into a cluster-level
