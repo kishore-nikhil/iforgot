@@ -10,7 +10,11 @@
 pub mod pipeline;
 
 use anyhow::{Context, Result};
-use forgetfuldb_core::types::{LinkRelation, MemoryItem, MemoryLink, MemoryType, RawEvent, Session};
+use forgetfuldb_core::types::{
+    EvidenceSource, EvidenceType, InputMode, LinkRelation, MemoryEvidence, MemoryItem, MemoryLink,
+    MemoryType, OutcomeSnapshot, PredictionSnapshot, RawEvent, Session, SessionTheme, SourceChunk,
+    SourceDocument,
+};
 use rusqlite::{params, Connection, OptionalExtension, Row};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -20,13 +24,35 @@ use std::str::FromStr;
 /// applied ones are skipped via the `schema_migrations` table.
 const MIGRATIONS: &[(&str, &str)] = &[
     ("0001_init", include_str!("../migrations/0001_init.sql")),
-    ("0002_chat_turns", include_str!("../migrations/0002_chat_turns.sql")),
-    ("0003_consolidation_runs", include_str!("../migrations/0003_consolidation_runs.sql")),
-    ("0004_store_meta", include_str!("../migrations/0004_store_meta.sql")),
-    ("0005_memory_edges", include_str!("../migrations/0005_memory_edges.sql")),
-    ("0006_salience", include_str!("../migrations/0006_salience.sql")),
-    ("0007_foundation_type", include_str!("../migrations/0007_foundation_type.sql")),
+    (
+        "0002_chat_turns",
+        include_str!("../migrations/0002_chat_turns.sql"),
+    ),
+    (
+        "0003_consolidation_runs",
+        include_str!("../migrations/0003_consolidation_runs.sql"),
+    ),
+    (
+        "0004_store_meta",
+        include_str!("../migrations/0004_store_meta.sql"),
+    ),
+    (
+        "0005_memory_edges",
+        include_str!("../migrations/0005_memory_edges.sql"),
+    ),
+    (
+        "0006_salience",
+        include_str!("../migrations/0006_salience.sql"),
+    ),
+    (
+        "0007_foundation_type",
+        include_str!("../migrations/0007_foundation_type.sql"),
+    ),
     ("0008_epochs", include_str!("../migrations/0008_epochs.sql")),
+    (
+        "0009_memory_v2",
+        include_str!("../migrations/0009_memory_v2.sql"),
+    ),
 ];
 
 pub struct Store {
@@ -57,7 +83,9 @@ impl Store {
 
     /// In-memory database for tests.
     pub fn open_in_memory() -> Result<Store> {
-        let store = Store { conn: Connection::open_in_memory()? };
+        let store = Store {
+            conn: Connection::open_in_memory()?,
+        };
         store.migrate()?;
         Ok(store)
     }
@@ -72,10 +100,16 @@ impl Store {
         for (name, sql) in MIGRATIONS {
             let applied: Option<String> = self
                 .conn
-                .query_row("SELECT name FROM schema_migrations WHERE name = ?1", [name], |r| r.get(0))
+                .query_row(
+                    "SELECT name FROM schema_migrations WHERE name = ?1",
+                    [name],
+                    |r| r.get(0),
+                )
                 .optional()?;
             if applied.is_none() {
-                self.conn.execute_batch(sql).with_context(|| format!("applying migration {name}"))?;
+                self.conn
+                    .execute_batch(sql)
+                    .with_context(|| format!("applying migration {name}"))?;
                 self.conn.execute(
                     "INSERT INTO schema_migrations (name, applied_at) VALUES (?1, ?2)",
                     params![name, forgetfuldb_core::now_unix()],
@@ -213,7 +247,9 @@ impl Store {
     }
 
     pub fn delete_memory(&self, id: &str) -> Result<bool> {
-        let n = self.conn.execute("DELETE FROM memory_items WHERE id = ?1", [id])?;
+        let n = self
+            .conn
+            .execute("DELETE FROM memory_items WHERE id = ?1", [id])?;
         // Cascade: don't leave dangling links/edges pointing at a memory
         // that no longer exists. (The consolidation edge rebuilds also clear
         // and recompute, but deleting here keeps the graph consistent in
@@ -301,7 +337,11 @@ impl Store {
              WHERE source_id = ?1 OR target_id = ?1",
         )?;
         let rows = stmt.query_map([memory_id], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
         })?;
         let mut out = Vec::new();
         for row in rows {
@@ -309,17 +349,22 @@ impl Store {
             out.push(MemoryLink {
                 source_id,
                 target_id,
-                relation: LinkRelation::from_str(&relation)
-                    .map_err(|e| anyhow::anyhow!(e))?,
+                relation: LinkRelation::from_str(&relation).map_err(|e| anyhow::anyhow!(e))?,
             });
         }
         Ok(out)
     }
 
     pub fn all_links(&self) -> Result<Vec<MemoryLink>> {
-        let mut stmt = self.conn.prepare("SELECT source_id, target_id, relation FROM memory_links")?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT source_id, target_id, relation FROM memory_links")?;
         let rows = stmt.query_map([], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
         })?;
         let mut out = Vec::new();
         for row in rows {
@@ -339,7 +384,14 @@ impl Store {
         self.conn.execute(
             "INSERT INTO raw_events (id, session_id, role, content, created_at, content_hash)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![ev.id, ev.session_id, ev.role, ev.content, ev.created_at, ev.content_hash],
+            params![
+                ev.id,
+                ev.session_id,
+                ev.role,
+                ev.content,
+                ev.created_at,
+                ev.content_hash
+            ],
         )?;
         Ok(())
     }
@@ -367,7 +419,8 @@ impl Store {
     }
 
     pub fn delete_raw_event(&self, id: &str) -> Result<()> {
-        self.conn.execute("DELETE FROM raw_events WHERE id = ?1", [id])?;
+        self.conn
+            .execute("DELETE FROM raw_events WHERE id = ?1", [id])?;
         Ok(())
     }
 
@@ -378,7 +431,12 @@ impl Store {
             "INSERT INTO sessions (id, title, created_at, updated_at) VALUES (?1, ?2, ?3, ?4)
              ON CONFLICT(id) DO UPDATE SET updated_at = excluded.updated_at,
                  title = COALESCE(excluded.title, sessions.title)",
-            params![session.id, session.title, session.created_at, session.updated_at],
+            params![
+                session.id,
+                session.title,
+                session.created_at,
+                session.updated_at
+            ],
         )?;
         Ok(())
     }
@@ -493,7 +551,9 @@ impl Store {
 
     pub fn get_meta(&self, key: &str) -> Result<Option<String>> {
         self.conn
-            .query_row("SELECT value FROM store_meta WHERE key = ?1", [key], |r| r.get(0))
+            .query_row("SELECT value FROM store_meta WHERE key = ?1", [key], |r| {
+                r.get(0)
+            })
             .optional()
             .map_err(Into::into)
     }
@@ -596,7 +656,8 @@ impl Store {
     /// Delete every edge of one type (the co-occurrence pass rebuilds them
     /// from scratch each run, so it clears first).
     pub fn clear_edges(&self, edge_type: &str) -> Result<()> {
-        self.conn.execute("DELETE FROM memory_edges WHERE edge_type = ?1", [edge_type])?;
+        self.conn
+            .execute("DELETE FROM memory_edges WHERE edge_type = ?1", [edge_type])?;
         Ok(())
     }
 
@@ -722,6 +783,161 @@ impl Store {
         Ok(rows)
     }
 
+    // ---- V2 evidence / source objects -------------------------------------
+
+    pub fn insert_evidence(&self, ev: &MemoryEvidence) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO memory_evidence
+                 (id, memory_id, evidence_type, strength, source, session_id, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                ev.id,
+                ev.memory_id,
+                ev.evidence_type.as_str(),
+                ev.strength,
+                ev.source.as_str(),
+                ev.session_id,
+                ev.created_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn evidence_for(&self, memory_id: &str) -> Result<Vec<MemoryEvidence>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, memory_id, evidence_type, strength, source, session_id, created_at
+             FROM memory_evidence WHERE memory_id = ?1 ORDER BY created_at, id",
+        )?;
+        let rows = stmt
+            .query_map([memory_id], row_to_evidence)?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    pub fn all_evidence(&self) -> Result<Vec<MemoryEvidence>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, memory_id, evidence_type, strength, source, session_id, created_at
+             FROM memory_evidence ORDER BY created_at, id",
+        )?;
+        let rows = stmt
+            .query_map([], row_to_evidence)?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    pub fn insert_source_document(&self, doc: &SourceDocument) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO source_documents
+                 (id, raw_text_hash, source_type, session_id, summary, entities, topics, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                doc.id,
+                doc.raw_text_hash,
+                doc.source_type.as_str(),
+                doc.session_id,
+                doc.summary,
+                serde_json::to_string(&doc.entities)?,
+                serde_json::to_string(&doc.topics)?,
+                doc.created_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn insert_source_chunk(&self, chunk: &SourceChunk) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO source_chunks
+                 (id, source_id, chunk_index, text, summary, entities, topics)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                chunk.id,
+                chunk.source_id,
+                chunk.chunk_index as i64,
+                chunk.text,
+                chunk.summary,
+                serde_json::to_string(&chunk.entities)?,
+                serde_json::to_string(&chunk.topics)?,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_source_document(&self, id: &str) -> Result<Option<SourceDocument>> {
+        self.conn
+            .query_row(
+                "SELECT id, raw_text_hash, source_type, session_id, summary, entities, topics, created_at
+                 FROM source_documents WHERE id = ?1",
+                [id],
+                row_to_source_document,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn source_chunks(&self, source_id: &str) -> Result<Vec<SourceChunk>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, source_id, chunk_index, text, summary, entities, topics
+             FROM source_chunks WHERE source_id = ?1 ORDER BY chunk_index",
+        )?;
+        let rows = stmt
+            .query_map([source_id], row_to_source_chunk)?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    pub fn insert_session_theme(&self, theme: &SessionTheme) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO session_themes
+                 (id, label, supporting_nodes, confidence, session_id)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                theme.id,
+                theme.label,
+                serde_json::to_string(&theme.supporting_nodes)?,
+                theme.confidence,
+                theme.session_id,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn insert_prediction_snapshot(&self, snap: &PredictionSnapshot) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO prediction_snapshots
+                 (id, memory_id, predicted_importance, predicted_lifetime_days,
+                  predicted_consolidation_probability, model_version, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                snap.id,
+                snap.memory_id,
+                snap.predicted_importance,
+                snap.predicted_lifetime_days,
+                snap.predicted_consolidation_probability,
+                snap.model_version,
+                snap.created_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn insert_outcome_snapshot(&self, snap: &OutcomeSnapshot) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO outcome_snapshots
+                 (id, memory_id, actual_importance, evidence_count, survived_days, correction_count, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                snap.id,
+                snap.memory_id,
+                snap.actual_importance,
+                snap.evidence_count as i64,
+                snap.survived_days as i64,
+                snap.correction_count as i64,
+                snap.created_at,
+            ],
+        )?;
+        Ok(())
+    }
+
     // ---- stats -----------------------------------------------------------
 
     pub fn stats(&self) -> Result<StoreStats> {
@@ -734,18 +950,41 @@ impl Store {
             )?;
             by_type.push((mt.as_str().to_string(), count));
         }
-        let total: i64 = self.conn.query_row("SELECT COUNT(*) FROM memory_items", [], |r| r.get(0))?;
-        let stale: i64 = self
+        let total: i64 = self
             .conn
-            .query_row("SELECT COUNT(*) FROM memory_items WHERE stale = 1", [], |r| r.get(0))?;
-        let pinned: i64 = self
+            .query_row("SELECT COUNT(*) FROM memory_items", [], |r| r.get(0))?;
+        let stale: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM memory_items WHERE stale = 1",
+            [],
+            |r| r.get(0),
+        )?;
+        let pinned: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM memory_items WHERE pinned = 1",
+            [],
+            |r| r.get(0),
+        )?;
+        let raw_events: i64 = self
             .conn
-            .query_row("SELECT COUNT(*) FROM memory_items WHERE pinned = 1", [], |r| r.get(0))?;
-        let raw_events: i64 = self.conn.query_row("SELECT COUNT(*) FROM raw_events", [], |r| r.get(0))?;
-        let links: i64 = self.conn.query_row("SELECT COUNT(*) FROM memory_links", [], |r| r.get(0))?;
-        let sessions: i64 = self.conn.query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0))?;
-        let epochs: i64 = self.conn.query_row("SELECT COUNT(*) FROM epochs", [], |r| r.get(0))?;
-        Ok(StoreStats { total_memories: total, by_type, stale, pinned, raw_events, links, sessions, epochs })
+            .query_row("SELECT COUNT(*) FROM raw_events", [], |r| r.get(0))?;
+        let links: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM memory_links", [], |r| r.get(0))?;
+        let sessions: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0))?;
+        let epochs: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM epochs", [], |r| r.get(0))?;
+        Ok(StoreStats {
+            total_memories: total,
+            by_type,
+            stale,
+            pinned,
+            raw_events,
+            links,
+            sessions,
+            epochs,
+        })
     }
 }
 
@@ -847,7 +1086,8 @@ impl ChatMetricsSummary {
     /// Average injected tokens spent per memory recalled — the unit cost of
     /// a memory in the prompt.
     pub fn tokens_per_injected_memory(&self) -> Option<f64> {
-        (self.total_context_memories > 0).then(|| self.injected_tokens() / self.total_context_memories as f64)
+        (self.total_context_memories > 0)
+            .then(|| self.injected_tokens() / self.total_context_memories as f64)
     }
 }
 
@@ -921,6 +1161,57 @@ fn row_to_memory(row: &Row<'_>) -> rusqlite::Result<MemoryItem> {
     })
 }
 
+fn row_to_evidence(row: &Row<'_>) -> rusqlite::Result<MemoryEvidence> {
+    let evidence_type: String = row.get(2)?;
+    let source: String = row.get(4)?;
+    Ok(MemoryEvidence {
+        id: row.get(0)?,
+        memory_id: row.get(1)?,
+        evidence_type: EvidenceType::from_str(&evidence_type).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(2, rusqlite::types::Type::Text, e.into())
+        })?,
+        strength: row.get(3)?,
+        source: EvidenceSource::from_str(&source).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(4, rusqlite::types::Type::Text, e.into())
+        })?,
+        session_id: row.get(5)?,
+        created_at: row.get(6)?,
+    })
+}
+
+fn row_to_source_document(row: &Row<'_>) -> rusqlite::Result<SourceDocument> {
+    let source_type: String = row.get(2)?;
+    let entities: String = row.get(5)?;
+    let topics: String = row.get(6)?;
+    Ok(SourceDocument {
+        id: row.get(0)?,
+        raw_text_hash: row.get(1)?,
+        source_type: InputMode::from_str(&source_type).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(2, rusqlite::types::Type::Text, e.into())
+        })?,
+        session_id: row.get(3)?,
+        summary: row.get(4)?,
+        entities: serde_json::from_str(&entities).unwrap_or_default(),
+        topics: serde_json::from_str(&topics).unwrap_or_default(),
+        created_at: row.get(7)?,
+    })
+}
+
+fn row_to_source_chunk(row: &Row<'_>) -> rusqlite::Result<SourceChunk> {
+    let entities: String = row.get(5)?;
+    let topics: String = row.get(6)?;
+    let chunk_index: i64 = row.get(2)?;
+    Ok(SourceChunk {
+        id: row.get(0)?,
+        source_id: row.get(1)?,
+        chunk_index: chunk_index.max(0) as usize,
+        text: row.get(3)?,
+        summary: row.get(4)?,
+        entities: serde_json::from_str(&entities).unwrap_or_default(),
+        topics: serde_json::from_str(&topics).unwrap_or_default(),
+    })
+}
+
 /// f32 vector -> little-endian byte BLOB.
 pub fn encode_embedding(v: &[f32]) -> Vec<u8> {
     let mut out = Vec::with_capacity(v.len() * 4);
@@ -946,7 +1237,13 @@ mod tests {
     fn sample_item(id: &str, content: &str) -> MemoryItem {
         let now = forgetfuldb_core::now_unix();
         let hash = forgetfuldb_core::ingest::content_hash(content);
-        let mut item = MemoryItem::new(id.to_string(), content.to_string(), MemoryType::Episodic, hash, now);
+        let mut item = MemoryItem::new(
+            id.to_string(),
+            content.to_string(),
+            MemoryType::Episodic,
+            hash,
+            now,
+        );
         item.tags = vec!["project:test".to_string()];
         item.entities = vec!["billing".to_string()];
         item.embedding = Some(vec![0.1, 0.2, 0.3]);
@@ -968,16 +1265,25 @@ mod tests {
     #[test]
     fn duplicate_content_hash_rejected() {
         let store = Store::open_in_memory().unwrap();
-        store.insert_memory(&sample_item("mem_1", "same text")).unwrap();
+        store
+            .insert_memory(&sample_item("mem_1", "same text"))
+            .unwrap();
         let err = store.insert_memory(&sample_item("mem_2", "same text"));
-        assert!(err.is_err(), "UNIQUE constraint should reject duplicate hash");
+        assert!(
+            err.is_err(),
+            "UNIQUE constraint should reject duplicate hash"
+        );
     }
 
     #[test]
     fn links_roundtrip() {
         let store = Store::open_in_memory().unwrap();
-        store.insert_memory(&sample_item("mem_1", "fact one")).unwrap();
-        store.insert_memory(&sample_item("mem_2", "fact two")).unwrap();
+        store
+            .insert_memory(&sample_item("mem_1", "fact one"))
+            .unwrap();
+        store
+            .insert_memory(&sample_item("mem_2", "fact two"))
+            .unwrap();
         store
             .insert_link(&MemoryLink {
                 source_id: "mem_1".into(),
@@ -997,7 +1303,9 @@ mod tests {
         // the bump isn't measured against an empty table.
         let ids: Vec<String> = (0..400).map(|i| format!("mem_{i:04}")).collect();
         for id in &ids {
-            store.insert_memory(&sample_item(id, &format!("memory {id}"))).unwrap();
+            store
+                .insert_memory(&sample_item(id, &format!("memory {id}")))
+                .unwrap();
         }
         for chunk in ids.chunks(6).take(60) {
             store.bump_cooccurrence_edges(chunk, 1_000).unwrap();
@@ -1008,8 +1316,15 @@ mod tests {
         store.bump_cooccurrence_edges(&pair, 2_000).unwrap();
         store.bump_cooccurrence_edges(&pair, 3_000).unwrap();
         let w = store.neighbors(&ids[0], "co_occurred").unwrap();
-        let weight = w.iter().find(|(n, _)| n == &ids[1]).map(|(_, w)| *w).unwrap();
-        assert!(weight >= 2.0, "two extra bumps should add to the weight, got {weight}");
+        let weight = w
+            .iter()
+            .find(|(n, _)| n == &ids[1])
+            .map(|(_, w)| *w)
+            .unwrap();
+        assert!(
+            weight >= 2.0,
+            "two extra bumps should add to the weight, got {weight}"
+        );
 
         // Latency: a typical turn injects ~6 memories (15 pairs). Time many
         // such bumps and assert the per-bump cost is tiny (it runs on the
@@ -1022,7 +1337,10 @@ mod tests {
         }
         let per = t0.elapsed().as_secs_f64() * 1000.0 / iters as f64;
         println!("co-occurrence bump (6 ids / 15 pairs): {per:.3} ms/turn over {iters} iters");
-        assert!(per < 5.0, "bump should be well under 5ms/turn, was {per:.3} ms");
+        assert!(
+            per < 5.0,
+            "bump should be well under 5ms/turn, was {per:.3} ms"
+        );
     }
 
     #[test]
@@ -1037,13 +1355,18 @@ mod tests {
                 relation: LinkRelation::Updates,
             })
             .unwrap();
-        store.bump_cooccurrence_edges(&["mem_1".into(), "mem_2".into()], 1).unwrap();
+        store
+            .bump_cooccurrence_edges(&["mem_1".into(), "mem_2".into()], 1)
+            .unwrap();
         assert_eq!(store.list_edges().unwrap().len(), 1);
 
         store.delete_memory("mem_1").unwrap();
         // No dangling links or edges reference the deleted memory.
         assert!(store.links_for("mem_2").unwrap().is_empty());
-        assert!(store.list_edges().unwrap().is_empty(), "edges to a deleted memory must be cleaned up");
+        assert!(
+            store.list_edges().unwrap().is_empty(),
+            "edges to a deleted memory must be cleaned up"
+        );
     }
 
     #[test]
@@ -1052,12 +1375,19 @@ mod tests {
         assert_eq!(store.get_meta("embedding_dim").unwrap(), None);
         store.set_meta("embedding_dim", "768").unwrap();
         store.set_meta("embedding_dim", "1024").unwrap(); // upsert
-        assert_eq!(store.get_meta("embedding_dim").unwrap().as_deref(), Some("1024"));
+        assert_eq!(
+            store.get_meta("embedding_dim").unwrap().as_deref(),
+            Some("1024")
+        );
 
         store.insert_memory(&sample_item("mem_1", "fact")).unwrap();
         store.set_embedding("mem_1", &[0.1, 0.2, 0.3, 0.4]).unwrap();
         let m = store.get_memory("mem_1").unwrap().unwrap();
-        assert_eq!(m.embedding.unwrap().len(), 4, "embedding swapped, dimension changed");
+        assert_eq!(
+            m.embedding.unwrap().len(),
+            4,
+            "embedding swapped, dimension changed"
+        );
     }
 
     #[test]

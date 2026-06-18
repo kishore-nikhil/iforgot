@@ -1,28 +1,32 @@
 //! Hybrid retrieval scoring.
 //!
 //! ```text
-//! retrieval_score =
-//!     0.45 * semantic_similarity
-//!   + 0.20 * importance_score
-//!   + 0.15 * recurrence_score
-//!   + 0.10 * recency_score
-//!   + 0.10 * pinned_boost
-//!   - 0.20 * staleness_penalty
+//! final_score =
+//!     0.60 * relevance
+//!   + 0.15 * recency_score
+//!   + 0.10 * importance_score
+//!   + 0.10 * recurrence_score
+//!   + 0.05 * graph_support
+//!   + pinned_boost
+//!   - staleness_penalty
 //! ```
 //!
-//! All inputs are expected in `[0, 1]`. The importance term should be the
-//! decay-adjusted importance (`decay::decay_score`), so old unimportant
-//! memories naturally sink without a separate decay term here.
+//! All inputs are expected in `[0, 1]`. Candidate recall is relevance-only;
+//! importance belongs in final ranking as a tie-breaker/retention signal.
 
 use serde::{Deserialize, Serialize};
 
 /// Weights for each component of the retrieval score.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RetrievalWeights {
+    /// Historical name kept for config/UI compatibility. In V2 this is the
+    /// relevance term produced by candidate recall.
     pub semantic: f64,
     pub importance: f64,
     pub recurrence: f64,
     pub recency: f64,
+    #[serde(default = "default_graph_support_weight")]
+    pub graph_support: f64,
     pub pinned_boost: f64,
     pub staleness_penalty: f64,
 }
@@ -30,25 +34,31 @@ pub struct RetrievalWeights {
 impl Default for RetrievalWeights {
     fn default() -> Self {
         RetrievalWeights {
-            semantic: 0.45,
-            importance: 0.20,
-            recurrence: 0.15,
-            recency: 0.10,
-            pinned_boost: 0.10,
+            semantic: 0.60,
+            importance: 0.10,
+            recurrence: 0.10,
+            recency: 0.15,
+            graph_support: default_graph_support_weight(),
+            pinned_boost: 0.05,
             staleness_penalty: 0.20,
         }
     }
 }
 
+fn default_graph_support_weight() -> f64 {
+    0.05
+}
+
 /// Inputs to the retrieval score for one candidate memory.
 #[derive(Debug, Clone, Copy)]
 pub struct ScoreInputs {
-    /// Blended vector/keyword similarity in [0, 1].
+    /// Relevance from candidate recall in [0, 1].
     pub semantic_similarity: f64,
     /// Decay-adjusted importance in [0, 1].
     pub importance: f64,
     pub recurrence: f64,
     pub recency: f64,
+    pub graph_support: f64,
     pub pinned: bool,
     pub stale: bool,
     /// The memory's salience in `[0, 1]`. Informational here — its effect
@@ -62,10 +72,16 @@ pub struct ScoreInputs {
 /// *why* a memory was retrieved.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScoreBreakdown {
+    /// Same value as `semantic_similarity`, named for the V2 two-stage
+    /// pipeline. The old field remains for API compatibility.
+    #[serde(default)]
+    pub relevance: f64,
     pub semantic_similarity: f64,
     pub importance: f64,
     pub recurrence: f64,
     pub recency: f64,
+    #[serde(default)]
+    pub graph_support: f64,
     pub pinned_boost: f64,
     pub staleness_penalty: f64,
     /// Multiplier applied to `total` because the memory is a verbatim
@@ -97,13 +113,16 @@ pub fn retrieval_score(inputs: &ScoreInputs, w: &RetrievalWeights) -> ScoreBreak
         + w.importance * inputs.importance
         + w.recurrence * inputs.recurrence
         + w.recency * inputs.recency
+        + w.graph_support * inputs.graph_support
         + w.pinned_boost * pinned_boost
         - w.staleness_penalty * staleness_penalty;
     ScoreBreakdown {
+        relevance: inputs.semantic_similarity,
         semantic_similarity: inputs.semantic_similarity,
         importance: inputs.importance,
         recurrence: inputs.recurrence,
         recency: inputs.recency,
+        graph_support: inputs.graph_support,
         pinned_boost,
         staleness_penalty,
         conversational_damping: 1.0,
@@ -123,6 +142,7 @@ mod tests {
             importance: 0.6,
             recurrence: 0.4,
             recency: 0.5,
+            graph_support: 0.0,
             pinned: false,
             stale: false,
             salience: 0.0,
@@ -133,7 +153,7 @@ mod tests {
     fn retrieval_score_matches_spec_formula() {
         let w = RetrievalWeights::default();
         let s = retrieval_score(&base_inputs(), &w);
-        let expected = 0.45 * 0.8 + 0.20 * 0.6 + 0.15 * 0.4 + 0.10 * 0.5;
+        let expected = 0.60 * 0.8 + 0.10 * 0.6 + 0.10 * 0.4 + 0.15 * 0.5;
         assert!((s.total - expected).abs() < 1e-12);
     }
 
@@ -144,7 +164,7 @@ mod tests {
         let unpinned = retrieval_score(&inputs, &w).total;
         inputs.pinned = true;
         let pinned = retrieval_score(&inputs, &w).total;
-        assert!((pinned - unpinned - 0.10).abs() < 1e-12);
+        assert!((pinned - unpinned - 0.05).abs() < 1e-12);
     }
 
     #[test]

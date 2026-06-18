@@ -121,7 +121,65 @@ Both installed to `~/.cargo/bin`.
     response streams. Flow is built + mock-tested; only the live call is
     unwired (needs a running model).
 
-State: ~178 tests pass, clippy clean, tsc clean.
+## V2 adaptive-memory pipeline (in progress, branch `memory-fixes`)
+
+A reframing of how memories are *born and valued*: importance is no longer a
+one-time write-time score but an emergent property of evidence, recurrence,
+graph structure, correction, and decay — and retrieval is **relevance-first**
+so importance never blocks recall. The conceptual model + a wired-vs-stubbed
+table live in [memory-architecture.md](memory-architecture.md) ("The
+adaptive-memory model"). This section is the operational state.
+
+**Wired + tested.** Two-stage retrieval (relevance-only candidate recall →
+importance-aware final ranking; `retrieve::{candidate_relevance, entity_overlap,
+graph_support_by_memory}`), the recurrence rewrite (`consolidate::
+refresh_recurrence`, log1p over raw / sessions / days / diversity / reuse +
+source-type normalization), evidence-derived importance (`consolidate::
+refresh_importance`, `0.40·correction_count` penalty), the deterministic
+extractor + input-mode classifier (`core::ingest::{extract_memory_candidates,
+classify_input_mode, chunk_source_text}`), and long-input → `source_documents`
+/ `source_chunks`. Schema is migration `0009_memory_v2.sql` (evidence, source
+docs / chunks, session themes, prediction / outcome snapshots).
+
+**Stubbed / not yet wired** (the math runs, but on inputs that are still zero):
+- **The evidence loop is open.** Only `ExplicitRememberRequest`,
+  `UserCorrection`, `TopicRepeated` are ever emitted, all at ingest. Retrieval
+  emits *no* evidence, so `RetrievalSuccess` / accepted-reuse never fires → the
+  `accepted_reuse_count` recurrence term and several `refresh_importance`
+  evidence terms are permanently 0. Wiring one accepted-retrieval emitter is the
+  highest-leverage next step.
+- **The confidence gate computes but doesn't gate.** `ParseResult.confidence`
+  is produced and stored, but the routing (≥0.75 accept / ≥0.45
+  weak-evidence-only / else audit) is not enforced — every ingest still creates
+  a durable memory regardless of confidence.
+- **Storage-ready but headless:** `session_themes` and `prediction` /
+  `outcome_snapshots` have store methods that are never called; `ConversationFrame`
+  exists but every caller passes `None` (no cross-turn scope inheritance — it is
+  the deterministic seed of the [evolving-context](evolving-context.md) tier).
+- **Not started:** chunk → durable promotion (the §13 consolidation step),
+  dynamic cue learning, the LLM auditor, and the `MemoryLifecycleState`
+  transitions.
+
+**Issues to clear (operational):**
+1. **2 clippy warnings** in the new extractor — `core/src/ingest.rs:113` (manual
+   char comparison) and `:150` (`.trim()` before `split_whitespace`). Both
+   `cargo clippy --fix`-able; the repo's bar is clippy-clean.
+2. **Migration `0009_memory_v2.sql` is untracked in git** — it builds via
+   `include_str!` but must be committed or a clean checkout fails.
+3. **`graph_support_by_memory` runs `store.list_edges()` on every `retrieve()`**
+   (even with spreading off) — a new O(edges) per-query cost; cache or gate it
+   as the edge table grows.
+4. **`refresh_recurrence` is O(n²)** over the corpus each consolidation — fine
+   now, quadratic at scale.
+5. **Duplicate-evidence insert can collide:** `reinforce` builds the evidence id
+   from `now`; two duplicates in the same second hit the `memory_evidence`
+   PRIMARY KEY with a plain `INSERT` (no `OR IGNORE`) and error the ingest.
+6. **Retrieval-gate recalibration:** `final_score` reweighted relevance to 0.60
+   (was 0.45 on a blended similarity) — re-tune `min_retrieval_score` /
+   `conversational_damping` against the new formula.
+
+State: 182 tests pass (workspace); **2 clippy warnings** in the new V2 extractor
+(auto-fixable — see issue 1 above); tsc clean.
 
 ## Commands
 
@@ -173,6 +231,32 @@ iforgot                                      # chat; /embed /research /consolida
 7. Date in this project's history is ~2026-06; consolidate relative dates.
 
 ## What's next (deferred, specced in memory-architecture.md)
+
+**Immediate — finish V2** (in dependency order; closes the loops opened above
+before any new mechanism lands):
+1. **Clear the operational issues** — fix the 2 clippy warnings, commit the
+   untracked `0009` migration, harden the duplicate-evidence insert
+   (`INSERT OR IGNORE`). ~30 min, unblocks a clean baseline.
+2. **Close the evidence loop** — emit `RetrievalSuccess` (or an explicit
+   accepted-reuse signal) from the retrieval / chat path. Highest leverage:
+   it's the spec's central reinforcement signal and currently makes several
+   scoring terms inert. Honor the rule — *accepted* reuse only, not raw
+   retrieval count.
+3. **Enforce the confidence gate** — route sub-threshold parses to weak
+   evidence instead of durable memory, so low-confidence input stops minting
+   memories. Without this, the lifecycle (§8) is decorative.
+4. **Wire or explicitly defer the headless producers** — session-theme
+   extraction (graph-structure first), prediction / outcome snapshots (free
+   training data), and the `ConversationFrame` (cross-turn scope; the
+   working-memory seed). Pick per value; mark the rest as deferred so they stop
+   reading as done.
+5. **Chunk → durable promotion** — the §13 consolidation pass that promotes a
+   source chunk to a memory only on support (confidence ≥ 0.70 ∧ relevance ≥
+   0.60 ∧ a trigger).
+6. **Re-tune retrieval thresholds** against the new `final_score` weighting and
+   add a behavior test or two for the emergent-importance path.
+
+Then the roadmap mechanisms below.
 
 Done since the last handoff: **Foundation tier**, **gist-collapse**, the
 **retention-efficiency metric** (cost denominator), the **launchd nightly
