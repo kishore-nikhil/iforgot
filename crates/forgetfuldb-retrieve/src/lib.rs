@@ -28,6 +28,9 @@ use std::collections::{HashMap, HashSet};
 #[serde(default)]
 pub struct RetrieveOptions {
     pub top_k: usize,
+    /// Relevance-only candidate pool size for stage-1 recall. If zero,
+    /// retrieval uses a wide default (`max(50, top_k * 10)`).
+    pub candidate_pool_size: usize,
     /// Stale memories are excluded unless explicitly requested.
     pub include_stale: bool,
     /// Archived memories are excluded unless explicitly requested.
@@ -72,6 +75,7 @@ impl Default for RetrieveOptions {
     fn default() -> Self {
         RetrieveOptions {
             top_k: 10,
+            candidate_pool_size: 0,
             include_stale: false,
             include_archived: false,
             min_score: 0.0,
@@ -217,8 +221,51 @@ pub fn keyword_overlap(query_tokens: &HashSet<String>, item: &MemoryItem) -> f64
     for entity in &item.entities {
         item_tokens.insert(entity.to_lowercase());
     }
-    let hits = query_tokens.iter().filter(|t| item_tokens.contains(*t)).count();
+    let hits = query_tokens
+        .iter()
+        .filter(|t| item_tokens.contains(*t))
+        .count();
     hits as f64 / query_tokens.len() as f64
+}
+
+/// Entity/topic overlap as a separate relevance signal. This lets a
+/// semantically weak but on-entity memory survive candidate recall without
+/// letting importance open the gate.
+pub fn entity_overlap(query_tokens: &HashSet<String>, item: &MemoryItem) -> f64 {
+    if query_tokens.is_empty() {
+        return 0.0;
+    }
+    let mut item_entities = HashSet::new();
+    if let Some(topic) = &item.topic {
+        item_entities.insert(topic.to_lowercase());
+    }
+    for entity in &item.entities {
+        item_entities.insert(entity.to_lowercase());
+    }
+    if item_entities.is_empty() {
+        return 0.0;
+    }
+    let hits = query_tokens
+        .iter()
+        .filter(|t| item_entities.contains(*t))
+        .count();
+    hits as f64 / query_tokens.len() as f64
+}
+
+fn candidate_relevance(semantic_similarity: f64, keyword_overlap: f64, entity_overlap: f64) -> f64 {
+    (0.70 * semantic_similarity + 0.20 * keyword_overlap + 0.10 * entity_overlap).clamp(0.0, 1.0)
+}
+
+fn graph_support_by_memory(store: &Store) -> Result<HashMap<String, f64>> {
+    let mut support: HashMap<String, f64> = HashMap::new();
+    for edge in store.list_edges()? {
+        let contribution = edge.weight.max(0.0).ln_1p() / 3.0;
+        for id in [edge.src_id, edge.dst_id] {
+            let entry = support.entry(id).or_insert(0.0);
+            *entry = (*entry + contribution).min(1.0);
+        }
+    }
+    Ok(support)
 }
 
 /// Cap on near-misses returned in debug mode.
@@ -248,17 +295,21 @@ fn apply_spreading_activation(
     // forward only.
     let mut adj: HashMap<String, Vec<traverse::AdjEdge>> = HashMap::new();
     for e in &edges {
-        adj.entry(e.src_id.clone()).or_default().push(traverse::AdjEdge {
-            dst: e.dst_id.clone(),
-            edge_type: e.edge_type.clone(),
-            weight: e.weight,
-        });
-        if e.edge_type != EDGE_SEQUENCE {
-            adj.entry(e.dst_id.clone()).or_default().push(traverse::AdjEdge {
-                dst: e.src_id.clone(),
+        adj.entry(e.src_id.clone())
+            .or_default()
+            .push(traverse::AdjEdge {
+                dst: e.dst_id.clone(),
                 edge_type: e.edge_type.clone(),
                 weight: e.weight,
             });
+        if e.edge_type != EDGE_SEQUENCE {
+            adj.entry(e.dst_id.clone())
+                .or_default()
+                .push(traverse::AdjEdge {
+                    dst: e.src_id.clone(),
+                    edge_type: e.edge_type.clone(),
+                    weight: e.weight,
+                });
         }
     }
 
@@ -273,8 +324,11 @@ fn apply_spreading_activation(
     };
 
     // Seeds: the strongest base hits (pre-boost scores).
-    let mut seeds: Vec<(String, f64)> =
-        scored.iter().filter(|m| m.score.total > 0.0).map(|m| (m.item.id.clone(), m.score.total)).collect();
+    let mut seeds: Vec<(String, f64)> = scored
+        .iter()
+        .filter(|m| m.score.total > 0.0)
+        .map(|m| (m.item.id.clone(), m.score.total))
+        .collect();
     seeds.sort_by(|a, b| b.1.total_cmp(&a.1));
     seeds.truncate(s.seed_count.max(1));
 
@@ -296,7 +350,10 @@ fn apply_spreading_activation(
 /// a semantic / preference / procedural fact.
 fn is_conversational(item: &MemoryItem) -> bool {
     item.source.as_deref() == Some("chat")
-        && matches!(item.memory_type, MemoryType::RawEvent | MemoryType::Episodic)
+        && matches!(
+            item.memory_type,
+            MemoryType::RawEvent | MemoryType::Episodic
+        )
 }
 
 /// Run hybrid retrieval and return the top-k context pack. Retrieved
@@ -313,7 +370,10 @@ pub fn retrieve(
     let query_tokens: HashSet<String> = tokenize(query).into_iter().collect();
     let lambdas = cfg.decay_lambdas();
     let weights = &cfg.retrieval_weights;
-    let session_tag = opts.exclude_session.as_ref().map(|s| format!("session:{s}"));
+    let session_tag = opts
+        .exclude_session
+        .as_ref()
+        .map(|s| format!("session:{s}"));
 
     // An epoch query is a dated lookup: resolve the ordinal to its
     // [started_at, ended_at) window and bypass decay (we want everything from
@@ -331,7 +391,14 @@ pub fn retrieve(
     let until = opts.until.or(epoch_until);
     let bypass_decay = opts.bypass_decay || epoch_bypass;
 
-    let mut scored: Vec<RetrievedMemory> = Vec::new();
+    let graph_support = graph_support_by_memory(store)?;
+    #[derive(Clone)]
+    struct Candidate {
+        item: MemoryItem,
+        relevance: f64,
+        graph_support: f64,
+    }
+    let mut candidates: Vec<Candidate> = Vec::new();
     for item in store.list_memories(None)? {
         if item.stale && !opts.include_stale {
             continue;
@@ -344,7 +411,8 @@ pub fn retrieve(
                 continue;
             }
         }
-        if since.is_some_and(|s| item.created_at < s) || until.is_some_and(|u| item.created_at > u) {
+        if since.is_some_and(|s| item.created_at < s) || until.is_some_and(|u| item.created_at > u)
+        {
             continue;
         }
         // The excluded session's turns are already in the prompt as live
@@ -362,9 +430,32 @@ pub fn retrieve(
             .unwrap_or(0.0)
             .max(0.0);
         let keywords = keyword_overlap(&query_tokens, &item);
-        // Blend vector and lexical signals into one similarity in [0, 1].
-        let semantic_similarity = (0.7 * cosine + 0.3 * keywords).clamp(0.0, 1.0);
+        let entities = entity_overlap(&query_tokens, &item);
+        let relevance = candidate_relevance(cosine, keywords, entities);
+        candidates.push(Candidate {
+            graph_support: *graph_support.get(&item.id).unwrap_or(&0.0),
+            item,
+            relevance,
+        });
+    }
 
+    // Stage 1: relevance-only recall. No importance, decay, recurrence, or
+    // age penalty is allowed to block a semantically relevant memory here.
+    candidates.sort_by(|a, b| b.relevance.total_cmp(&a.relevance));
+    let pool_size = opts
+        .candidate_pool_size
+        .max(opts.top_k.saturating_mul(10))
+        .max(50);
+    candidates.truncate(pool_size);
+
+    // Stage 2: final ranking. Importance participates, but only after recall.
+    let mut scored: Vec<RetrievedMemory> = Vec::new();
+    for Candidate {
+        item,
+        relevance,
+        graph_support,
+    } in candidates
+    {
         let lambda = lambdas.for_type(item.memory_type);
         // Salience resists decay; a dated query bypasses decay entirely.
         let importance = if bypass_decay {
@@ -386,10 +477,11 @@ pub fn retrieve(
 
         let mut breakdown = retrieval_score(
             &ScoreInputs {
-                semantic_similarity,
+                semantic_similarity: relevance,
                 importance,
                 recurrence: item.recurrence_score,
                 recency,
+                graph_support,
                 pinned: item.pinned,
                 stale: item.stale,
                 salience: item.salience,
@@ -403,7 +495,10 @@ pub fn retrieve(
             breakdown.conversational_damping = opts.conversational_damping;
             breakdown.total *= opts.conversational_damping;
         }
-        scored.push(RetrievedMemory { item, score: breakdown });
+        scored.push(RetrievedMemory {
+            item,
+            score: breakdown,
+        });
     }
 
     // Spreading activation: from the strongest hits, activation spreads over
@@ -417,7 +512,12 @@ pub fn retrieve(
         HashMap::new()
     };
 
-    scored.sort_by(|a, b| b.score.total.partial_cmp(&a.score.total).unwrap_or(std::cmp::Ordering::Equal));
+    scored.sort_by(|a, b| {
+        b.score
+            .total
+            .partial_cmp(&a.score.total)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     let mut near_misses = Vec::new();
     if opts.min_score > 0.0 {
         if opts.debug {
@@ -490,18 +590,27 @@ fn resolve_latest(memories: &mut Vec<RetrievedMemory>, cfg: &Config) -> Vec<Reso
             if !same_subject {
                 continue;
             }
-            let (Some(ea), Some(eb)) = (a.item.embedding.as_ref(), b.item.embedding.as_ref()) else {
+            let (Some(ea), Some(eb)) = (a.item.embedding.as_ref(), b.item.embedding.as_ref())
+            else {
                 continue;
             };
             let sim = cosine_similarity(ea, eb);
             if !(sim >= lo && sim < hi) {
                 continue;
             }
-            let (older, newer) = if a.item.created_at <= b.item.created_at { (a, b) } else { (b, a) };
+            let (older, newer) = if a.item.created_at <= b.item.created_at {
+                (a, b)
+            } else {
+                (b, a)
+            };
             if let Some(v) = judge(&older.item, &newer.item, Cardinality::Unknown) {
                 if v.confidence >= threshold {
                     dropped.insert(v.loser_id.clone());
-                    resolved.push(ResolvedConflict { kept_id: v.winner_id, dropped_id: v.loser_id, reason: v.reason });
+                    resolved.push(ResolvedConflict {
+                        kept_id: v.winner_id,
+                        dropped_id: v.loser_id,
+                        reason: v.reason,
+                    });
                 }
             }
         }
@@ -530,9 +639,16 @@ fn inject_subgraph(
 
     // Traversed-in paths, longest first (so the maximal chain wins the budget
     // and its prefixes fold into it), then strongest.
-    let mut cands: Vec<&traverse::Reach> =
-        reach.values().filter(|r| r.depth >= 1 && !r.edges.is_empty()).collect();
-    cands.sort_by(|a, b| b.path.len().cmp(&a.path.len()).then(b.activation.total_cmp(&a.activation)));
+    let mut cands: Vec<&traverse::Reach> = reach
+        .values()
+        .filter(|r| r.depth >= 1 && !r.edges.is_empty())
+        .collect();
+    cands.sort_by(|a, b| {
+        b.path
+            .len()
+            .cmp(&a.path.len())
+            .then(b.activation.total_cmp(&a.activation))
+    });
 
     let max_nodes = cfg.spreading.subgraph_max_nodes;
     let mut paths: Vec<ContextPath> = Vec::new();
@@ -540,11 +656,18 @@ fn inject_subgraph(
     let mut injected: HashSet<String> = HashSet::new();
 
     for r in cands {
-        if paths.iter().any(|q| q.nodes.len() > r.path.len() && q.nodes.starts_with(&r.path)) {
+        if paths
+            .iter()
+            .any(|q| q.nodes.len() > r.path.len() && q.nodes.starts_with(&r.path))
+        {
             continue; // prefix of a chain we already kept
         }
-        let extra: Vec<String> =
-            r.path.iter().filter(|id| !present.contains(*id) && !injected.contains(*id)).cloned().collect();
+        let extra: Vec<String> = r
+            .path
+            .iter()
+            .filter(|id| !present.contains(*id) && !injected.contains(*id))
+            .cloned()
+            .collect();
         if inject.len() + extra.len() > max_nodes {
             continue;
         }
@@ -552,7 +675,10 @@ fn inject_subgraph(
             injected.insert(id.clone());
             inject.push(id);
         }
-        paths.push(ContextPath { nodes: r.path.clone(), edges: r.edges.clone() });
+        paths.push(ContextPath {
+            nodes: r.path.clone(),
+            edges: r.edges.clone(),
+        });
     }
     if paths.is_empty() {
         return Ok(None);
@@ -566,7 +692,10 @@ fn inject_subgraph(
                 continue;
             }
             let activation = reach.get(id).map(|r| r.activation).unwrap_or(0.0);
-            memories.push(RetrievedMemory { item, score: association_score(activation) });
+            memories.push(RetrievedMemory {
+                item,
+                score: association_score(activation),
+            });
         }
     }
     Ok(Some(ContextSubgraph { paths }))
@@ -576,10 +705,12 @@ fn inject_subgraph(
 /// only nonzero term is the activation it accumulated.
 fn association_score(activation: f64) -> ScoreBreakdown {
     ScoreBreakdown {
+        relevance: 0.0,
         semantic_similarity: 0.0,
         importance: 0.0,
         recurrence: 0.0,
         recency: 0.0,
+        graph_support: 0.0,
         pinned_boost: 0.0,
         staleness_penalty: 0.0,
         conversational_damping: 1.0,
@@ -600,7 +731,13 @@ mod tests {
         (store, provider, Config::default())
     }
 
-    fn add(store: &Store, provider: &dyn EmbeddingProvider, cfg: &Config, text: &str, tags: Vec<String>) -> String {
+    fn add(
+        store: &Store,
+        provider: &dyn EmbeddingProvider,
+        cfg: &Config,
+        text: &str,
+        tags: Vec<String>,
+    ) -> String {
         let mut bloom = warm_bloom(store).unwrap();
         let out = ingest(
             store,
@@ -623,9 +760,28 @@ mod tests {
     #[test]
     fn relevant_memory_ranks_first() {
         let (store, provider, cfg) = setup();
-        add(&store, provider.as_ref(), &cfg, "plot perfect billing runs on stripe invoices", vec![]);
-        add(&store, provider.as_ref(), &cfg, "the cat sleeps on the windowsill every afternoon", vec![]);
-        let pack = retrieve(&store, provider.as_ref(), &cfg, "plot perfect billing", &RetrieveOptions::default()).unwrap();
+        add(
+            &store,
+            provider.as_ref(),
+            &cfg,
+            "plot perfect billing runs on stripe invoices",
+            vec![],
+        );
+        add(
+            &store,
+            provider.as_ref(),
+            &cfg,
+            "the cat sleeps on the windowsill every afternoon",
+            vec![],
+        );
+        let pack = retrieve(
+            &store,
+            provider.as_ref(),
+            &cfg,
+            "plot perfect billing",
+            &RetrieveOptions::default(),
+        )
+        .unwrap();
         assert!(pack.memories[0].item.content.contains("billing"));
         assert!(pack.memories[0].score.total > pack.memories[1].score.total);
     }
@@ -633,13 +789,29 @@ mod tests {
     #[test]
     fn stale_memories_hidden_unless_requested() {
         let (store, provider, cfg) = setup();
-        let id = add(&store, provider.as_ref(), &cfg, "old billing fact about stripe", vec![]);
+        let id = add(
+            &store,
+            provider.as_ref(),
+            &cfg,
+            "old billing fact about stripe",
+            vec![],
+        );
         store.set_stale(&id, true).unwrap();
 
-        let hidden = retrieve(&store, provider.as_ref(), &cfg, "billing stripe", &RetrieveOptions::default()).unwrap();
+        let hidden = retrieve(
+            &store,
+            provider.as_ref(),
+            &cfg,
+            "billing stripe",
+            &RetrieveOptions::default(),
+        )
+        .unwrap();
         assert!(hidden.memories.is_empty());
 
-        let opts = RetrieveOptions { include_stale: true, ..Default::default() };
+        let opts = RetrieveOptions {
+            include_stale: true,
+            ..Default::default()
+        };
         let shown = retrieve(&store, provider.as_ref(), &cfg, "billing stripe", &opts).unwrap();
         assert_eq!(shown.memories.len(), 1);
         assert_eq!(shown.memories[0].score.staleness_penalty, 1.0);
@@ -649,16 +821,78 @@ mod tests {
     fn pinned_memory_outranks_equal_unpinned() {
         let (store, provider, cfg) = setup();
         // Two equally relevant memories; pin the second.
-        add(&store, provider.as_ref(), &cfg, "billing detail alpha for stripe", vec![]);
-        let pinned_id = add(&store, provider.as_ref(), &cfg, "billing detail bravo for stripe", vec![]);
+        add(
+            &store,
+            provider.as_ref(),
+            &cfg,
+            "billing detail alpha for stripe",
+            vec![],
+        );
+        let pinned_id = add(
+            &store,
+            provider.as_ref(),
+            &cfg,
+            "billing detail bravo for stripe",
+            vec![],
+        );
         store.set_pinned(&pinned_id, true).unwrap();
 
-        let pack = retrieve(&store, provider.as_ref(), &cfg, "billing stripe", &RetrieveOptions::default()).unwrap();
+        let pack = retrieve(
+            &store,
+            provider.as_ref(),
+            &cfg,
+            "billing stripe",
+            &RetrieveOptions::default(),
+        )
+        .unwrap();
         assert_eq!(pack.memories[0].item.id, pinned_id);
         assert_eq!(pack.memories[0].score.pinned_boost, 1.0);
     }
 
-    fn add_chat_turn(store: &Store, provider: &dyn EmbeddingProvider, cfg: &Config, text: &str, session: &str) -> String {
+    #[test]
+    fn low_importance_relevant_memory_survives_candidate_recall() {
+        let (store, provider, cfg) = setup();
+        let relevant_id = add(
+            &store,
+            provider.as_ref(),
+            &cfg,
+            "coffee grinder burr setting",
+            vec![],
+        );
+        let mut relevant = store.get_memory(&relevant_id).unwrap().unwrap();
+        relevant.importance_score = 0.05;
+        store.update_memory(&relevant).unwrap();
+
+        for i in 0..60 {
+            let id = add(
+                &store,
+                provider.as_ref(),
+                &cfg,
+                &format!("unrelated archival note number {i}"),
+                vec![],
+            );
+            let mut item = store.get_memory(&id).unwrap().unwrap();
+            item.importance_score = 1.0;
+            store.update_memory(&item).unwrap();
+        }
+
+        let opts = RetrieveOptions {
+            top_k: 1,
+            candidate_pool_size: 10,
+            ..Default::default()
+        };
+        let pack = retrieve(&store, provider.as_ref(), &cfg, "coffee grinder", &opts).unwrap();
+        assert_eq!(pack.memories[0].item.id, relevant_id);
+        assert!(pack.memories[0].score.relevance > 0.0);
+    }
+
+    fn add_chat_turn(
+        store: &Store,
+        provider: &dyn EmbeddingProvider,
+        cfg: &Config,
+        text: &str,
+        session: &str,
+    ) -> String {
         let mut bloom = warm_bloom(store).unwrap();
         let out = ingest(
             store,
@@ -681,18 +915,57 @@ mod tests {
     #[test]
     fn min_score_gates_weak_matches() {
         let (store, provider, cfg) = setup();
-        add(&store, provider.as_ref(), &cfg, "the cat sleeps on the windowsill every afternoon", vec![]);
+        add(
+            &store,
+            provider.as_ref(),
+            &cfg,
+            "the cat sleeps on the windowsill every afternoon",
+            vec![],
+        );
 
-        let open = retrieve(&store, provider.as_ref(), &cfg, "plot perfect billing stripe", &RetrieveOptions::default()).unwrap();
+        let open = retrieve(
+            &store,
+            provider.as_ref(),
+            &cfg,
+            "plot perfect billing stripe",
+            &RetrieveOptions::default(),
+        )
+        .unwrap();
         assert_eq!(open.memories.len(), 1, "no gate: weak match still returned");
 
-        let gated_opts = RetrieveOptions { min_score: 0.4, ..Default::default() };
-        let gated = retrieve(&store, provider.as_ref(), &cfg, "plot perfect billing stripe", &gated_opts).unwrap();
-        assert!(gated.memories.is_empty(), "an unrelated memory must not pass the gate");
+        let gated_opts = RetrieveOptions {
+            min_score: 0.4,
+            ..Default::default()
+        };
+        let gated = retrieve(
+            &store,
+            provider.as_ref(),
+            &cfg,
+            "plot perfect billing stripe",
+            &gated_opts,
+        )
+        .unwrap();
+        assert!(
+            gated.memories.is_empty(),
+            "an unrelated memory must not pass the gate"
+        );
 
         // A direct hit still clears the same gate.
-        add(&store, provider.as_ref(), &cfg, "plot perfect billing runs on stripe invoices", vec![]);
-        let hit = retrieve(&store, provider.as_ref(), &cfg, "plot perfect billing stripe", &gated_opts).unwrap();
+        add(
+            &store,
+            provider.as_ref(),
+            &cfg,
+            "plot perfect billing runs on stripe invoices",
+            vec![],
+        );
+        let hit = retrieve(
+            &store,
+            provider.as_ref(),
+            &cfg,
+            "plot perfect billing stripe",
+            &gated_opts,
+        )
+        .unwrap();
         assert_eq!(hit.memories.len(), 1);
         assert!(hit.memories[0].item.content.contains("billing"));
     }
@@ -700,10 +973,25 @@ mod tests {
     #[test]
     fn excluded_session_memories_are_skipped() {
         let (store, provider, cfg) = setup();
-        add_chat_turn(&store, provider.as_ref(), &cfg, "standup moved to nine thirty", "live");
-        add_chat_turn(&store, provider.as_ref(), &cfg, "standup notes go in the wiki", "old");
+        add_chat_turn(
+            &store,
+            provider.as_ref(),
+            &cfg,
+            "standup moved to nine thirty",
+            "live",
+        );
+        add_chat_turn(
+            &store,
+            provider.as_ref(),
+            &cfg,
+            "standup notes go in the wiki",
+            "old",
+        );
 
-        let opts = RetrieveOptions { exclude_session: Some("live".to_string()), ..Default::default() };
+        let opts = RetrieveOptions {
+            exclude_session: Some("live".to_string()),
+            ..Default::default()
+        };
         let pack = retrieve(&store, provider.as_ref(), &cfg, "standup", &opts).unwrap();
         assert_eq!(pack.memories.len(), 1);
         assert!(pack.memories[0].item.content.contains("wiki"));
@@ -713,25 +1001,74 @@ mod tests {
     fn conversational_turns_are_damped() {
         let (store, provider, cfg) = setup();
         // The same fact as a verbatim chat turn and as a distilled memory.
-        add_chat_turn(&store, provider.as_ref(), &cfg, "billing for plot perfect runs on stripe", "old");
-        add(&store, provider.as_ref(), &cfg, "plot perfect billing runs on stripe invoices", vec![]);
+        add_chat_turn(
+            &store,
+            provider.as_ref(),
+            &cfg,
+            "billing for plot perfect runs on stripe",
+            "old",
+        );
+        add(
+            &store,
+            provider.as_ref(),
+            &cfg,
+            "plot perfect billing runs on stripe invoices",
+            vec![],
+        );
 
-        let opts = RetrieveOptions { conversational_damping: 0.5, ..Default::default() };
-        let pack = retrieve(&store, provider.as_ref(), &cfg, "plot perfect billing stripe", &opts).unwrap();
+        let opts = RetrieveOptions {
+            conversational_damping: 0.5,
+            ..Default::default()
+        };
+        let pack = retrieve(
+            &store,
+            provider.as_ref(),
+            &cfg,
+            "plot perfect billing stripe",
+            &opts,
+        )
+        .unwrap();
 
-        let turn = pack.memories.iter().find(|m| m.item.memory_type == MemoryType::Episodic).unwrap();
-        let fact = pack.memories.iter().find(|m| m.item.memory_type == MemoryType::Semantic).unwrap();
+        let turn = pack
+            .memories
+            .iter()
+            .find(|m| m.item.memory_type == MemoryType::Episodic)
+            .unwrap();
+        let fact = pack
+            .memories
+            .iter()
+            .find(|m| m.item.memory_type == MemoryType::Semantic)
+            .unwrap();
         assert_eq!(turn.score.conversational_damping, 0.5);
-        assert_eq!(fact.score.conversational_damping, 1.0, "distilled memories are never damped");
-        assert!(fact.score.total > turn.score.total, "the distilled fact must outrank the verbatim turn");
+        assert_eq!(
+            fact.score.conversational_damping, 1.0,
+            "distilled memories are never damped"
+        );
+        assert!(
+            fact.score.total > turn.score.total,
+            "the distilled fact must outrank the verbatim turn"
+        );
         assert_eq!(pack.memories[0].item.id, fact.item.id);
     }
 
     #[test]
     fn session_tags_do_not_leak_into_keyword_overlap() {
         let (store, provider, cfg) = setup();
-        add_chat_turn(&store, provider.as_ref(), &cfg, "the deploy finished cleanly", "abc123");
-        let pack = retrieve(&store, provider.as_ref(), &cfg, "session abc123", &RetrieveOptions::default()).unwrap();
+        add_chat_turn(
+            &store,
+            provider.as_ref(),
+            &cfg,
+            "the deploy finished cleanly",
+            "abc123",
+        );
+        let pack = retrieve(
+            &store,
+            provider.as_ref(),
+            &cfg,
+            "session abc123",
+            &RetrieveOptions::default(),
+        )
+        .unwrap();
         // Without the skip, keyword overlap alone would contribute 0.3
         // (both query tokens match the tag parts). Allow a little noise
         // from hashed-BoW collisions, but nowhere near that.
@@ -745,57 +1082,154 @@ mod tests {
     #[test]
     fn debug_mode_reports_near_misses() {
         let (store, provider, cfg) = setup();
-        add(&store, provider.as_ref(), &cfg, "plot perfect billing runs on stripe invoices", vec![]);
-        add(&store, provider.as_ref(), &cfg, "the cat sleeps on the windowsill every afternoon", vec![]);
+        add(
+            &store,
+            provider.as_ref(),
+            &cfg,
+            "plot perfect billing runs on stripe invoices",
+            vec![],
+        );
+        add(
+            &store,
+            provider.as_ref(),
+            &cfg,
+            "the cat sleeps on the windowsill every afternoon",
+            vec![],
+        );
 
-        let opts = RetrieveOptions { min_score: 0.4, debug: true, ..Default::default() };
-        let pack = retrieve(&store, provider.as_ref(), &cfg, "plot perfect billing stripe", &opts).unwrap();
+        let opts = RetrieveOptions {
+            min_score: 0.4,
+            debug: true,
+            ..Default::default()
+        };
+        let pack = retrieve(
+            &store,
+            provider.as_ref(),
+            &cfg,
+            "plot perfect billing stripe",
+            &opts,
+        )
+        .unwrap();
         assert_eq!(pack.memories.len(), 1);
         assert_eq!(pack.min_score, 0.4);
-        assert_eq!(pack.near_misses.len(), 1, "the weak match shows up as a near-miss");
+        assert_eq!(
+            pack.near_misses.len(),
+            1,
+            "the weak match shows up as a near-miss"
+        );
         assert!(pack.near_misses[0].item.content.contains("cat"));
         assert!(pack.near_misses[0].score.total < 0.4);
 
         // Without debug, near-misses stay private.
-        let quiet = RetrieveOptions { min_score: 0.4, ..Default::default() };
-        let pack = retrieve(&store, provider.as_ref(), &cfg, "plot perfect billing stripe", &quiet).unwrap();
+        let quiet = RetrieveOptions {
+            min_score: 0.4,
+            ..Default::default()
+        };
+        let pack = retrieve(
+            &store,
+            provider.as_ref(),
+            &cfg,
+            "plot perfect billing stripe",
+            &quiet,
+        )
+        .unwrap();
         assert!(pack.near_misses.is_empty());
     }
 
     #[test]
     fn type_and_time_filters_restrict_candidates() {
         let (store, provider, cfg) = setup();
-        let id = add(&store, provider.as_ref(), &cfg, "standup is at nine thirty", vec![]);
+        let id = add(
+            &store,
+            provider.as_ref(),
+            &cfg,
+            "standup is at nine thirty",
+            vec![],
+        );
 
         let wrong_type = RetrieveOptions {
             memory_types: Some(vec![MemoryType::Preference]),
             ..Default::default()
         };
-        assert!(retrieve(&store, provider.as_ref(), &cfg, "standup", &wrong_type).unwrap().memories.is_empty());
+        assert!(
+            retrieve(&store, provider.as_ref(), &cfg, "standup", &wrong_type)
+                .unwrap()
+                .memories
+                .is_empty()
+        );
 
         let right_type = RetrieveOptions {
             memory_types: Some(vec![MemoryType::Semantic]),
             ..Default::default()
         };
-        assert_eq!(retrieve(&store, provider.as_ref(), &cfg, "standup", &right_type).unwrap().memories[0].item.id, id);
+        assert_eq!(
+            retrieve(&store, provider.as_ref(), &cfg, "standup", &right_type)
+                .unwrap()
+                .memories[0]
+                .item
+                .id,
+            id
+        );
 
-        let future_only = RetrieveOptions { since: Some(now_unix() + 1000), ..Default::default() };
-        assert!(retrieve(&store, provider.as_ref(), &cfg, "standup", &future_only).unwrap().memories.is_empty());
+        let future_only = RetrieveOptions {
+            since: Some(now_unix() + 1000),
+            ..Default::default()
+        };
+        assert!(
+            retrieve(&store, provider.as_ref(), &cfg, "standup", &future_only)
+                .unwrap()
+                .memories
+                .is_empty()
+        );
 
-        let past_window = RetrieveOptions { until: Some(now_unix() + 1000), ..Default::default() };
-        assert_eq!(retrieve(&store, provider.as_ref(), &cfg, "standup", &past_window).unwrap().memories.len(), 1);
+        let past_window = RetrieveOptions {
+            until: Some(now_unix() + 1000),
+            ..Default::default()
+        };
+        assert_eq!(
+            retrieve(&store, provider.as_ref(), &cfg, "standup", &past_window)
+                .unwrap()
+                .memories
+                .len(),
+            1
+        );
     }
 
     #[test]
     fn spreading_activation_boosts_associated_memories() {
         let (store, provider, mut cfg) = setup();
         // A memory that matches the query, and an unrelated one that does not.
-        let _hit = add(&store, provider.as_ref(), &cfg, "the standup is at nine thirty on mondays", vec![]);
-        let companion = add(&store, provider.as_ref(), &cfg, "the sprint demo is on friday afternoon", vec![]);
+        let _hit = add(
+            &store,
+            provider.as_ref(),
+            &cfg,
+            "the standup is at nine thirty on mondays",
+            vec![],
+        );
+        let companion = add(
+            &store,
+            provider.as_ref(),
+            &cfg,
+            "the sprint demo is on friday afternoon",
+            vec![],
+        );
 
         // Without an edge, the companion gets no boost.
-        let base = retrieve(&store, provider.as_ref(), &cfg, "standup time", &RetrieveOptions::default()).unwrap();
-        let base_companion = base.memories.iter().find(|m| m.item.id == companion).unwrap().score.total;
+        let base = retrieve(
+            &store,
+            provider.as_ref(),
+            &cfg,
+            "standup time",
+            &RetrieveOptions::default(),
+        )
+        .unwrap();
+        let base_companion = base
+            .memories
+            .iter()
+            .find(|m| m.item.id == companion)
+            .unwrap()
+            .score
+            .total;
 
         // Associate them (as if they'd been retrieved together before) and
         // enable spreading activation.
@@ -812,9 +1246,23 @@ mod tests {
             .unwrap();
         cfg.spreading_activation = true;
 
-        let spread = retrieve(&store, provider.as_ref(), &cfg, "standup time", &RetrieveOptions::default()).unwrap();
-        let boosted = spread.memories.iter().find(|m| m.item.id == companion).unwrap();
-        assert!(boosted.score.association_boost > 0.0, "companion should gain an association boost");
+        let spread = retrieve(
+            &store,
+            provider.as_ref(),
+            &cfg,
+            "standup time",
+            &RetrieveOptions::default(),
+        )
+        .unwrap();
+        let boosted = spread
+            .memories
+            .iter()
+            .find(|m| m.item.id == companion)
+            .unwrap();
+        assert!(
+            boosted.score.association_boost > 0.0,
+            "companion should gain an association boost"
+        );
         assert!(
             boosted.score.total > base_companion,
             "spreading activation should raise the companion's total ({} vs {})",
@@ -826,9 +1274,27 @@ mod tests {
     #[test]
     fn multi_hop_surfaces_linked_memories_below_direct_hits() {
         let (store, provider, mut cfg) = setup();
-        let hit = add(&store, provider.as_ref(), &cfg, "the standup is at nine thirty on mondays", vec![]);
-        let mid = add(&store, provider.as_ref(), &cfg, "the sprint demo is on friday afternoon", vec![]);
-        let far = add(&store, provider.as_ref(), &cfg, "we ordered pizza for the team retro lunch", vec![]);
+        let hit = add(
+            &store,
+            provider.as_ref(),
+            &cfg,
+            "the standup is at nine thirty on mondays",
+            vec![],
+        );
+        let mid = add(
+            &store,
+            provider.as_ref(),
+            &cfg,
+            "the sprint demo is on friday afternoon",
+            vec![],
+        );
+        let far = add(
+            &store,
+            provider.as_ref(),
+            &cfg,
+            "we ordered pizza for the team retro lunch",
+            vec![],
+        );
 
         let edge = |a: &str, b: &str| forgetfuldb_store::MemoryEdge {
             src_id: a.min(b).to_string(),
@@ -847,16 +1313,36 @@ mod tests {
 
         // One hop: only the direct neighbor is reached; far gets nothing.
         cfg.spreading.max_hops = 1;
-        let one = retrieve(&store, provider.as_ref(), &cfg, "standup time", &RetrieveOptions::default()).unwrap();
+        let one = retrieve(
+            &store,
+            provider.as_ref(),
+            &cfg,
+            "standup time",
+            &RetrieveOptions::default(),
+        )
+        .unwrap();
         let far_one = one.memories.iter().find(|m| m.item.id == far).unwrap();
-        assert_eq!(far_one.score.association_boost, 0.0, "two hops away gets nothing at max_hops=1");
+        assert_eq!(
+            far_one.score.association_boost, 0.0,
+            "two hops away gets nothing at max_hops=1"
+        );
 
         // Two hops: far is reached and lifted — but never above the direct hit.
         cfg.spreading.max_hops = 2;
-        let two = retrieve(&store, provider.as_ref(), &cfg, "standup time", &RetrieveOptions::default()).unwrap();
+        let two = retrieve(
+            &store,
+            provider.as_ref(),
+            &cfg,
+            "standup time",
+            &RetrieveOptions::default(),
+        )
+        .unwrap();
         let far_two = two.memories.iter().find(|m| m.item.id == far).unwrap();
         let hit_two = two.memories.iter().find(|m| m.item.id == hit).unwrap();
-        assert!(far_two.score.association_boost > 0.0, "the 2-hop memory is reached and boosted");
+        assert!(
+            far_two.score.association_boost > 0.0,
+            "the 2-hop memory is reached and boosted"
+        );
         assert!(
             hit_two.score.total > far_two.score.total,
             "the direct hit must still outrank the traversed-in memory ({} vs {})",
@@ -868,9 +1354,27 @@ mod tests {
     #[test]
     fn subgraph_injection_renders_connection_paths() {
         let (store, provider, mut cfg) = setup();
-        let hit = add(&store, provider.as_ref(), &cfg, "the standup is at nine thirty on mondays", vec![]);
-        let mid = add(&store, provider.as_ref(), &cfg, "the sprint demo is on friday afternoon", vec![]);
-        let far = add(&store, provider.as_ref(), &cfg, "we ordered pizza for the team retro lunch", vec![]);
+        let hit = add(
+            &store,
+            provider.as_ref(),
+            &cfg,
+            "the standup is at nine thirty on mondays",
+            vec![],
+        );
+        let mid = add(
+            &store,
+            provider.as_ref(),
+            &cfg,
+            "the sprint demo is on friday afternoon",
+            vec![],
+        );
+        let far = add(
+            &store,
+            provider.as_ref(),
+            &cfg,
+            "we ordered pizza for the team retro lunch",
+            vec![],
+        );
 
         // Directional sequence edges: hit → mid → far (a reasoning path).
         let seq = |a: &str, b: &str| forgetfuldb_store::MemoryEdge {
@@ -890,29 +1394,73 @@ mod tests {
         cfg.spreading.max_hops = 2;
         cfg.spreading.inject_subgraph = true;
 
-        let pack = retrieve(&store, provider.as_ref(), &cfg, "standup time", &RetrieveOptions::default()).unwrap();
+        let pack = retrieve(
+            &store,
+            provider.as_ref(),
+            &cfg,
+            "standup time",
+            &RetrieveOptions::default(),
+        )
+        .unwrap();
         let sg = pack.subgraph.as_ref().expect("a subgraph is injected");
         // The full chain is one maximal path; the hit→mid prefix is folded in.
         assert!(
-            sg.paths.iter().any(|p| p.nodes == vec![hit.clone(), mid.clone(), far.clone()]),
+            sg.paths
+                .iter()
+                .any(|p| p.nodes == vec![hit.clone(), mid.clone(), far.clone()]),
             "the 2-hop chain is a path"
         );
-        assert!(!sg.paths.iter().any(|p| p.nodes == vec![hit.clone(), mid.clone()]), "the prefix path is dropped");
+        assert!(
+            !sg.paths
+                .iter()
+                .any(|p| p.nodes == vec![hit.clone(), mid.clone()]),
+            "the prefix path is dropped"
+        );
 
         let rendered = pack.render_subgraph().expect("renders to text");
-        assert!(rendered.contains("led to"), "sequence edges render as 'led to': {rendered}");
-        assert!(rendered.contains("pizza"), "the far memory's snippet appears: {rendered}");
+        assert!(
+            rendered.contains("led to"),
+            "sequence edges render as 'led to': {rendered}"
+        );
+        assert!(
+            rendered.contains("pizza"),
+            "the far memory's snippet appears: {rendered}"
+        );
     }
 
     #[test]
     fn subgraph_injects_connective_memories_beyond_top_k() {
         let (store, provider, mut cfg) = setup();
-        let hit = add(&store, provider.as_ref(), &cfg, "the standup is at nine thirty on mondays", vec![]);
-        let b = add(&store, provider.as_ref(), &cfg, "office plants need watering on tuesdays", vec![]);
-        let c = add(&store, provider.as_ref(), &cfg, "the parking garage closes at midnight", vec![]);
+        let hit = add(
+            &store,
+            provider.as_ref(),
+            &cfg,
+            "the standup is at nine thirty on mondays",
+            vec![],
+        );
+        let b = add(
+            &store,
+            provider.as_ref(),
+            &cfg,
+            "office plants need watering on tuesdays",
+            vec![],
+        );
+        let c = add(
+            &store,
+            provider.as_ref(),
+            &cfg,
+            "the parking garage closes at midnight",
+            vec![],
+        );
         // Noise so a top_k=1 flat result excludes b and c.
         for i in 0..5 {
-            add(&store, provider.as_ref(), &cfg, &format!("filler memory number {i} about nothing in particular"), vec![]);
+            add(
+                &store,
+                provider.as_ref(),
+                &cfg,
+                &format!("filler memory number {i} about nothing in particular"),
+                vec![],
+            );
         }
         let seq = |a: &str, d: &str| forgetfuldb_store::MemoryEdge {
             src_id: a.to_string(),
@@ -932,7 +1480,10 @@ mod tests {
         cfg.spreading.inject_subgraph = true;
 
         // Flat top-k is just the hit; the chain's other links aren't top-k.
-        let opts = RetrieveOptions { top_k: 1, ..Default::default() };
+        let opts = RetrieveOptions {
+            top_k: 1,
+            ..Default::default()
+        };
         let pack = retrieve(&store, provider.as_ref(), &cfg, "standup time", &opts).unwrap();
 
         let ids: HashSet<&str> = pack.memories.iter().map(|m| m.item.id.as_str()).collect();
@@ -941,15 +1492,33 @@ mod tests {
             ids.contains(b.as_str()) && ids.contains(c.as_str()),
             "the connective memories are injected past top_k=1"
         );
-        assert!(pack.memories.len() > opts.top_k, "subgraph injection grows the result beyond top_k");
-        assert!(pack.render_subgraph().unwrap().contains("led to"), "the chain renders");
+        assert!(
+            pack.memories.len() > opts.top_k,
+            "subgraph injection grows the result beyond top_k"
+        );
+        assert!(
+            pack.render_subgraph().unwrap().contains("led to"),
+            "the chain renders"
+        );
     }
 
     #[test]
     fn no_subgraph_unless_opted_in() {
         let (store, provider, mut cfg) = setup();
-        let a = add(&store, provider.as_ref(), &cfg, "alpha standup note", vec![]);
-        let b = add(&store, provider.as_ref(), &cfg, "bravo unrelated note", vec![]);
+        let a = add(
+            &store,
+            provider.as_ref(),
+            &cfg,
+            "alpha standup note",
+            vec![],
+        );
+        let b = add(
+            &store,
+            provider.as_ref(),
+            &cfg,
+            "bravo unrelated note",
+            vec![],
+        );
         store
             .upsert_edge(&forgetfuldb_store::MemoryEdge {
                 src_id: a.clone().min(b.clone()),
@@ -962,8 +1531,18 @@ mod tests {
             })
             .unwrap();
         cfg.spreading_activation = true; // boosts on, but subgraph off
-        let pack = retrieve(&store, provider.as_ref(), &cfg, "standup", &RetrieveOptions::default()).unwrap();
-        assert!(pack.subgraph.is_none(), "no subgraph unless inject_subgraph is set");
+        let pack = retrieve(
+            &store,
+            provider.as_ref(),
+            &cfg,
+            "standup",
+            &RetrieveOptions::default(),
+        )
+        .unwrap();
+        assert!(
+            pack.subgraph.is_none(),
+            "no subgraph unless inject_subgraph is set"
+        );
     }
 
     #[test]
@@ -971,17 +1550,42 @@ mod tests {
         let (store, provider, mut cfg) = setup();
         cfg.contradiction.enabled = true;
         cfg.contradiction.candidate_min_sim = 0.5; // hashed_bow range
-        let old = add(&store, provider.as_ref(), &cfg, "the main database runs on Postgres", vec!["db".into()]);
-        let new = add(&store, provider.as_ref(), &cfg, "the main database migrated from Postgres to SQLite", vec!["db".into()]);
+        let old = add(
+            &store,
+            provider.as_ref(),
+            &cfg,
+            "the main database runs on Postgres",
+            vec!["db".into()],
+        );
+        let new = add(
+            &store,
+            provider.as_ref(),
+            &cfg,
+            "the main database migrated from Postgres to SQLite",
+            vec!["db".into()],
+        );
         // Age `old` so it's clearly older.
         let mut m = store.get_memory(&old).unwrap().unwrap();
         m.created_at = now_unix() - 10 * 86_400;
         store.update_memory(&m).unwrap();
 
-        let pack = retrieve(&store, provider.as_ref(), &cfg, "what database do we use", &RetrieveOptions::default()).unwrap();
+        let pack = retrieve(
+            &store,
+            provider.as_ref(),
+            &cfg,
+            "what database do we use",
+            &RetrieveOptions::default(),
+        )
+        .unwrap();
         let ids: Vec<&str> = pack.memories.iter().map(|m| m.item.id.as_str()).collect();
-        assert!(ids.contains(&new.as_str()), "the current (newest) memory stays");
-        assert!(!ids.contains(&old.as_str()), "the superseded one is dropped from this turn");
+        assert!(
+            ids.contains(&new.as_str()),
+            "the current (newest) memory stays"
+        );
+        assert!(
+            !ids.contains(&old.as_str()),
+            "the superseded one is dropped from this turn"
+        );
         assert_eq!(pack.resolved_conflicts.len(), 1);
         assert_eq!(pack.resolved_conflicts[0].dropped_id, old);
         // Query-scoped: the store row is NOT staled (offline/tool does that).
@@ -993,23 +1597,58 @@ mod tests {
         let (store, provider, mut cfg) = setup();
         cfg.contradiction.enabled = true;
         cfg.contradiction.candidate_min_sim = 0.5;
-        let a = add(&store, provider.as_ref(), &cfg, "I really prefer drinking coffee in the morning", vec!["drinks".into()]);
-        let b = add(&store, provider.as_ref(), &cfg, "I really prefer drinking tea in the morning", vec!["drinks".into()]);
+        let a = add(
+            &store,
+            provider.as_ref(),
+            &cfg,
+            "I really prefer drinking coffee in the morning",
+            vec!["drinks".into()],
+        );
+        let b = add(
+            &store,
+            provider.as_ref(),
+            &cfg,
+            "I really prefer drinking tea in the morning",
+            vec!["drinks".into()],
+        );
         let mut m = store.get_memory(&a).unwrap().unwrap();
         m.created_at = now_unix() - 10 * 86_400;
         store.update_memory(&m).unwrap();
 
-        let pack = retrieve(&store, provider.as_ref(), &cfg, "what do I drink", &RetrieveOptions::default()).unwrap();
+        let pack = retrieve(
+            &store,
+            provider.as_ref(),
+            &cfg,
+            "what do I drink",
+            &RetrieveOptions::default(),
+        )
+        .unwrap();
         let ids: Vec<&str> = pack.memories.iter().map(|m| m.item.id.as_str()).collect();
-        assert!(ids.contains(&a.as_str()) && ids.contains(&b.as_str()), "no cue → both coexist, nothing dropped");
+        assert!(
+            ids.contains(&a.as_str()) && ids.contains(&b.as_str()),
+            "no cue → both coexist, nothing dropped"
+        );
         assert!(pack.resolved_conflicts.is_empty());
     }
 
     #[test]
     fn retrieval_touches_access_metadata() {
         let (store, provider, cfg) = setup();
-        let id = add(&store, provider.as_ref(), &cfg, "remember the standup is at nine", vec![]);
-        retrieve(&store, provider.as_ref(), &cfg, "standup time", &RetrieveOptions::default()).unwrap();
+        let id = add(
+            &store,
+            provider.as_ref(),
+            &cfg,
+            "remember the standup is at nine",
+            vec![],
+        );
+        retrieve(
+            &store,
+            provider.as_ref(),
+            &cfg,
+            "standup time",
+            &RetrieveOptions::default(),
+        )
+        .unwrap();
         let item = store.get_memory(&id).unwrap().unwrap();
         assert_eq!(item.access_count, 1);
         assert!(item.last_accessed_at.is_some());
@@ -1019,8 +1658,20 @@ mod tests {
     fn epoch_ordinal_restricts_retrieval_to_that_era() {
         let (store, provider, cfg) = setup();
         let now = now_unix();
-        let old = add(&store, provider.as_ref(), &cfg, "the gardening project notes from the early era", vec![]);
-        let recent = add(&store, provider.as_ref(), &cfg, "the database migration notes from the current era", vec![]);
+        let old = add(
+            &store,
+            provider.as_ref(),
+            &cfg,
+            "the gardening project notes from the early era",
+            vec![],
+        );
+        let recent = add(
+            &store,
+            provider.as_ref(),
+            &cfg,
+            "the database migration notes from the current era",
+            vec![],
+        );
         // Age `old` into the past; `recent` stays at now.
         let mut m = store.get_memory(&old).unwrap().unwrap();
         m.created_at = now - 40 * 86_400;
@@ -1061,12 +1712,21 @@ mod tests {
             provider.as_ref(),
             &cfg,
             "notes",
-            &RetrieveOptions { epoch_ordinal: Some(0), ..Default::default() },
+            &RetrieveOptions {
+                epoch_ordinal: Some(0),
+                ..Default::default()
+            },
         )
         .unwrap();
         let ids0: Vec<&str> = pack0.memories.iter().map(|m| m.item.id.as_str()).collect();
-        assert!(ids0.contains(&old.as_str()), "era 0 query returns the old-era memory");
-        assert!(!ids0.contains(&recent.as_str()), "era 0 query excludes the current-era memory");
+        assert!(
+            ids0.contains(&old.as_str()),
+            "era 0 query returns the old-era memory"
+        );
+        assert!(
+            !ids0.contains(&recent.as_str()),
+            "era 0 query excludes the current-era memory"
+        );
 
         // Querying era 1 returns only the current-era memory.
         let pack1 = retrieve(
@@ -1074,7 +1734,10 @@ mod tests {
             provider.as_ref(),
             &cfg,
             "notes",
-            &RetrieveOptions { epoch_ordinal: Some(1), ..Default::default() },
+            &RetrieveOptions {
+                epoch_ordinal: Some(1),
+                ..Default::default()
+            },
         )
         .unwrap();
         let ids1: Vec<&str> = pack1.memories.iter().map(|m| m.item.id.as_str()).collect();

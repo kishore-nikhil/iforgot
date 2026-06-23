@@ -56,6 +56,110 @@ it can be made exact.
 
 ---
 
+## The adaptive-memory model (importance as an emergent property)
+
+The six mechanisms above describe what happens to a memory *over its
+lifetime*. A separate concern — call it **V2**, in flight on the
+`memory-fixes` branch — governs how a memory is *born and valued* in the
+first place: ingestion, scoring, and the retrieval gate. Its thesis is a
+direct reaction to the brittlest part of a naive memory layer:
+
+> **Importance is not a score you assign once at write time. It emerges —
+> from evidence, recurrence, graph structure, correction, and decay — and it
+> must never gate recall.**
+
+A one-time importance score is wrong twice: it is guessed before the engine
+has seen how a fact is actually used, and once it is low it suppresses a
+memory the user may turn out to need. V2 replaces it with five moves.
+
+### 1. Relevance-first, two-stage retrieval
+Recall and ranking are split so importance can inform *ranking* without ever
+blocking *recall*:
+- **Stage 1 — candidate recall (relevance only).** A wide pool
+  (≈ `max(50, 10·k)`) scored purely by
+  `0.70·semantic + 0.20·keyword + 0.10·entity`. No importance, decay,
+  recurrence, or age penalty is allowed to keep a semantically relevant
+  memory *out of the pool*.
+- **Stage 2 — final ranking.** The pool is re-scored with
+  `0.60·relevance + 0.15·recency + 0.10·importance + 0.10·recurrence +
+  0.05·graph_support + pin − staleness`. Importance is a **tie-breaker and a
+  retention signal, not a recall gate** — a low-importance but on-topic
+  memory still surfaces.
+
+This is the most consequential shift: the old single formula folded
+importance into one blended score, so an unimportant-but-relevant memory
+could be buried by importance alone. (Tested: a 0.05-importance on-topic
+memory still wins recall against 60 high-importance distractors.)
+
+### 2. Evidence accumulation
+Importance is recomputed from an append-only **evidence log**, not edited in
+place. Each event — explicit "remember", user confirmation, correction,
+cross-session / cross-day recurrence, *accepted* retrieval, theme / graph
+support, LLM-auditor support — is a typed, weighted, sourced row. The rule
+that matters: **retrieval count alone must not raise importance** — only
+*accepted* or *successful* reuse counts, so a memory repeatedly pulled and
+ignored does not enshrine itself. Correction is the strong negative signal
+(`0.40·correction_count`), able to suppress or rewrite.
+
+### 3. Recurrence ≠ raw frequency
+Word repetition inside one pasted blob is weak evidence; the same fact
+recurring across sessions and days is strong. Recurrence is scored as
+`0.10·log1p(raw) + 0.25·log1p(sessions) + 0.35·log1p(distinct_days) +
+0.20·context_diversity + 0.10·log1p(accepted_reuse)`, with source-type
+normalization (code / logs contribute nothing to personal memory; a pasted
+document is discounted; conversation counts fully).
+
+### 4. The memory lifecycle
+A message does not become a durable memory by default — it produces
+*evidence candidates* that earn their way up:
+`raw_input → candidate evidence → weak → reinforced → consolidated durable →
+decayed / archived / forgotten`. A deterministic extractor (regex / cue
+based, no model) emits typed candidates each with a **confidence**, and a
+confidence gate decides the route: accept the parse, store as weak evidence,
+or escalate to a sparse LLM auditor — the LLM a bounded booster, never
+per-message and never the sole authority.
+
+### 5. Long input is a source, not a flood
+A pasted article or log is not dozens of high-importance memories. Long /
+code / log input is classified by an input-mode heuristic, stored as a
+**source document** + chunks (entities / topics / summary), pinned to low
+importance, and only *later* promoted to durable claims if consolidation
+finds support (explicit remember, repetition outside the source, successful
+retrieval, or a strong link to an existing cluster).
+
+The throughline matches the rest of the engine: **deterministic floor first,
+LLM as a sparse booster**, every signal inspectable, importance *earned
+through use* rather than guessed once. The lightweight per-session
+`ConversationFrame` (active topics / entities / location / project) is the
+deterministic seed of the working-memory tier specced in
+[evolving-context.md](evolving-context.md) — the same idea, one tier up.
+
+### Status: wired vs. stubbed
+V2 is a partial build — the scoring spine is real and tested, but several
+producers that feed it are not yet connected, so parts of the math currently
+run on inputs that are zero. Honest accounting:
+
+| Piece | Status |
+| --- | --- |
+| Two-stage relevance-first retrieval | ✅ wired + tested |
+| Recurrence rewrite (log1p + source normalization) | ✅ wired + tested |
+| Evidence-derived importance (`refresh_importance`) | ✅ wired + tested |
+| Deterministic extractor + input-mode classifier | ✅ wired + tested |
+| Long input → source document + chunks | ✅ wired + tested |
+| Evidence **emission** | 🟡 only 3 of 12 types emitted, all at ingest |
+| Retrieval-feedback evidence (`RetrievalSuccess`) | ❌ not emitted → `accepted_reuse` term is always 0 |
+| Confidence-gate **routing** | 🟡 confidence computed, routing not enforced — every ingest still becomes durable |
+| Conversation frame (cross-turn scope) | ⚠️ struct only; callers pass `None` |
+| Session themes; prediction / outcome snapshots | 🟡 tables + store methods exist, never called |
+| Chunk → durable-memory promotion | ❌ chunks stored, no promotion pass |
+| Dynamic cue learning; LLM auditor; lifecycle-state machine | ○ not started |
+
+The actionable issue list (open evidence loop, gate enforcement, per-query
+`list_edges` cost, untracked migration) lives in
+[HANDOFF.md](HANDOFF.md).
+
+---
+
 ## What's implemented today
 
 ### Decay (`forgetfuldb-core::decay`)
@@ -217,6 +321,13 @@ Ordered by the critical path. Each is specced enough to build cleanly.
 > contradiction detection** (items 1–5 below) now ship — see "What's
 > implemented today". The remaining critical path starts at **goal-conditioned
 > retrieval**.
+>
+> ⏳ **In flight (parallel track):** the **V2 adaptive-memory model** above —
+> relevance-first retrieval + emergent importance. Its scoring spine is wired
+> and tested; completing it (close the evidence loop, enforce the confidence
+> gate, connect the headless producers) is the immediate priority *before* the
+> new mechanisms below, since it changes how every memory is born and ranked.
+> The operational checklist is in [HANDOFF.md](HANDOFF.md) → "What's next".
 
 1. ~~**Foundation tier**~~ — *shipped.* Decay-exempt trait memories
    *concluded* by consolidation from accumulated habit evidence ("user

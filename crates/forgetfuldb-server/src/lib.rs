@@ -443,6 +443,7 @@ async fn uiconfig_handler(State(state): State<SharedState>) -> Result<Json<serde
             "importance": w.importance,
             "recurrence": w.recurrence,
             "recency": w.recency,
+            "graph_support": w.graph_support,
             "pinned_boost": w.pinned_boost,
             "staleness_penalty": w.staleness_penalty,
         },

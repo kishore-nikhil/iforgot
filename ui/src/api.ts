@@ -78,10 +78,12 @@ export interface GraphResponse {
 }
 
 export interface ScoreBreakdown {
+  relevance?: number;
   semantic_similarity: number;
   importance: number;
   recurrence: number;
   recency: number;
+  graph_support?: number;
   pinned_boost: number;
   staleness_penalty: number;
   conversational_damping: number;
@@ -121,6 +123,7 @@ export interface UiConfig {
     importance: number;
     recurrence: number;
     recency: number;
+    graph_support: number;
     pinned_boost: number;
     staleness_penalty: number;
   };

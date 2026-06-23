@@ -109,6 +109,11 @@ nightly consolidate run):
    session topic guess + accumulated entities + first user message.
    New `working_memory` table; injection next to the memory block;
    retrieval query uses it. Ship behind `[chat] working_memory = true`.
+   *Seed already exists:* the V2 `core::types::ConversationFrame` (active
+   topics / entities / location / project / intent) is the deterministic
+   per-session scope object this tier needs — currently defined but unwired
+   (every caller passes `None`). Populating it across turns is the first half
+   of this phase. See [HANDOFF.md](HANDOFF.md) → V2 pipeline.
 2. **LLM summarizer** (roadmap item 2): `Summarizer` impl backed by
    Ollama; abstractive rolling summary with a fixed token budget;
    fact/preference extraction at session end. The background
