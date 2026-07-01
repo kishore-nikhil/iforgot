@@ -98,6 +98,10 @@ pub struct Config {
     pub chat: ChatConfig,
     /// Tool integration settings (shell execution and future tools).
     pub tools: ToolsConfig,
+    /// Tier-2 surprise-segmentation parameters. Drives both epoch boundaries
+    /// and temporal event summaries via `forgetfuldb-segment`.
+    #[serde(default)]
+    pub segmentation: SegmentConfig,
 }
 
 /// Settings for the pluggable tool interface.
@@ -334,13 +338,11 @@ pub struct ConsolidationThresholds {
     pub topic_refine_enabled: bool,
     /// Cosine at/above which two memories join the same topic cluster.
     pub topic_cluster_sim: f64,
-    /// Epoch segmentation: cosine *distance* from an era's centroid above
-    /// which a memory counts as "drifting" toward a new era.
-    pub epoch_drift_threshold: f64,
-    /// Consecutive drifting memories needed to actually cut an epoch boundary
-    /// (hysteresis — a one-off tangent shouldn't start an era).
-    pub epoch_hysteresis_runs: usize,
     /// A closed era must hold at least this many memories…
+    ///
+    /// Epoch *boundaries* are found by `forgetfuldb-segment` (see
+    /// `[segmentation]`); these two knobs are the adapter-level guard that
+    /// merges away micro-eras the surprise segmenter may produce.
     pub epoch_min_size: usize,
     /// …and span at least this many days. Together they prevent micro-eras.
     pub epoch_min_days: f64,
@@ -360,11 +362,78 @@ impl Default for ConsolidationThresholds {
             burst_min_size: 4,
             topic_refine_enabled: true,
             topic_cluster_sim: 0.6,
-            epoch_drift_threshold: 0.35,
-            epoch_hysteresis_runs: 3,
             epoch_min_size: 4,
             epoch_min_days: 5.0,
         }
+    }
+}
+
+/// Which predictor the tier-2 surprise segmenter uses to form its expectation
+/// of the next embedding. Selected by name in `[segmentation]`; because it is a
+/// typed enum, an unknown string is a **load error**, not a runtime surprise
+/// (FR-7 / V-9). See `docs/surprise-segmentation.md`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PredictorKind {
+    /// Flat mean of the prior window.
+    Centroid,
+    /// Exponential recency weighting — tracks a moving center (the default).
+    #[default]
+    Weighted,
+    /// Linear trajectory extrapolation. Stubbed; falls back to weighted.
+    Extrapolate,
+}
+
+/// Tier-2 embedding-space surprise segmentation parameters (the
+/// `forgetfuldb-segment` crate). Boundaries are found by recency-weighted
+/// prediction error against a rolling `μ + γσ` threshold. See
+/// `docs/surprise-segmentation.md`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SegmentConfig {
+    /// `W`: how many prior entries the predictor sees.
+    pub window_size: usize,
+    /// Which predictor forms the expected next embedding.
+    pub predictor: PredictorKind,
+    /// Exponential decay for the weighted predictor, in `(0, 1]`.
+    pub weight_decay: f64,
+    /// `τ`: trailing window for the `μ/σ` rolling threshold.
+    pub threshold_window: usize,
+    /// `γ`: std-devs above the local mean that mark a boundary.
+    pub gamma: f64,
+    /// `±` positions refinement may shift a cut.
+    pub refine_radius: usize,
+    /// Minimum entries per event.
+    pub min_event_len: usize,
+}
+
+impl Default for SegmentConfig {
+    fn default() -> Self {
+        SegmentConfig {
+            window_size: 8,
+            predictor: PredictorKind::Weighted,
+            weight_decay: 0.5,
+            threshold_window: 16,
+            gamma: 1.0,
+            refine_radius: 3,
+            min_event_len: 2,
+        }
+    }
+}
+
+impl SegmentConfig {
+    /// Reject out-of-range values at config load (V-9). The `predictor` string
+    /// is already validated by serde (unknown variant → error).
+    pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(self.window_size > 0, "[segmentation] window_size must be > 0");
+        anyhow::ensure!(self.threshold_window > 0, "[segmentation] threshold_window must be > 0");
+        anyhow::ensure!(self.gamma >= 0.0, "[segmentation] gamma must be >= 0");
+        anyhow::ensure!(self.min_event_len > 0, "[segmentation] min_event_len must be > 0");
+        anyhow::ensure!(
+            self.weight_decay > 0.0 && self.weight_decay <= 1.0,
+            "[segmentation] weight_decay must be in (0, 1]"
+        );
+        Ok(())
     }
 }
 
@@ -401,6 +470,7 @@ impl Default for Config {
             local_only: true,
             chat: ChatConfig::default(),
             tools: ToolsConfig::default(),
+            segmentation: SegmentConfig::default(),
         }
     }
 }
@@ -408,7 +478,17 @@ impl Default for Config {
 impl Config {
     pub fn load(path: &Path) -> anyhow::Result<Config> {
         let raw = std::fs::read_to_string(path)?;
-        Ok(toml::from_str(&raw)?)
+        let cfg: Config = toml::from_str(&raw)?;
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
+    /// Reject configs that parse but hold out-of-range values. Called from
+    /// [`Config::load`]. Central hook for cross-block invariants; today it
+    /// validates `[segmentation]` (V-9).
+    pub fn validate(&self) -> anyhow::Result<()> {
+        self.segmentation.validate()?;
+        Ok(())
     }
 
     /// Load `path` if it exists, otherwise return defaults.
@@ -423,17 +503,6 @@ impl Config {
     pub fn save(&self, path: &Path) -> anyhow::Result<()> {
         std::fs::write(path, toml::to_string_pretty(self)?)?;
         Ok(())
-    }
-
-    /// Epoch segmentation parameters assembled from the consolidation knobs.
-    pub fn epoch_params(&self) -> crate::epochs::EpochParams {
-        let t = &self.consolidation_thresholds;
-        crate::epochs::EpochParams {
-            drift_threshold: t.epoch_drift_threshold,
-            hysteresis_runs: t.epoch_hysteresis_runs,
-            min_size: t.epoch_min_size,
-            min_days: t.epoch_min_days,
-        }
     }
 
     /// Decay lambdas assembled from the individual config fields.
@@ -582,6 +651,56 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    fn write_cfg(body: &str) -> PathBuf {
+        let dir = temp_dir("seg");
+        let path = dir.join("forgetfuldb.toml");
+        std::fs::write(&path, body).unwrap();
+        path
+    }
+
+    // ── V-9: config loading ──────────────────────────────────────────────
+    #[test]
+    fn segmentation_defaults_load_when_block_absent() {
+        // A config with no [segmentation] block still yields the defaults.
+        let path = write_cfg("name = \"x\"\n");
+        let cfg = Config::load(&path).unwrap();
+        assert_eq!(cfg.segmentation.window_size, 8);
+        assert_eq!(cfg.segmentation.predictor, PredictorKind::Weighted);
+        assert_eq!(cfg.segmentation.gamma, 1.0);
+    }
+
+    #[test]
+    fn unknown_predictor_fails_at_load() {
+        let path = write_cfg("[segmentation]\npredictor = \"bogus\"\n");
+        let err = Config::load(&path).expect_err("unknown predictor must fail at load");
+        let msg = err.to_string().to_lowercase();
+        assert!(msg.contains("predictor") || msg.contains("bogus") || msg.contains("unknown variant"), "clear error, got: {msg}");
+    }
+
+    #[test]
+    fn out_of_range_segmentation_is_rejected() {
+        for bad in [
+            "[segmentation]\ngamma = -1.0\n",
+            "[segmentation]\nwindow_size = 0\n",
+            "[segmentation]\nthreshold_window = 0\n",
+            "[segmentation]\nmin_event_len = 0\n",
+            "[segmentation]\nweight_decay = 0.0\n",
+            "[segmentation]\nweight_decay = 1.5\n",
+        ] {
+            let path = write_cfg(bad);
+            assert!(Config::load(&path).is_err(), "should reject config: {bad:?}");
+        }
+    }
+
+    #[test]
+    fn valid_segmentation_overrides_load() {
+        let path = write_cfg("[segmentation]\npredictor = \"centroid\"\ngamma = 2.0\nwindow_size = 5\n");
+        let cfg = Config::load(&path).unwrap();
+        assert_eq!(cfg.segmentation.predictor, PredictorKind::Centroid);
+        assert_eq!(cfg.segmentation.gamma, 2.0);
+        assert_eq!(cfg.segmentation.window_size, 5);
     }
 
     #[test]

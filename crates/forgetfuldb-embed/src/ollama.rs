@@ -87,6 +87,12 @@ impl EmbeddingProvider for OllamaEmbeddings {
         "ollama"
     }
 
+    /// Fold in the concrete model name so `embeddinggemma` and
+    /// `nomic-embed-text` are distinguishable provenance, not both `"ollama"`.
+    fn model_id(&self) -> String {
+        format!("ollama:{}", self.model)
+    }
+
     fn dim(&self) -> usize {
         self.dim
     }

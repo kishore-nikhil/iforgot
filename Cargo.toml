@@ -4,6 +4,7 @@ members = [
     "crates/forgetfuldb-core",
     "crates/forgetfuldb-prob",
     "crates/forgetfuldb-embed",
+    "crates/forgetfuldb-segment",
     "crates/forgetfuldb-store",
     "crates/forgetfuldb-retrieve",
     "crates/forgetfuldb-consolidate",
@@ -43,6 +44,7 @@ rustyline = "14"
 forgetfuldb-core = { path = "crates/forgetfuldb-core" }
 forgetfuldb-prob = { path = "crates/forgetfuldb-prob" }
 forgetfuldb-embed = { path = "crates/forgetfuldb-embed" }
+forgetfuldb-segment = { path = "crates/forgetfuldb-segment" }
 forgetfuldb-store = { path = "crates/forgetfuldb-store" }
 forgetfuldb-retrieve = { path = "crates/forgetfuldb-retrieve" }
 forgetfuldb-consolidate = { path = "crates/forgetfuldb-consolidate" }
