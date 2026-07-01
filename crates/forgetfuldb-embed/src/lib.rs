@@ -27,6 +27,16 @@ pub trait EmbeddingProvider: Send + Sync {
     fn name(&self) -> &'static str;
     fn dim(&self) -> usize;
     fn embed(&self, text: &str) -> Vec<f32>;
+
+    /// Stable identity of the embedding **space** — enough to tell two models
+    /// within the same backend apart (`name()` alone can't: every Ollama model
+    /// reports `"ollama"`). Used as segmentation provenance (FR-8): boundaries
+    /// are only comparable within one embedding space. Kept consistent with the
+    /// `META_EMBED_MODEL` identity the store records for the dimension-mismatch
+    /// guard. Default is `"<name>:<dim>"`; backends with a model name override.
+    fn model_id(&self) -> String {
+        format!("{}:{}", self.name(), self.dim())
+    }
 }
 
 /// Deterministic placeholder embedding: each token is hashed into one of

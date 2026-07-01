@@ -111,3 +111,16 @@ cluster_min_size = 3             # topic cluster size that earns a summary
 promote_min_access_count = 3     # accesses before episodic -> semantic
 archive_max_decay = 0.05         # decay score below which raw events archive
 prune_sample_size = 5            # reservoir sample kept when pruning
+
+# Tier-2 embedding-space surprise segmentation (forgetfuldb-segment).
+# Finds where the memory stream shifts to a new "era" from prediction error
+# against a rolling window — no LLM. Drives both epoch boundaries and temporal
+# event summaries. See docs/surprise-segmentation.md.
+[segmentation]
+window_size = 8          # W: prior entries the predictor sees
+predictor = "weighted"   # "centroid" | "weighted" | "extrapolate"
+weight_decay = 0.5       # exponential recency decay for the weighted predictor
+threshold_window = 16    # tau: trailing window for the mu/sigma threshold
+gamma = 1.0              # std-devs above local mean that mark a boundary
+refine_radius = 3        # +/- positions refinement may shift a cut
+min_event_len = 2        # minimum entries per event

@@ -391,6 +391,7 @@ dependencies = [
  "forgetfuldb-core",
  "forgetfuldb-embed",
  "forgetfuldb-prob",
+ "forgetfuldb-segment",
  "forgetfuldb-store",
  "serde",
 ]
@@ -430,6 +431,14 @@ dependencies = [
  "forgetfuldb-store",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "forgetfuldb-segment"
+version = "0.1.0"
+dependencies = [
+ "forgetfuldb-core",
+ "forgetfuldb-embed",
 ]
 
 [[package]]

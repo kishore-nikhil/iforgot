@@ -712,8 +712,14 @@ fn refresh_importance(
     Ok(())
 }
 
-/// Group active episodic memories by topic; clusters big enough get an
-/// extractive summary stored as a semantic memory linked `derived_from`.
+/// Summarize contiguous **temporal events** of episodic memory into semantic
+/// gist memories. Replaces topic-string grouping with tier-2 surprise
+/// segmentation ([`forgetfuldb_segment`]): a stretch of episodic experience
+/// that hangs together in time and embedding space becomes one summary, rather
+/// than every same-topic memory across all time collapsing together. Events run
+/// over the survivors of `collapse_bursts` (which ran earlier and deleted its
+/// members), so a burst is never summarized twice. See
+/// `docs/surprise-segmentation.md` §9.
 fn summarize_clusters(
     store: &Store,
     summarizer: &dyn Summarizer,
@@ -721,18 +727,25 @@ fn summarize_clusters(
     now: i64,
     report: &mut ConsolidationReport,
 ) -> Result<()> {
+    use forgetfuldb_segment::segment_with_embeddings;
+
     let min_size = cfg.consolidation_thresholds.cluster_min_size;
-    let mut clusters: HashMap<String, Vec<MemoryItem>> = HashMap::new();
-    for item in store.list_memories(Some(MemoryType::Episodic))? {
-        if item.stale {
-            continue;
-        }
-        if let Some(topic) = &item.topic {
-            clusters.entry(topic.clone()).or_default().push(item);
-        }
+    let mut items: Vec<MemoryItem> = store
+        .list_memories(Some(MemoryType::Episodic))?
+        .into_iter()
+        .filter(|m| !m.stale && m.embedding.is_some())
+        .collect();
+    items.sort_by_key(|m| m.created_at);
+    retain_modal_embedding_dim(&mut items);
+    if items.len() < min_size {
+        return Ok(());
     }
 
-    for (topic, members) in clusters {
+    let embs: Vec<Vec<f32>> = items.iter().map(|m| m.embedding.clone().unwrap()).collect();
+    let events = segment_with_embeddings(&embs, &cfg.segmentation, None).events;
+
+    for ev in &events {
+        let members = &items[ev.start..ev.end];
         if members.len() < min_size {
             continue;
         }
@@ -754,7 +767,7 @@ fn summarize_clusters(
             now,
         );
         item.summary = Some(summary);
-        item.topic = Some(topic.clone());
+        item.topic = modal_topic(members);
         item.source = Some("consolidation".to_string());
         item.importance_score = members
             .iter()
@@ -764,7 +777,7 @@ fn summarize_clusters(
         item.recurrence_score = (members.len() as f64 / 10.0).min(1.0);
         item.decay_score = item.importance_score;
         store.insert_memory(&item)?;
-        for member in &members {
+        for member in members {
             store.insert_link(&MemoryLink {
                 source_id: item.id.clone(),
                 target_id: member.id.clone(),
@@ -778,6 +791,29 @@ fn summarize_clusters(
         report.clusters_summarized += 1;
     }
     Ok(())
+}
+
+/// The most common non-empty `topic` among an event's members (deterministic:
+/// ties break alphabetically). Used to label a temporal summary now that
+/// summaries are no longer grouped by a single topic string.
+fn modal_topic(members: &[MemoryItem]) -> Option<String> {
+    let mut topics: Vec<&str> = members.iter().filter_map(|m| m.topic.as_deref()).collect();
+    if topics.is_empty() {
+        return None;
+    }
+    topics.sort_unstable();
+    let (mut best, mut best_n) = ("", 0usize);
+    let mut i = 0;
+    while i < topics.len() {
+        let t = topics[i];
+        let n = topics[i..].iter().take_while(|&&x| x == t).count();
+        if n > best_n {
+            best_n = n;
+            best = t;
+        }
+        i += n;
+    }
+    Some(best.to_string())
 }
 
 /// Episodic memories rehearsed often enough graduate to semantic memory
@@ -937,17 +973,21 @@ fn same_epoch(starts: &[i64], a: i64, b: i64) -> bool {
     starts.is_empty() || epoch_index_at(starts, a) == epoch_index_at(starts, b)
 }
 
-/// Segment the surviving timeline into drift-bounded eras and persist them.
-/// The model has no clock, so the engine computes the eras: windowed
-/// embedding-centroid drift with hysteresis ([`forgetfuldb_core::epochs`]).
-/// Each era is labeled with an extractive summary of its most-salient members.
+/// Segment the surviving timeline into eras and persist them. The model has no
+/// clock, so the engine computes the eras: tier-2 embedding-space *surprise*
+/// segmentation ([`forgetfuldb_segment`]) finds the boundaries, and this
+/// adapter turns its index ranges into stored `Epoch` rows — re-imposing the
+/// `epoch_min_size` / `epoch_min_days` guard the surprise segmenter is (by
+/// design) time-agnostic about. Each era is labeled with an extractive summary
+/// of its most-salient members. See `docs/surprise-segmentation.md` §8.
 fn segment_epochs(
     store: &Store,
     summarizer: &dyn Summarizer,
     cfg: &Config,
     report: &mut ConsolidationReport,
 ) -> Result<()> {
-    use forgetfuldb_core::epochs::{segment, EpochPoint};
+    use forgetfuldb_core::epochs::centroid_of;
+    use forgetfuldb_segment::segment_with_embeddings;
 
     // Active, embedded memories in time order define the era stream. Archives
     // (de-emphasized) and unembedded rows don't shape an era's identity.
@@ -957,47 +997,116 @@ fn segment_epochs(
         .filter(|m| m.memory_type != MemoryType::Archive && m.embedding.is_some())
         .collect();
     items.sort_by_key(|m| m.created_at);
+    // Boundaries are only comparable within one embedding space (FR-8): keep a
+    // single-dimension cohort so a half-finished re-embed can't mix spaces.
+    retain_modal_embedding_dim(&mut items);
     if items.is_empty() {
         store.replace_epochs(&[])?;
         return Ok(());
     }
 
-    let points: Vec<EpochPoint> = items
-        .iter()
-        .map(|m| EpochPoint {
-            created_at: m.created_at,
-            embedding: m.embedding.clone().unwrap(),
-        })
-        .collect();
-    let spans = segment(&points, &cfg.epoch_params());
+    let embs: Vec<Vec<f32>> = items.iter().map(|m| m.embedding.clone().unwrap()).collect();
+    let result = segment_with_embeddings(&embs, &cfg.segmentation, None);
 
-    // Spans partition the points contiguously, so walk members in lockstep.
-    let mut idx = 0usize;
-    let mut rows = Vec::with_capacity(spans.len());
-    for span in &spans {
-        let members = &items[idx..idx + span.member_count];
-        idx += span.member_count;
-        // Label/summary from the era's most-salient members — the gist of
-        // what that stretch of time was about.
+    // Re-impose the min-size / min-days guard (the segmenter is time-agnostic):
+    // absorb any event too small or too short to stand as its own era.
+    let events = merge_micro_eras(
+        &result.events,
+        &items,
+        cfg.consolidation_thresholds.epoch_min_size,
+        cfg.consolidation_thresholds.epoch_min_days,
+    );
+
+    let mut rows = Vec::with_capacity(events.len());
+    for (ordinal, ev) in events.iter().enumerate() {
+        let members = &items[ev.start..ev.end];
+        let member_embs: Vec<Vec<f32>> = members.iter().map(|m| m.embedding.clone().unwrap()).collect();
+        let started_at = members[0].created_at;
+        // Exclusive end = the first memory of the next era, or open for the last.
+        let ended_at = events.get(ordinal + 1).map(|next| items[next.start].created_at);
+        // Drift that opened this era = the surprise at its first entry (0 for
+        // the first era, which breaks from nothing).
+        let drift_in = if ordinal == 0 { 0.0 } else { result.surprise[ev.start] };
+
+        // Label/summary from the era's most-salient members — the gist of what
+        // that stretch of time was about.
         let mut top: Vec<&MemoryItem> = members.iter().collect();
         top.sort_by(|a, b| b.salience.total_cmp(&a.salience));
         let texts: Vec<&str> = top.iter().take(5).map(|m| m.content.as_str()).collect();
         let summary = summarizer.summarize(&texts);
         rows.push(forgetfuldb_store::Epoch {
-            id: new_id("epoch", &format!("{}-{}", span.ordinal, span.started_at)),
-            ordinal: span.ordinal as i64,
-            started_at: span.started_at,
-            ended_at: span.ended_at,
-            centroid: Some(span.centroid.clone()),
-            label: Some(format!("era {}", span.ordinal + 1)),
+            id: new_id("epoch", &format!("{}-{}", ordinal, started_at)),
+            ordinal: ordinal as i64,
+            started_at,
+            ended_at,
+            centroid: Some(centroid_of(&member_embs)),
+            label: Some(format!("era {}", ordinal + 1)),
             summary: (!summary.is_empty()).then_some(summary),
-            member_count: span.member_count as i64,
-            drift_in: span.drift_in,
+            member_count: members.len() as i64,
+            drift_in,
         });
     }
     store.replace_epochs(&rows)?;
-    report.epochs = spans.len();
+    report.epochs = rows.len();
     Ok(())
+}
+
+/// Keep only memories whose embedding has the most common dimensionality, so a
+/// partially-migrated store (mixed embedding models/dims) can't feed
+/// incomparable vectors into segmentation. Deterministic: ties break toward the
+/// larger dimension.
+fn retain_modal_embedding_dim(items: &mut Vec<MemoryItem>) {
+    let mut dims: Vec<usize> = items.iter().filter_map(|m| m.embedding.as_ref().map(|e| e.len())).collect();
+    if dims.is_empty() {
+        return;
+    }
+    dims.sort_unstable();
+    // Modal dim: longest run in the sorted list; tie → larger dim.
+    let (mut best_dim, mut best_count) = (dims[0], 0usize);
+    let mut i = 0;
+    while i < dims.len() {
+        let d = dims[i];
+        let j = dims[i..].iter().take_while(|&&x| x == d).count();
+        if j > best_count || (j == best_count && d > best_dim) {
+            best_count = j;
+            best_dim = d;
+        }
+        i += j;
+    }
+    items.retain(|m| m.embedding.as_ref().map(|e| e.len()) == Some(best_dim));
+}
+
+/// Absorb events too small (`< min_size` members) or too short (`< min_days`
+/// span) to stand as their own era into the following span, so the surprise
+/// segmenter's fine boundaries don't create micro-eras. The final (open) era is
+/// always kept even if small. Preserves contiguous `0..n` coverage.
+fn merge_micro_eras(
+    events: &[forgetfuldb_segment::Event],
+    items: &[MemoryItem],
+    min_size: usize,
+    min_days: f64,
+) -> Vec<forgetfuldb_segment::Event> {
+    use forgetfuldb_segment::Event;
+    if events.is_empty() {
+        return Vec::new();
+    }
+    let stands_alone = |ev: &Event| {
+        let count = ev.end - ev.start;
+        let days = age_days(items[ev.start].created_at, items[ev.end - 1].created_at);
+        count >= min_size && days >= min_days
+    };
+    let mut merged: Vec<Event> = Vec::new();
+    let mut cur = events[0];
+    for ev in &events[1..] {
+        if stands_alone(&cur) {
+            merged.push(cur);
+            cur = *ev;
+        } else {
+            cur.end = ev.end; // absorb the too-small era forward
+        }
+    }
+    merged.push(cur);
+    merged
 }
 
 /// Same-subject precision filter for contradiction candidacy: two memories
@@ -1626,6 +1735,11 @@ mod tests {
                                                                      // Tight on-topic points sit within the 0.92 dup angle; only collapse
                                                                      // true duplicates so the six-per-era stream survives to be segmented.
         cfg.consolidation_thresholds.duplicate_similarity = 0.999;
+        // The surprise segmenter needs `window_size` entries of warm-up before
+        // the first detectable boundary (FR-3). This 12-note fixture puts the
+        // A→B shift at index 6, so the default window of 8 would never see it —
+        // a smaller window suits the miniature stream (real streams are larger).
+        cfg.segmentation.window_size = 3;
 
         // Era A: six notes clustered near axis 0° (mutually similar but none a
         // duplicate), spread over ~10 days starting ~40 days ago.
