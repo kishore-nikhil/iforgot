@@ -13,3 +13,4 @@ serde_json = { workspace = true }
 forgetfuldb-core = { workspace = true }
 forgetfuldb-embed = { workspace = true }
 forgetfuldb-prob = { workspace = true }
+forgetfuldb-segment = { workspace = true }

@@ -333,6 +333,108 @@ pub fn chunk_source_text(text: &str, target_tokens: usize, overlap_tokens: usize
     out
 }
 
+/// What kind of large text this is — chosen only to pick a *splitting*
+/// strategy for [`atomize`], never stored as a label. Length already decides
+/// *whether* to atomize (see [`crate::types::InputMode::is_long_source`]); this
+/// decides *how*.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StructureHint {
+    /// Sentences / paragraphs.
+    Prose,
+    /// Code — split on blank-line blocks (functions, statements).
+    Code,
+    /// Logs — one atom per line (entries / stack frames).
+    Log,
+}
+
+/// Pick an atomization strategy from cheap structural cues. This is the *only*
+/// legitimate use of the old code/log markers: choosing how to split, not
+/// labeling the memory.
+pub fn structure_hint(text: &str) -> StructureHint {
+    let lower = text.to_lowercase();
+    let code = text.contains("```")
+        || lower.contains("fn ")
+        || lower.contains("function ")
+        || lower.contains("class ")
+        || lower.contains("import ")
+        || lower.contains("def ")
+        || (lower.contains('{') && lower.contains('}') && lower.contains(';'));
+    let log = lower.contains("stack trace")
+        || lower.contains("traceback")
+        || lower.contains("exception")
+        || (lower.matches(':').count() > 20 && text.lines().count() > 8);
+    if log {
+        StructureHint::Log
+    } else if code {
+        StructureHint::Code
+    } else {
+        StructureHint::Prose
+    }
+}
+
+/// Split large text into **atoms** — the fine units that are then embedded and
+/// grouped into coherent chunks by `forgetfuldb-segment`. Unlike
+/// [`chunk_source_text`] (fixed-size word windows), atoms respect natural
+/// boundaries so segmentation has real structure to work with. Deterministic;
+/// empty/whitespace input yields no atoms.
+pub fn atomize(text: &str, hint: StructureHint) -> Vec<String> {
+    let atoms = match hint {
+        StructureHint::Prose => atomize_prose(text),
+        StructureHint::Code => atomize_blocks(text),
+        StructureHint::Log => atomize_lines(text),
+    };
+    atoms
+        .into_iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| s.chars().any(|c| c.is_alphanumeric()))
+        .collect()
+}
+
+/// Sentence/paragraph split: break on `.?!` followed by whitespace, and on line
+/// breaks, so lists and headings become their own atoms too.
+fn atomize_prose(text: &str) -> Vec<String> {
+    let mut atoms = Vec::new();
+    let mut cur = String::new();
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\n' {
+            if !cur.trim().is_empty() {
+                atoms.push(std::mem::take(&mut cur));
+            }
+            cur.clear();
+            continue;
+        }
+        cur.push(ch);
+        let terminator = matches!(ch, '.' | '!' | '?');
+        let next_ws = chars.peek().map(|c| c.is_whitespace()).unwrap_or(true);
+        if terminator && next_ws {
+            atoms.push(std::mem::take(&mut cur));
+        }
+    }
+    if !cur.trim().is_empty() {
+        atoms.push(cur);
+    }
+    atoms
+}
+
+/// Blank-line-separated blocks; a block with no blank lines falls back to lines.
+fn atomize_blocks(text: &str) -> Vec<String> {
+    let blocks: Vec<String> = text
+        .split("\n\n")
+        .map(|b| b.trim().to_string())
+        .filter(|b| !b.is_empty())
+        .collect();
+    if blocks.len() <= 1 {
+        return atomize_lines(text);
+    }
+    blocks
+}
+
+/// One atom per non-blank line.
+fn atomize_lines(text: &str) -> Vec<String> {
+    text.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect()
+}
+
 /// Top-N tokens by frequency (ties broken alphabetically for determinism).
 /// This is the v1 "entity extraction": cheap local heuristics first, a
 /// real NER/LLM pass can replace it later behind the same signature.
@@ -430,6 +532,47 @@ mod tests {
         let kws = extract_keywords("the billing system and the billing invoices", 3);
         assert_eq!(kws[0], "billing");
         assert!(!kws.contains(&"the".to_string()));
+    }
+
+    #[test]
+    fn atomize_prose_splits_sentences() {
+        let atoms = atomize("The cat sat. Then the wolf ran! Did it stop? Yes.", StructureHint::Prose);
+        assert_eq!(atoms.len(), 4);
+        assert_eq!(atoms[0], "The cat sat.");
+        assert_eq!(atoms[2], "Did it stop?");
+    }
+
+    #[test]
+    fn atomize_prose_does_not_split_decimals_or_empties() {
+        // "3.14" has no space after the dot, so it stays whole; blank atoms drop.
+        let atoms = atomize("Pi is 3.14 today.\n\n   \nDone.", StructureHint::Prose);
+        assert_eq!(atoms, vec!["Pi is 3.14 today.", "Done."]);
+    }
+
+    #[test]
+    fn atomize_code_splits_on_blank_line_blocks() {
+        let code = "fn a() {\n  x;\n}\n\nfn b() {\n  y;\n}";
+        let atoms = atomize(code, StructureHint::Code);
+        assert_eq!(atoms.len(), 2);
+        assert!(atoms[1].contains("fn b()"));
+    }
+
+    #[test]
+    fn atomize_log_is_one_atom_per_line() {
+        let log = "ERROR boom\n\nWARN careful\n   \nINFO ok";
+        assert_eq!(atomize(log, StructureHint::Log), vec!["ERROR boom", "WARN careful", "INFO ok"]);
+    }
+
+    #[test]
+    fn structure_hint_detects_code_and_log() {
+        assert_eq!(structure_hint("fn main() { let x = 1; }"), StructureHint::Code);
+        assert_eq!(structure_hint("thread panicked: stack trace follows"), StructureHint::Log);
+        assert_eq!(structure_hint("Just an ordinary sentence about cats."), StructureHint::Prose);
+    }
+
+    #[test]
+    fn atomize_empty_yields_nothing() {
+        assert!(atomize("   \n\n  ", StructureHint::Prose).is_empty());
     }
 
     #[test]

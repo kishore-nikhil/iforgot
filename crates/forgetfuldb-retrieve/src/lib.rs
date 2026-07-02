@@ -543,6 +543,12 @@ pub fn retrieve(
     // `scored`, so it runs before the touch loop below.
     let subgraph = inject_subgraph(store, &mut scored, &reach, cfg)?;
 
+    // Gist-first descent: document-anchored hits swap their diluted
+    // whole-document text for the one staged chunk that actually matches the
+    // query. Runs after subgraph injection so injected connective memories
+    // (which can be gists) expand too.
+    expand_document_chunks(store, cfg, &query_embedding, &mut scored, now)?;
+
     // Retrieval counts as access: it slows future decay-driven cleanup.
     // Near-misses are NOT touched — looking at what almost matched must
     // not rehearse it.
@@ -559,6 +565,109 @@ pub fn retrieve(
         subgraph,
         resolved_conflicts,
     })
+}
+
+/// Gist-first descent — the read path for staged document chunks
+/// (`docs/large-text-ingest.md` §8.2). A final hit tagged `source_doc:<id>` is
+/// a document-level anchor (the durable gist or the verbatim blob) whose
+/// whole-document embedding is diluted; the actual answer usually lives in ONE
+/// chunk. Re-score the query against that document's still-alive staged chunks
+/// — a scoped cosine scan over stored vectors (tens of rows, not the corpus) —
+/// and substitute the best chunk's text when it out-matches the anchor itself.
+/// Directed and bounded, so unlike spreading activation it is always on.
+///
+/// Chunks that have decayed below the archive floor are treated as already
+/// gone, whether or not the consolidation prune pass has physically removed
+/// them — retrieval behavior must not depend on prune timing. Substitution is
+/// query-scoped (the pack, never the store) and recorded via an
+/// `expanded_chunk:<id>` tag so the promotion pass can later read "this chunk
+/// was actually used" off the pack.
+///
+/// Two guards keep this from misfiring:
+/// - **An absolute floor** (`chunk_match_min_sim`), not just "beats the
+///   anchor". Cosines are clamped to `[0, 1]` before comparing: an unclamped
+///   anchor score near a negative embedder floor (e.g. `hashed_bow`'s
+///   sign-hashed vectors) would let literal noise "beat" it and inject an
+///   unrelated chunk into the prompt.
+/// - **One document, one slot.** A document's gist and its verbatim blob can
+///   both be top-k hits; only the first (highest-ranked) is expanded, so the
+///   pack never spends two slots restating the same document.
+fn expand_document_chunks(
+    store: &Store,
+    cfg: &Config,
+    query_embedding: &[f32],
+    scored: &mut [RetrievedMemory],
+    now: i64,
+) -> Result<usize> {
+    let lambda = cfg.decay_lambdas().raw_event;
+    let floor = cfg.consolidation_thresholds.archive_max_decay;
+    let min_match = cfg.chunk_match_min_sim;
+    let mut used_chunks: HashSet<String> = HashSet::new();
+    let mut used_sources: HashSet<String> = HashSet::new();
+    let mut expanded = 0usize;
+
+    for hit in scored.iter_mut() {
+        let Some(source_id) = hit
+            .item
+            .tags
+            .iter()
+            .find_map(|t| t.strip_prefix("source_doc:").map(str::to_string))
+        else {
+            continue;
+        };
+        if used_sources.contains(&source_id) {
+            continue; // this document already claimed a slot via an earlier anchor
+        }
+        let anchor_cos = hit
+            .item
+            .embedding
+            .as_ref()
+            .map(|e| cosine_similarity(query_embedding, e) as f64)
+            .unwrap_or(0.0)
+            .clamp(0.0, 1.0);
+
+        let chunks = store.source_chunks(&source_id)?;
+        let mut best: Option<(f64, usize)> = None;
+        for (k, c) in chunks.iter().enumerate() {
+            if used_chunks.contains(&c.id) {
+                continue; // two anchors of one doc must not inject the same chunk twice
+            }
+            let Some(e) = &c.embedding else { continue };
+            let alive = decay::decay_score_resisted(
+                1.0,
+                lambda,
+                age_days(c.created_at, now),
+                false,
+                c.salience,
+                cfg.salience_resist,
+            ) >= floor;
+            if !alive {
+                continue;
+            }
+            let cos = cosine_similarity(query_embedding, e).clamp(0.0, 1.0) as f64;
+            if cos < min_match {
+                continue; // not a real match, however it compares to the anchor
+            }
+            if best.map(|(b, _)| cos > b).unwrap_or(true) {
+                best = Some((cos, k));
+            }
+        }
+
+        // The anchor routed us to the document; the chunk is the answer — but
+        // only when it genuinely matches the query better than the anchor does
+        // ("what is this doc about?" keeps the gist).
+        if let Some((cos, k)) = best {
+            if cos > anchor_cos {
+                let chunk = &chunks[k];
+                hit.item.content = chunk.text.clone();
+                hit.item.tags.push(format!("expanded_chunk:{}", chunk.id));
+                used_chunks.insert(chunk.id.clone());
+                used_sources.insert(source_id);
+                expanded += 1;
+            }
+        }
+    }
+    Ok(expanded)
 }
 
 /// "Default to latest" — the deterministic, LLM-free conflict floor. Among the
@@ -755,6 +864,192 @@ mod tests {
         )
         .unwrap();
         out.memory().id.clone()
+    }
+
+    #[test]
+    fn document_anchor_expands_to_the_matching_chunk() {
+        let (store, provider, mut cfg) = setup();
+        cfg.segmentation.window_size = 3;
+        // A long three-section doc: querying one section's detail should pull
+        // THAT chunk's text, not the diluted whole-document blob/gist.
+        let long = "# Notes\n\n".to_string()
+            + &"This section discusses embeddings recurrence and graph support in detail. ".repeat(30)
+            + &"Then we switch entirely to billing invoices and stripe payment refunds. ".repeat(30)
+            + &"Finally the topic moves to granite countertop kitchen installation quotes. ".repeat(30);
+        let mut bloom = warm_bloom(&store).unwrap();
+        ingest(
+            &store,
+            &mut bloom,
+            provider.as_ref(),
+            &cfg,
+            IngestRequest {
+                text: long,
+                source: None,
+                tags: vec![],
+                memory_type: None,
+                session_id: None,
+                role: None,
+            },
+        )
+        .unwrap();
+
+        let pack = retrieve(
+            &store,
+            provider.as_ref(),
+            &cfg,
+            "granite countertop installation quote",
+            &RetrieveOptions::default(),
+        )
+        .unwrap();
+
+        // Some document-anchored hit must have been expanded to the
+        // countertop chunk, and its content must now BE that chunk (not the
+        // multi-topic blob).
+        let expanded: Vec<_> = pack
+            .memories
+            .iter()
+            .filter(|m| m.item.tags.iter().any(|t| t.starts_with("expanded_chunk:")))
+            .collect();
+        assert!(!expanded.is_empty(), "a doc anchor should expand to a chunk");
+        let hit = expanded[0];
+        let content = hit.item.content.to_lowercase();
+        assert!(content.contains("countertop"), "expanded content must be the matching chunk");
+        assert!(
+            !content.contains("billing"),
+            "expansion must swap in ONE coherent chunk, not the whole document"
+        );
+    }
+
+    #[test]
+    fn off_topic_query_does_not_expand_into_noise() {
+        // Regression: an unclamped, floor-less comparison let a query with NO
+        // real overlap to the store "beat" a negative anchor cosine and
+        // substitute an arbitrary unrelated chunk. min_score=0.0 (the
+        // default) is deliberate — this bug fired precisely when nothing
+        // cleared the relevance gate.
+        let (store, provider, mut cfg) = setup();
+        cfg.segmentation.window_size = 3;
+        let long = "# Notes\n\n".to_string()
+            + &"This section discusses embeddings recurrence and graph support in detail. ".repeat(30)
+            + &"Then we switch entirely to billing invoices and stripe payment refunds. ".repeat(30)
+            + &"Finally the topic moves to granite countertop kitchen installation quotes. ".repeat(30);
+        let mut bloom = warm_bloom(&store).unwrap();
+        ingest(
+            &store,
+            &mut bloom,
+            provider.as_ref(),
+            &cfg,
+            IngestRequest {
+                text: long,
+                source: None,
+                tags: vec![],
+                memory_type: None,
+                session_id: None,
+                role: None,
+            },
+        )
+        .unwrap();
+
+        let pack = retrieve(
+            &store,
+            provider.as_ref(),
+            &cfg,
+            "quantum chess tournament in reykjavik next spring",
+            &RetrieveOptions::default(),
+        )
+        .unwrap();
+
+        for m in &pack.memories {
+            assert!(
+                !m.item.tags.iter().any(|t| t.starts_with("expanded_chunk:")),
+                "a query with no real overlap must not trigger chunk substitution, got: {}",
+                m.item.content
+            );
+        }
+    }
+
+    #[test]
+    fn one_document_never_occupies_two_expanded_slots() {
+        // Both the gist and the verbatim blob of the same document carry
+        // source_doc:<id> and can both be top-k hits; only one should expand.
+        let (store, provider, mut cfg) = setup();
+        cfg.segmentation.window_size = 3;
+        let long = "# Notes\n\n".to_string()
+            + &"This section discusses embeddings recurrence and graph support in detail. ".repeat(30)
+            + &"Then we switch entirely to billing invoices and stripe payment refunds. ".repeat(30)
+            + &"Finally the topic moves to granite countertop kitchen installation quotes. ".repeat(30);
+        let mut bloom = warm_bloom(&store).unwrap();
+        ingest(
+            &store,
+            &mut bloom,
+            provider.as_ref(),
+            &cfg,
+            IngestRequest {
+                text: long,
+                source: None,
+                tags: vec![],
+                memory_type: None,
+                session_id: None,
+                role: None,
+            },
+        )
+        .unwrap();
+
+        let pack = retrieve(
+            &store,
+            provider.as_ref(),
+            &cfg,
+            "granite countertop installation quote",
+            &RetrieveOptions { min_score: 0.0, top_k: 20, ..RetrieveOptions::default() },
+        )
+        .unwrap();
+
+        let expanded_count =
+            pack.memories.iter().filter(|m| m.item.tags.iter().any(|t| t.starts_with("expanded_chunk:"))).count();
+        assert!(expanded_count <= 1, "at most one slot per document should expand, got {expanded_count}");
+    }
+
+    #[test]
+    fn gist_survives_generic_doc_questions_unexpanded_or_matching() {
+        let (store, provider, mut cfg) = setup();
+        cfg.segmentation.window_size = 3;
+        let long = "# Notes\n\n".to_string()
+            + &"This section discusses embeddings recurrence and graph support in detail. ".repeat(30)
+            + &"Then we switch entirely to billing invoices and stripe payment refunds. ".repeat(30);
+        let mut bloom = warm_bloom(&store).unwrap();
+        ingest(
+            &store,
+            &mut bloom,
+            provider.as_ref(),
+            &cfg,
+            IngestRequest {
+                text: long,
+                source: None,
+                tags: vec![],
+                memory_type: None,
+                session_id: None,
+                role: None,
+            },
+        )
+        .unwrap();
+
+        // Unrelated query: no doc anchor should surface at all (or if one
+        // does, expansion must not fabricate a match — the pack stays sane).
+        let pack = retrieve(
+            &store,
+            provider.as_ref(),
+            &cfg,
+            "granite countertop kitchen quote",
+            &RetrieveOptions { min_score: 0.15, ..RetrieveOptions::default() },
+        )
+        .unwrap();
+        for m in &pack.memories {
+            let c = m.item.content.to_lowercase();
+            assert!(
+                !c.contains("countertop"),
+                "nothing in this store mentions countertops; expansion must not invent one"
+            );
+        }
     }
 
     #[test]

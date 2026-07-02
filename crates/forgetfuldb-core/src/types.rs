@@ -344,6 +344,15 @@ pub struct SourceChunk {
     pub summary: Option<String>,
     pub entities: Vec<String>,
     pub topics: Vec<String>,
+    /// The embedding this chunk was segmented on (the segment's member mean).
+    /// `None` for pre-0010 rows.
+    pub embedding: Option<Vec<f32>>,
+    /// Write-time salience (novelty x relevance) — how worth-remembering this
+    /// chunk is. Drives promotion and the chunk's decay rate.
+    pub salience: f64,
+    /// When the chunk was staged. Ages the chunk for the consolidation prune
+    /// pass (fast raw-event decay, resisted by salience). 0 = pre-lifecycle row.
+    pub created_at: i64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

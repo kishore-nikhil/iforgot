@@ -53,6 +53,14 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0009_memory_v2",
         include_str!("../migrations/0009_memory_v2.sql"),
     ),
+    (
+        "0010_source_chunk_salience",
+        include_str!("../migrations/0010_source_chunk_salience.sql"),
+    ),
+    (
+        "0011_source_chunk_lifecycle",
+        include_str!("../migrations/0011_source_chunk_lifecycle.sql"),
+    ),
 ];
 
 pub struct Store {
@@ -847,8 +855,8 @@ impl Store {
     pub fn insert_source_chunk(&self, chunk: &SourceChunk) -> Result<()> {
         self.conn.execute(
             "INSERT OR IGNORE INTO source_chunks
-                 (id, source_id, chunk_index, text, summary, entities, topics)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                 (id, source_id, chunk_index, text, summary, entities, topics, embedding, salience, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 chunk.id,
                 chunk.source_id,
@@ -857,8 +865,30 @@ impl Store {
                 chunk.summary,
                 serde_json::to_string(&chunk.entities)?,
                 serde_json::to_string(&chunk.topics)?,
+                chunk.embedding.as_deref().map(encode_embedding),
+                chunk.salience,
+                chunk.created_at,
             ],
         )?;
+        Ok(())
+    }
+
+    /// Every staged chunk across all source documents — the consolidation
+    /// prune pass ages each one and deletes what has faded.
+    pub fn all_source_chunks(&self) -> Result<Vec<SourceChunk>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, source_id, chunk_index, text, summary, entities, topics, embedding, salience, created_at
+             FROM source_chunks ORDER BY source_id, chunk_index",
+        )?;
+        let rows = stmt
+            .query_map([], row_to_source_chunk)?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    pub fn delete_source_chunk(&self, id: &str) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM source_chunks WHERE id = ?1", [id])?;
         Ok(())
     }
 
@@ -876,7 +906,7 @@ impl Store {
 
     pub fn source_chunks(&self, source_id: &str) -> Result<Vec<SourceChunk>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, source_id, chunk_index, text, summary, entities, topics
+            "SELECT id, source_id, chunk_index, text, summary, entities, topics, embedding, salience, created_at
              FROM source_chunks WHERE source_id = ?1 ORDER BY chunk_index",
         )?;
         let rows = stmt
@@ -1201,6 +1231,7 @@ fn row_to_source_chunk(row: &Row<'_>) -> rusqlite::Result<SourceChunk> {
     let entities: String = row.get(5)?;
     let topics: String = row.get(6)?;
     let chunk_index: i64 = row.get(2)?;
+    let embedding: Option<Vec<u8>> = row.get(7)?;
     Ok(SourceChunk {
         id: row.get(0)?,
         source_id: row.get(1)?,
@@ -1209,6 +1240,9 @@ fn row_to_source_chunk(row: &Row<'_>) -> rusqlite::Result<SourceChunk> {
         summary: row.get(4)?,
         entities: serde_json::from_str(&entities).unwrap_or_default(),
         topics: serde_json::from_str(&topics).unwrap_or_default(),
+        embedding: embedding.map(|b| decode_embedding(&b)),
+        salience: row.get::<_, f64>(8).unwrap_or(0.0),
+        created_at: row.get::<_, i64>(9).unwrap_or(0),
     })
 }
 
