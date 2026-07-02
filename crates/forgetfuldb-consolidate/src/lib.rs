@@ -51,6 +51,9 @@ pub struct ConsolidationReport {
     pub marked_stale: usize,
     pub archived: usize,
     pub deleted: usize,
+    /// Staged document chunks whose fast, salience-resisted decay fell below
+    /// the archive floor — the "fast decay, not drop" lifecycle completing.
+    pub chunks_pruned: usize,
     /// Provenance of every summary memory created this pass.
     pub summaries: Vec<forgetfuldb_store::SummaryProvenance>,
     /// Co-occurrence association edges rebuilt from chat history.
@@ -93,6 +96,7 @@ pub fn consolidate(
     mark_contradicted_stale(store, &mut report)?;
     revive_reasserted(store, cfg, &mut report)?;
     archive_and_prune(store, cfg, now, &mut report)?;
+    prune_source_chunks(store, cfg, now, &mut report)?;
 
     // Rebuild the association graph from scratch. Done last, after pruning,
     // so edges never point at deleted memories. Three distinct edge types,
@@ -1311,6 +1315,41 @@ fn mark_contradicted_stale(store: &Store, report: &mut ConsolidationReport) -> R
     Ok(())
 }
 
+/// The verbatim half of the fuzzy-trace split completing its lifecycle:
+/// staged document chunks age at the fast raw-event rate, **resisted by their
+/// salience** — a routine chunk fades in ~1-3 weeks, a novel one lasts months
+/// — and are deleted once below the archive floor. The document row (hash +
+/// summary) and the durable gist memory outlive the chunks: what remains is
+/// the memory of the document, not the document. Retrieval already treats
+/// below-floor chunks as gone (`expand_document_chunks`), so pruning here
+/// never changes query behavior — it only reclaims the rows. Legacy rows with
+/// `created_at = 0` predate the lifecycle (they were never readable) and are
+/// pruned on the first pass.
+fn prune_source_chunks(
+    store: &Store,
+    cfg: &Config,
+    now: i64,
+    report: &mut ConsolidationReport,
+) -> Result<()> {
+    let lambda = cfg.decay_lambdas().raw_event;
+    let floor = cfg.consolidation_thresholds.archive_max_decay;
+    for chunk in store.all_source_chunks()? {
+        let weight = decay::decay_score_resisted(
+            1.0,
+            lambda,
+            age_days(chunk.created_at, now),
+            false,
+            chunk.salience,
+            cfg.salience_resist,
+        );
+        if weight < floor {
+            store.delete_source_chunk(&chunk.id)?;
+            report.chunks_pruned += 1;
+        }
+    }
+    Ok(())
+}
+
 /// Forgetting proper: old, decayed, unpinned raw-event memories become
 /// archives; long-archived ones are deleted. A reservoir sample of pruned
 /// raw events survives as a single archive note, so the past is thinned,
@@ -2244,6 +2283,59 @@ mod tests {
         assert!(semantic
             .iter()
             .any(|m| m.source.as_deref() == Some("consolidation")));
+    }
+
+    #[test]
+    fn staged_chunks_decay_and_prune_by_salience() {
+        use forgetfuldb_core::types::{SourceChunk, SourceDocument, InputMode};
+
+        let (store, _provider, cfg) = setup();
+        let now = now_unix();
+        store
+            .insert_source_document(&SourceDocument {
+                id: "src-1".into(),
+                raw_text_hash: "h".into(),
+                source_type: InputMode::PastedDocument,
+                session_id: None,
+                summary: None,
+                entities: vec![],
+                topics: vec![],
+                created_at: now,
+            })
+            .unwrap();
+        let chunk = |id: &str, idx: usize, salience: f64, age_days: i64| SourceChunk {
+            id: id.into(),
+            source_id: "src-1".into(),
+            chunk_index: idx,
+            text: format!("chunk {idx}"),
+            summary: None,
+            entities: vec![],
+            topics: vec![],
+            embedding: Some(vec![1.0, 0.0]),
+            salience,
+            created_at: now - age_days * 86_400,
+        };
+        // Routine (low salience) and old → below the floor → pruned.
+        // (At λ_raw=0.35, resist=0.7: weight ≈ 0.002 at 20 days.)
+        store.insert_source_chunk(&chunk("c-routine-old", 0, 0.2, 20)).unwrap();
+        // Same age but highly salient → decay resisted → survives.
+        // (weight ≈ 0.10 at 20 days; even max salience hits the floor ~day 28 —
+        // salience buys the promotion window, the gist is what lasts forever.)
+        store.insert_source_chunk(&chunk("c-novel-old", 1, 0.95, 20)).unwrap();
+        // Routine but young → still above the floor → survives (fade, not drop).
+        store.insert_source_chunk(&chunk("c-routine-young", 2, 0.2, 1)).unwrap();
+
+        let report = consolidate(&store, &ExtractiveSummarizer::default(), &cfg).unwrap();
+        let left: Vec<String> = store
+            .source_chunks("src-1")
+            .unwrap()
+            .into_iter()
+            .map(|c| c.id)
+            .collect();
+        assert!(!left.contains(&"c-routine-old".to_string()), "old routine chunk must be pruned");
+        assert!(left.contains(&"c-novel-old".to_string()), "salience must resist chunk decay");
+        assert!(left.contains(&"c-routine-young".to_string()), "young chunks are faded, not dropped");
+        assert_eq!(report.chunks_pruned, 1);
     }
 
     #[test]

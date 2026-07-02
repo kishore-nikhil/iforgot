@@ -18,12 +18,12 @@ use anyhow::Result;
 use forgetfuldb_core::config::Config;
 use forgetfuldb_core::ids::new_id;
 use forgetfuldb_core::ingest::{
-    chunk_source_text, classify_input_mode, content_hash, extract_keywords,
-    extract_memory_candidates, guess_topic, initial_importance, normalize,
+    classify_input_mode, content_hash, extract_keywords, extract_memory_candidates, guess_topic,
+    initial_importance, normalize,
 };
 use forgetfuldb_core::types::{
-    EvidenceSource, EvidenceType, InputMode, MemoryCandidateType, MemoryEvidence, MemoryItem,
-    MemoryType, RawEvent, Session, SourceChunk, SourceDocument,
+    EvidenceSource, EvidenceType, InputMode, LinkRelation, MemoryCandidateType, MemoryEvidence,
+    MemoryItem, MemoryLink, MemoryType, RawEvent, Session, SourceChunk, SourceDocument,
 };
 use forgetfuldb_core::{age_days, decay, now_unix};
 use forgetfuldb_embed::EmbeddingProvider;
@@ -399,17 +399,21 @@ pub fn ingest(
         content_hash: hash.clone(),
     })?;
 
-    let source_document_id = if input_mode.is_long_source() {
-        Some(store_source_document(
+    let (source_document_id, gist_seed) = if input_mode.is_long_source() {
+        let (sid, seed) = store_source_document(
             store,
+            provider,
+            cfg,
+            &req.text,
             &text,
             &hash,
             input_mode,
             req.session_id.clone(),
             now,
-        )?)
+        )?;
+        (Some(sid), seed)
     } else {
-        None
+        (None, None)
     };
 
     let memory_type = req
@@ -452,6 +456,15 @@ pub fn ingest(
     item.embedding = Some(embedding);
 
     store.insert_memory(&item)?;
+    // The gist is finalized only AFTER the blob is committed: it must never be
+    // visible to the blob's own provisional_salience lookup above (scoring the
+    // blob's novelty against a summary derived from itself would be
+    // self-depression), and it needs the blob's real id for the DerivedFrom
+    // link. Fuzzy-trace: the durable gist is derived from this verbatim blob;
+    // the blob fades in days (raw-event lambda), the gist is what remains.
+    if let (Some(source_id), Some(seed)) = (&source_document_id, gist_seed) {
+        finalize_document_gist(store, bloom, provider, source_id, seed, &item.id, now)?;
+    }
     record_ingest_evidence(store, &item, &parse, req.session_id.clone(), now)?;
     bloom.insert(&hash);
     Ok(IngestOutcome::Stored(item))
@@ -517,14 +530,29 @@ fn v2_base_importance(
         .clamp(0.05, 1.0)
 }
 
+/// Stage a large paste: atomize → embed atoms → **surprise-segment** into
+/// coherent chunks (replacing fixed-size windows) → score each chunk's novelty
+/// vs. what's already stored, and persist the embedding + salience so the
+/// promotion pass can decide what graduates and low-salience chunks can decay
+/// fast rather than being dropped. Returns `(source_id, gist_seed)` — the seed
+/// is pure data (no DB write) for [`finalize_document_gist`], which the caller
+/// must run only AFTER the verbatim blob is committed (see the call site in
+/// [`ingest`] for why the ordering matters).
+#[allow(clippy::too_many_arguments)] // internal staging orchestration; args are cohesive
 fn store_source_document(
     store: &Store,
+    provider: &dyn EmbeddingProvider,
+    cfg: &Config,
+    raw_text: &str,
     text: &str,
     hash: &str,
     input_mode: InputMode,
     session_id: Option<String>,
     now: i64,
-) -> Result<String> {
+) -> Result<(String, Option<GistSeed>)> {
+    use forgetfuldb_core::ingest::{atomize, structure_hint, StructureHint};
+    use forgetfuldb_segment::segment_with_embeddings;
+
     let id = new_id("src", hash);
     let entities = extract_keywords(text, 16);
     let topics = entities.iter().take(5).cloned().collect::<Vec<_>>();
@@ -540,14 +568,39 @@ fn store_source_document(
         source_type: input_mode,
         session_id,
         summary,
-        entities,
+        entities: entities.clone(),
         topics,
         created_at: now,
     })?;
-    for (i, chunk_text) in chunk_source_text(text, 550, 80).into_iter().enumerate() {
+
+    // Atomize on natural boundaries — from the RAW text, because normalization
+    // collapses the newlines/blocks the atomizer (esp. code/log) depends on.
+    // The same hint picks the chunk-text join separator below: joining
+    // one-atom-per-line Log/Code atoms with a space would flatten a stack
+    // trace or a function body into one unreadable line.
+    let hint = structure_hint(raw_text);
+    let atoms = atomize(raw_text, hint);
+    if atoms.is_empty() {
+        return Ok((id, None));
+    }
+    let join_sep = if hint == StructureHint::Prose { " " } else { "\n" };
+    let atom_embs: Vec<Vec<f32>> = atoms.iter().map(|a| provider.embed(a)).collect();
+    let events = segment_with_embeddings(&atom_embs, &cfg.segmentation, None).events;
+
+    // Chunks are scored and inserted BEFORE the gist memory exists: the gist is
+    // built from the chunks' own opening sentences, so inserting it first would
+    // depress every chunk's novelty against its own summary.
+    for (i, ev) in events.iter().enumerate() {
+        let chunk_text = atoms[ev.start..ev.end].join(join_sep);
         let chunk_hash = content_hash(&format!("{hash}:{i}:{chunk_text}"));
         let chunk_entities = extract_keywords(&chunk_text, 8);
         let chunk_topics = chunk_entities.iter().take(3).cloned().collect::<Vec<_>>();
+        // Embed the whole chunk and score its novelty against existing memory
+        // (relevance = 1.0: at staging there's no query, so salience is pure
+        // "is this new to me?"). The document being ingested isn't a memory yet,
+        // so a chunk is scored only against prior knowledge.
+        let chunk_emb = provider.embed(&chunk_text);
+        let salience = provisional_salience(store, &chunk_emb, 1.0)?;
         store.insert_source_chunk(&SourceChunk {
             id: new_id("chunk", &chunk_hash),
             source_id: id.clone(),
@@ -556,9 +609,128 @@ fn store_source_document(
             summary: None,
             entities: chunk_entities,
             topics: chunk_topics,
+            embedding: Some(chunk_emb),
+            salience,
+            created_at: now,
         })?;
     }
-    Ok(id)
+
+    let seed = build_gist_seed(&atoms, &events, &entities);
+    Ok((id, seed))
+}
+
+/// Pure ingredients for the durable gist — computed while chunks are being
+/// staged, materialized later by [`finalize_document_gist`]. Holding no DB
+/// state here is what lets gist creation move to after the blob commits.
+struct GistSeed {
+    text: String,
+    entities: Vec<String>,
+}
+
+/// One boundary sentence per chunk (event-segmentation theory: boundary
+/// content is privileged in recall — and it's deterministic and free), capped
+/// so a 40-chunk dump doesn't mint a bloated "gist". A chunk's opening atom can
+/// be a bare heading ("# Doc"), so take the first *substantial* atom of the
+/// chunk (≥ 4 words), falling back to the opener.
+fn build_gist_seed(
+    atoms: &[String],
+    events: &[forgetfuldb_segment::Event],
+    doc_entities: &[String],
+) -> Option<GistSeed> {
+    const MAX_BOUNDARY_ATOMS: usize = 8;
+    let text = events
+        .iter()
+        .take(MAX_BOUNDARY_ATOMS)
+        .map(|ev| {
+            atoms[ev.start..ev.end]
+                .iter()
+                .find(|a| a.split_whitespace().count() >= 4)
+                .unwrap_or(&atoms[ev.start])
+                .as_str()
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    if text.trim().is_empty() {
+        return None;
+    }
+    Some(GistSeed { text, entities: doc_entities.iter().take(8).cloned().collect() })
+}
+
+/// The durable half of the fuzzy-trace split: one compact **gist** memory per
+/// document. Stored as a Semantic memory (slow decay) with its own embedding
+/// and a `source_doc:` tag pointing down at the staged chunks, so retrieval
+/// can descend from the surviving gist to whatever detail still exists. The
+/// verbatim blob and chunks fade; this is what remains.
+///
+/// Must run **after** the verbatim blob is inserted: (1) the gist's hash is
+/// salted with `source_id` — which is only guaranteed fresh once the identical
+/// whole-document dedup check upstream in `ingest` has already passed — so it
+/// can never collide with the blob's own content_hash (a single-atom document
+/// would otherwise produce a gist byte-identical to the blob, and the second
+/// `INSERT` would fail the `UNIQUE` constraint); (2) the gist needs the blob's
+/// real id for the `DerivedFrom` link; (3) inserting the gist before the
+/// blob's own `provisional_salience` lookup would score the blob's novelty
+/// against a summary derived from itself.
+fn finalize_document_gist(
+    store: &Store,
+    bloom: &mut BloomFilter,
+    provider: &dyn EmbeddingProvider,
+    source_id: &str,
+    seed: GistSeed,
+    blob_id: &str,
+    now: i64,
+) -> Result<()> {
+    let gist_hash = content_hash(&format!("gist:{source_id}:{}", seed.text));
+
+    // Defensive only: with source_id salted in, a real collision is a SHA-256
+    // coincidence, not a design possibility. If one ever occurs, adopt an
+    // existing gist row rather than corrupt an unrelated memory or crash.
+    if let Some(existing) = store.get_memory_by_hash(&gist_hash)? {
+        if existing.source.as_deref() == Some("document_gist") {
+            let mut existing = existing;
+            let tag = format!("source_doc:{source_id}");
+            if !existing.tags.contains(&tag) {
+                existing.tags.push(tag);
+                store.update_memory(&existing)?;
+            }
+            store.insert_link(&MemoryLink {
+                source_id: existing.id.clone(),
+                target_id: blob_id.to_string(),
+                relation: LinkRelation::DerivedFrom,
+            })?;
+        }
+        return Ok(());
+    }
+
+    let mut gist = MemoryItem::new(
+        new_id("mem", &gist_hash),
+        seed.text.clone(),
+        MemoryType::Semantic,
+        gist_hash.clone(),
+        now,
+    );
+    gist.summary = Some(seed.text.clone());
+    gist.entities = seed.entities;
+    gist.topic = guess_topic(&[], &gist.entities);
+    gist.source = Some("document_gist".to_string());
+    gist.tags = vec![format!("source_doc:{source_id}")];
+    // The anchor must survive: durable-but-modest importance (matches the
+    // floor summarize_clusters uses for its summary memories).
+    gist.importance_score = 0.6;
+    gist.confidence = 0.5;
+    gist.decay_score = gist.importance_score;
+    gist.recency_score = 1.0;
+    let emb = provider.embed(&seed.text);
+    gist.salience = provisional_salience(store, &emb, 1.0)?;
+    gist.embedding = Some(emb);
+    store.insert_memory(&gist)?;
+    bloom.insert(&gist_hash);
+    store.insert_link(&MemoryLink {
+        source_id: gist.id,
+        target_id: blob_id.to_string(),
+        relation: LinkRelation::DerivedFrom,
+    })?;
+    Ok(())
 }
 
 fn record_ingest_evidence(
@@ -784,9 +956,13 @@ mod tests {
     #[test]
     fn long_input_becomes_source_document_and_chunks() {
         let (store, mut bloom, provider, cfg) = setup();
+        // Three distinct sections: semantic segmentation should cut where the
+        // topic shifts (embeddings → billing → countertops), yielding multiple
+        // chunks — unlike a monotone repetition, which is correctly one chunk.
         let long = "# Rust memory graph\n\n".to_string()
-            + &"This section discusses embeddings, recurrence, source chunks, and graph support. "
-                .repeat(180);
+            + &"This section discusses embeddings recurrence and graph support in detail. ".repeat(30)
+            + &"Then we switch entirely to billing invoices and stripe payment refunds. ".repeat(30)
+            + &"Finally the topic moves to granite countertop kitchen installation quotes. ".repeat(30);
         let out = ingest(&store, &mut bloom, provider.as_ref(), &cfg, req(&long)).unwrap();
         let item = out.memory();
         assert_eq!(item.memory_type, MemoryType::RawEvent);
@@ -803,5 +979,316 @@ mod tests {
             .expect("source document row");
         assert_eq!(doc.source_type, InputMode::PastedDocument);
         assert!(store.source_chunks(source_tag).unwrap().len() > 1);
+    }
+
+    #[test]
+    fn semantic_chunks_persist_embedding_and_discriminate_salience() {
+        let (store, mut bloom, provider, cfg) = setup();
+        // Pre-seed knowledge about the "embeddings" topic so it's no longer novel.
+        ingest(
+            &store,
+            &mut bloom,
+            provider.as_ref(),
+            &cfg,
+            req("embeddings recurrence and graph support are the core memory concepts"),
+        )
+        .unwrap();
+
+        // A two-section doc: a known section (embeddings) then a novel one (billing).
+        let long = "# Doc\n\n".to_string()
+            + &"This section discusses embeddings recurrence and graph support in detail. ".repeat(30)
+            + &"Then we switch entirely to billing invoices and stripe payment refunds. ".repeat(30);
+        let out = ingest(&store, &mut bloom, provider.as_ref(), &cfg, req(&long)).unwrap();
+        let source_tag = out
+            .memory()
+            .tags
+            .iter()
+            .find_map(|t| t.strip_prefix("source_doc:"))
+            .expect("source document tag");
+
+        let chunks = store.source_chunks(source_tag).unwrap();
+        assert!(chunks.len() >= 2, "distinct sections should segment into multiple chunks");
+        assert!(chunks.iter().all(|c| c.embedding.is_some()), "each chunk must persist its embedding");
+
+        // The already-known "embeddings" chunk should be LESS salient (redundant)
+        // than the novel "billing" chunk — the salience hypothesis.
+        let known = chunks.iter().min_by(|a, b| a.salience.total_cmp(&b.salience)).unwrap();
+        let novel = chunks.iter().max_by(|a, b| a.salience.total_cmp(&b.salience)).unwrap();
+        assert!(
+            novel.salience > known.salience,
+            "a novel chunk should out-score a known one (known={:.3}, novel={:.3})",
+            known.salience,
+            novel.salience
+        );
+        assert!(
+            known.text.to_lowercase().contains("embedding"),
+            "the least-salient chunk should be the already-known embeddings section"
+        );
+    }
+
+    #[test]
+    fn long_input_mints_a_durable_gist_linked_to_the_blob() {
+        let (store, mut bloom, provider, mut cfg) = setup();
+        cfg.segmentation.window_size = 3;
+        let long = "# Doc\n\n".to_string()
+            + &"This section discusses embeddings recurrence and graph support in detail. ".repeat(30)
+            + &"Then we switch entirely to billing invoices and stripe payment refunds. ".repeat(30);
+        let out = ingest(&store, &mut bloom, provider.as_ref(), &cfg, req(&long)).unwrap();
+        let blob = out.memory();
+
+        // Exactly one gist: Semantic (slow decay), embedded, tagged with the doc.
+        let gists: Vec<MemoryItem> = store
+            .list_memories(Some(MemoryType::Semantic))
+            .unwrap()
+            .into_iter()
+            .filter(|m| m.source.as_deref() == Some("document_gist"))
+            .collect();
+        assert_eq!(gists.len(), 1, "one durable gist per document");
+        let gist = &gists[0];
+        assert!(gist.embedding.is_some(), "the gist must be its own retrieval anchor");
+        assert!(
+            gist.tags.iter().any(|t| t.starts_with("source_doc:")),
+            "the gist carries the pointer down to its chunks"
+        );
+        // Boundary-anchor construction: the gist covers BOTH sections.
+        let lower = gist.content.to_lowercase();
+        assert!(lower.contains("embeddings") && lower.contains("billing"),
+            "gist should be built from each chunk's opening sentence, got: {lower}");
+        // Fuzzy-trace provenance: gist derived_from the verbatim blob.
+        let links = store.links_for(&gist.id).unwrap();
+        assert!(
+            links.iter().any(|l| l.relation == LinkRelation::DerivedFrom && l.target_id == blob.id),
+            "gist must be linked derived_from the raw blob"
+        );
+    }
+
+    #[test]
+    fn single_atom_long_input_does_not_collide_with_its_own_gist() {
+        // Regression: a message misclassified as a long source (the "exception"
+        // keyword trips LogDump) that atomizes to exactly ONE atom used to
+        // produce a gist byte-identical to the blob, so the second insert hit
+        // the content_hash UNIQUE constraint and ingest() returned Err.
+        let (store, mut bloom, provider, cfg) = setup();
+        let out = ingest(&store, &mut bloom, provider.as_ref(), &cfg, req("I hit an exception in the parser today"));
+        assert!(out.is_ok(), "single-atom long-source ingest must not crash: {out:?}");
+    }
+
+    #[test]
+    fn re_ingesting_gist_text_verbatim_does_not_crash() {
+        // Regression: the gist's content_hash used to be a PLAIN hash of its
+        // text (identical to what a normal message with the same words would
+        // hash to), and was never added to the bloom filter -- so a later
+        // message equal to the gist text skipped the authoritative dedup
+        // lookup and hit the UNIQUE constraint. The gist hash is now salted
+        // with source_id (also the fix for the hash-collision bugs below), so
+        // a plain re-ingest of the same words legitimately gets a different
+        // hash and is stored as an ordinary new memory -- not a dedup hit, but
+        // not a crash either.
+        let (store, mut bloom, provider, mut cfg) = setup();
+        cfg.segmentation.window_size = 3;
+        let long = "# Doc\n\n".to_string()
+            + &"This section discusses embeddings recurrence and graph support in detail. ".repeat(30)
+            + &"Then we switch entirely to billing invoices and stripe payment refunds. ".repeat(30);
+        ingest(&store, &mut bloom, provider.as_ref(), &cfg, req(&long)).unwrap();
+        let gist = store
+            .list_memories(Some(MemoryType::Semantic))
+            .unwrap()
+            .into_iter()
+            .find(|m| m.source.as_deref() == Some("document_gist"))
+            .expect("a gist was minted");
+
+        let out = ingest(&store, &mut bloom, provider.as_ref(), &cfg, req(&gist.content));
+        assert!(out.is_ok(), "re-ingesting the gist's own text must not crash: {out:?}");
+    }
+
+    #[test]
+    fn distinct_documents_with_colliding_gist_hashes_both_stay_reachable() {
+        // Regression: gist dedup used to be keyed on the boundary-sentence text
+        // ALONE, so two different documents sharing their first N chunk-opening
+        // sentences collapsed onto one gist tagged with only the first
+        // document's source_id -- the second document's chunks became
+        // unreachable. The hash is now salted with source_id, so both
+        // documents mint their own gist even with identical opening text.
+        let (store, mut bloom, provider, mut cfg) = setup();
+        cfg.segmentation.window_size = 3;
+        let shared_opening = "This section discusses embeddings recurrence and graph support in detail. ".repeat(30);
+        let doc_a = "# Report\n\n".to_string() + &shared_opening + &"Then billing invoices and stripe payment refunds appear here. ".repeat(30);
+        let doc_b = "# Report\n\n".to_string() + &shared_opening + &"Then granite countertop kitchen installation quotes appear here. ".repeat(30);
+
+        let out_a = ingest(&store, &mut bloom, provider.as_ref(), &cfg, req(&doc_a)).unwrap();
+        let out_b = ingest(&store, &mut bloom, provider.as_ref(), &cfg, req(&doc_b)).unwrap();
+        let src_a = out_a.memory().tags.iter().find_map(|t| t.strip_prefix("source_doc:")).unwrap().to_string();
+        let src_b = out_b.memory().tags.iter().find_map(|t| t.strip_prefix("source_doc:")).unwrap().to_string();
+        assert_ne!(src_a, src_b);
+
+        let gists: Vec<MemoryItem> = store
+            .list_memories(Some(MemoryType::Semantic))
+            .unwrap()
+            .into_iter()
+            .filter(|m| m.source.as_deref() == Some("document_gist"))
+            .collect();
+        assert_eq!(gists.len(), 2, "each document must mint its own gist, not share one");
+        let doc_a_gist = gists.iter().find(|g| g.tags.iter().any(|t| t == &format!("source_doc:{src_a}")));
+        let doc_b_gist = gists.iter().find(|g| g.tags.iter().any(|t| t == &format!("source_doc:{src_b}")));
+        assert!(doc_a_gist.is_some(), "document A's chunks must be reachable via its own gist");
+        assert!(doc_b_gist.is_some(), "document B's chunks must be reachable via its own gist");
+    }
+
+    #[test]
+    fn blob_salience_is_not_scored_against_its_own_gist() {
+        // Regression: the gist used to be inserted into memory_items BEFORE the
+        // blob's provisional_salience lookup, so a long document's own novelty
+        // was scored against a summary derived from itself (self-depression).
+        // A doc whose content is entirely novel to an empty store should score
+        // near-maximal blob salience, not depressed by its own gist.
+        let (store, mut bloom, provider, mut cfg) = setup();
+        cfg.segmentation.window_size = 3;
+        let long = "# Doc\n\n".to_string()
+            + &"This section discusses embeddings recurrence and graph support in detail. ".repeat(30)
+            + &"Then we switch entirely to billing invoices and stripe payment refunds. ".repeat(30);
+        let out = ingest(&store, &mut bloom, provider.as_ref(), &cfg, req(&long)).unwrap();
+        assert!(
+            out.memory().salience > 0.9,
+            "an entirely novel document's blob must not be depressed by its own gist, got {}",
+            out.memory().salience
+        );
+    }
+
+    fn clip(s: &str) -> String {
+        let s = s.replace('\n', " ");
+        if s.chars().count() <= 64 {
+            s
+        } else {
+            format!("{}…", s.chars().take(61).collect::<String>())
+        }
+    }
+
+    /// End-to-end on a *made-up* cat-and-wolf story (no pretrained model knows
+    /// it) driven through the real `ingest` pipeline. Watch the numbers:
+    /// `cargo test -p forgetfuldb-store cat_and_wolf -- --nocapture`.
+    #[test]
+    fn cat_and_wolf_end_to_end_eval() {
+        use forgetfuldb_core::decay::decay_score_resisted;
+        use forgetfuldb_embed::cosine_similarity;
+
+        const STORY: &str = "# The Meadow\n\
+Mira the striped cat lived in a sunny meadow beside the quiet village. \
+Every morning Mira chased grasshoppers through the tall yellow meadow grass. \
+The kind villagers left Mira warm bowls of milk near the meadow fence.\n\n\
+# The River\n\
+One cold afternoon Mira wandered down to the rushing river. \
+At the river Mira met Fenn a grey wolf drinking from the cold water. \
+Fenn the grey wolf had traveled far along the river looking for food.\n\n\
+# The Bargain\n\
+Fenn offered Mira a bargain to guard the meadow from hungry foxes. \
+In return Mira would share her evening fish with the grey wolf. \
+The cat and the wolf sealed their bargain beside the flowing river.\n\n\
+# The Winter\n\
+Through the long winter the wolf guarded the snowy meadow every night. \
+No hungry fox ever again crept into the cold snowy meadow. \
+Mira and Fenn stayed loyal friends until the warm spring returned.";
+
+        fn ingest_story(
+            store: &Store,
+            bloom: &mut BloomFilter,
+            provider: &dyn EmbeddingProvider,
+            cfg: &Config,
+        ) -> Vec<SourceChunk> {
+            let out = ingest(store, bloom, provider, cfg, req(STORY)).unwrap();
+            let tag = out
+                .memory()
+                .tags
+                .iter()
+                .find_map(|t| t.strip_prefix("source_doc:"))
+                .expect("a long story must be staged as a source document");
+            store.source_chunks(tag).unwrap()
+        }
+
+        // ── Case 1: empty store — nothing to compare against ──
+        let (store, mut bloom, provider, mut cfg) = setup();
+        cfg.segmentation.window_size = 3; // short document
+        let chunks1 = ingest_story(&store, &mut bloom, provider.as_ref(), &cfg);
+        println!("\n=== Case 1: EMPTY store — {} chunks ===", chunks1.len());
+        for c in &chunks1 {
+            println!("  salience={:.2}  {}", c.salience, clip(&c.text));
+        }
+        assert!(chunks1.len() >= 2, "the story should segment into multiple scenes");
+        assert!(chunks1.iter().all(|c| c.salience > 0.8), "empty store ⇒ every chunk is novel");
+
+        // ── Case 2: the meadow scene is already known ──
+        let (store2, mut bloom2, provider2, mut cfg2) = setup();
+        cfg2.segmentation.window_size = 3;
+        ingest(
+            &store2,
+            &mut bloom2,
+            provider2.as_ref(),
+            &cfg2,
+            req("A striped cat named Mira lived in a sunny green meadow near a small quiet village"),
+        )
+        .unwrap();
+        let chunks2 = ingest_story(&store2, &mut bloom2, provider2.as_ref(), &cfg2);
+        println!("\n=== Case 2: meadow already known — {} chunks ===", chunks2.len());
+        for c in &chunks2 {
+            println!("  salience={:.2}  {}", c.salience, clip(&c.text));
+        }
+        let known = chunks2.iter().min_by(|a, b| a.salience.total_cmp(&b.salience)).unwrap();
+        let novel = chunks2.iter().max_by(|a, b| a.salience.total_cmp(&b.salience)).unwrap();
+        println!("  → most-known: {:.2} [{}]", known.salience, clip(&known.text));
+        println!("  → most-novel: {:.2} [{}]", novel.salience, clip(&novel.text));
+        assert!(
+            novel.salience > known.salience + 0.05,
+            "the already-known chunk must be less salient than a novel one"
+        );
+        assert!(known.text.to_lowercase().contains("meadow"), "the known chunk is the meadow scene");
+
+        // ── Questions: retrieval over chunks (Case 1 store) ──
+        println!("\n=== Questions (retrieval = cosine to chunks) ===");
+        let ask = |q: &str| -> (usize, f64) {
+            let qe = provider.embed(q);
+            let sims: Vec<f64> = chunks1
+                .iter()
+                .map(|c| c.embedding.as_ref().map(|e| cosine_similarity(&qe, e) as f64).unwrap_or(0.0))
+                .collect();
+            let idx = sims
+                .iter()
+                .enumerate()
+                .fold((0usize, f64::MIN), |(bi, bv), (i, &x)| if x > bv { (i, x) } else { (bi, bv) })
+                .0;
+            (idx, sims[idx])
+        };
+        for (q, expect) in [
+            ("Who was the grey wolf drinking at the cold river?", &["wolf", "river", "fenn"][..]),
+            ("Where was the sunny meadow near the quiet village?", &["meadow", "village"][..]),
+        ] {
+            let (idx, score) = ask(q);
+            println!("  Q: {q}\n     → chunk {idx} ({score:.2}): {}", clip(&chunks1[idx].text));
+            assert!(
+                expect.iter().any(|k| chunks1[idx].text.to_lowercase().contains(k)),
+                "top chunk for {q:?} should mention one of {expect:?}"
+            );
+        }
+        let (_, absent) = ask("How did the fire dragon defend the stone castle tower?");
+        println!("  Q (absent from story): dragon/castle → best score {absent:.2}");
+        assert!(absent < 0.25, "a question about absent content should fall below the confidence floor");
+
+        // ── Fast decay, not drop ──
+        // Staged chunks decay at the fast raw-event rate, resisted by salience:
+        // the routine (low-salience) chunk fades in days while the novel one
+        // persists — but neither is dropped outright at day 1.
+        println!("\n=== Fast decay, not drop (fast base rate, salience resists) ===");
+        let base = cfg2.decay_lambdas().raw_event;
+        let resist = cfg2.salience_resist;
+        for age in [1.0, 7.0, 30.0] {
+            let dull = decay_score_resisted(1.0, base, age, false, known.salience, resist);
+            let keen = decay_score_resisted(1.0, base, age, false, novel.salience, resist);
+            println!("  day {age:>4.0}: routine(sal {:.2})={dull:.3}   novel(sal {:.2})={keen:.3}", known.salience, novel.salience);
+            assert!(keen >= dull, "the salient chunk must retain at least as much at every age");
+        }
+        let dull7 = decay_score_resisted(1.0, base, 7.0, false, known.salience, resist);
+        let keen7 = decay_score_resisted(1.0, base, 7.0, false, novel.salience, resist);
+        assert!(keen7 > dull7, "by day 7 the novel chunk should clearly outlast the routine one");
+        let dull1 = decay_score_resisted(1.0, base, 1.0, false, known.salience, resist);
+        assert!(dull1 > 0.0, "not dropped — the routine chunk is still present at day 1");
+        println!("\n=== eval complete ===\n");
     }
 }

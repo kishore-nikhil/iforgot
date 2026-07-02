@@ -473,6 +473,7 @@ dependencies = [
  "forgetfuldb-core",
  "forgetfuldb-embed",
  "forgetfuldb-prob",
+ "forgetfuldb-segment",
  "rusqlite",
  "serde",
  "serde_json",

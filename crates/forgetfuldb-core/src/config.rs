@@ -86,6 +86,18 @@ pub struct Config {
     /// Nearest neighbors linked per memory for `semantic_similar` edges.
     #[serde(default = "default_semantic_edge_top_k")]
     pub semantic_edge_top_k: usize,
+    /// Minimum cosine for gist-first descent to substitute a staged document
+    /// chunk in place of its diluted whole-document anchor (see
+    /// `docs/large-text-ingest.md` §8.3). Deliberately its own, lower-tuned
+    /// knob, not `semantic_edge_min_sim`: that threshold is calibrated for
+    /// memory-to-memory kNN, and reusing it here made expansion silently
+    /// never fire under the default `hashed_bow` embedder (whose realistic
+    /// same-topic cosine tops out well below `semantic_edge_min_sim`'s
+    /// default). A dense embedder's noise floor sits far higher (empirically
+    /// ~0.44 vs ~0.51 on-topic — see `docs/surprise-segmentation.md` §7.1) and
+    /// may need raising this default for that backend.
+    #[serde(default = "default_chunk_match_min_sim")]
+    pub chunk_match_min_sim: f64,
     /// Raw events older than this become archive memories.
     pub archive_after_days: f64,
     /// Archived, unpinned memories older than this are deleted.
@@ -201,6 +213,9 @@ fn default_semantic_edge_min_sim() -> f64 {
 }
 fn default_semantic_edge_top_k() -> usize {
     5
+}
+fn default_chunk_match_min_sim() -> f64 {
+    0.2
 }
 
 pub fn default_system_prompt() -> String {
@@ -465,6 +480,7 @@ impl Default for Config {
             salience_keep_threshold: default_salience_keep_threshold(),
             semantic_edge_min_sim: default_semantic_edge_min_sim(),
             semantic_edge_top_k: default_semantic_edge_top_k(),
+            chunk_match_min_sim: default_chunk_match_min_sim(),
             archive_after_days: 14.0,
             delete_after_days: 90.0,
             local_only: true,
