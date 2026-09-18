@@ -110,7 +110,7 @@ fn first_phrase_after<'a>(lower: &'a str, cue: &str) -> Option<&'a str> {
     let after = lower[idx + cue.len()..]
         .trim_start_matches(|c: char| c.is_whitespace() || c == ':' || c == ',');
     let end = after
-        .find(|c: char| matches!(c, '.' | '!' | '?' | '\n' | ';'))
+        .find(['.', '!', '?', '\n', ';'])
         .unwrap_or(after.len());
     let phrase = after[..end].trim();
     (!phrase.is_empty()).then_some(phrase)
@@ -147,7 +147,7 @@ pub fn extract_memory_candidates(text: &str, frame: Option<&ConversationFrame>) 
             reasons.push(UncertaintyReason::PastedDocument);
         }
     }
-    if text.trim().split_whitespace().count() < 3 {
+    if text.split_whitespace().count() < 3 {
         reasons.push(UncertaintyReason::FragmentSentence);
     }
 
