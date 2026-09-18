@@ -20,7 +20,7 @@ use forgetfuldb_core::scoring::{retrieval_score, ScoreBreakdown, ScoreInputs};
 use forgetfuldb_core::types::{MemoryItem, MemoryType};
 use forgetfuldb_core::{age_days, decay, now_unix};
 use forgetfuldb_embed::{cosine_similarity, EmbeddingProvider};
-use forgetfuldb_store::Store;
+use forgetfuldb_store::{MemoryEdge, Store};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
@@ -256,16 +256,16 @@ fn candidate_relevance(semantic_similarity: f64, keyword_overlap: f64, entity_ov
     (0.70 * semantic_similarity + 0.20 * keyword_overlap + 0.10 * entity_overlap).clamp(0.0, 1.0)
 }
 
-fn graph_support_by_memory(store: &Store) -> Result<HashMap<String, f64>> {
+fn graph_support_by_memory(edges: &[MemoryEdge]) -> HashMap<String, f64> {
     let mut support: HashMap<String, f64> = HashMap::new();
-    for edge in store.list_edges()? {
+    for edge in edges {
         let contribution = edge.weight.max(0.0).ln_1p() / 3.0;
-        for id in [edge.src_id, edge.dst_id] {
-            let entry = support.entry(id).or_insert(0.0);
+        for id in [&edge.src_id, &edge.dst_id] {
+            let entry = support.entry(id.clone()).or_insert(0.0);
             *entry = (*entry + contribution).min(1.0);
         }
     }
-    Ok(support)
+    support
 }
 
 /// Cap on near-misses returned in debug mode.
@@ -280,21 +280,20 @@ const MAX_NEAR_MISSES: usize = 20;
 /// the caller can also assemble the injected subgraph. Uses pre-boost scores
 /// as seed strengths, so the spread can't cascade off its own boosts.
 fn apply_spreading_activation(
-    store: &Store,
+    edges: &[MemoryEdge],
     cfg: &Config,
     scored: &mut [RetrievedMemory],
-) -> Result<HashMap<String, traverse::Reach>> {
+) -> HashMap<String, traverse::Reach> {
     use forgetfuldb_store::pipeline::EDGE_SEQUENCE;
 
-    let edges = store.list_edges()?;
     if edges.is_empty() {
-        return Ok(HashMap::new());
+        return HashMap::new();
     }
     // Adjacency over all edge types. co_occurred / semantic_similar are
     // undirected; sequence is directional (earlier → later), so it's followed
     // forward only.
     let mut adj: HashMap<String, Vec<traverse::AdjEdge>> = HashMap::new();
-    for e in &edges {
+    for e in edges {
         adj.entry(e.src_id.clone())
             .or_default()
             .push(traverse::AdjEdge {
@@ -343,7 +342,7 @@ fn apply_spreading_activation(
             }
         }
     }
-    Ok(reach)
+    reach
 }
 
 /// A verbatim conversational turn: chat-sourced and never distilled into
@@ -365,7 +364,51 @@ pub fn retrieve(
     query: &str,
     opts: &RetrieveOptions,
 ) -> Result<ContextPack> {
-    let now = now_unix();
+    retrieve_inner(
+        store, provider, cfg, query, opts,
+        RetrievalRun { now: now_unix(), record_access: true },
+    )
+}
+
+/// Preview retrieval without updating memory access metadata or evidence.
+/// The supplied clock controls decay, recency, chunk expiry and `generated_at`;
+/// stable ID/path tie-breaks make a fixed snapshot reproducible.
+///
+/// This is NOT a time-travel query. For historical replay, the caller must
+/// provide a store snapshot containing only events and versions known at
+/// `as_of`. This function cannot undo later edits, corrections or graph updates.
+/// For shadow retrieval against a live store, pass the current time. Concurrent
+/// writes still require the caller to hold a snapshot/lock across the read.
+/// The embedding provider is supplied by the caller; use a deterministic local
+/// provider for offline replay.
+pub fn preview_at(
+    store: &Store,
+    provider: &dyn EmbeddingProvider,
+    cfg: &Config,
+    query: &str,
+    opts: &RetrieveOptions,
+    as_of: i64,
+) -> Result<ContextPack> {
+    retrieve_inner(
+        store, provider, cfg, query, opts,
+        RetrievalRun { now: as_of, record_access: false },
+    )
+}
+
+struct RetrievalRun {
+    now: i64,
+    record_access: bool,
+}
+
+fn retrieve_inner(
+    store: &Store,
+    provider: &dyn EmbeddingProvider,
+    cfg: &Config,
+    query: &str,
+    opts: &RetrieveOptions,
+    run: RetrievalRun,
+) -> Result<ContextPack> {
+    let now = run.now;
     let query_embedding = provider.embed(query);
     let query_tokens: HashSet<String> = tokenize(query).into_iter().collect();
     let lambdas = cfg.decay_lambdas();
@@ -391,7 +434,17 @@ pub fn retrieve(
     let until = opts.until.or(epoch_until);
     let bypass_decay = opts.bypass_decay || epoch_bypass;
 
-    let graph_support = graph_support_by_memory(store)?;
+    let mut edges = store.list_edges()?;
+    let mut items = store.list_memories(None)?;
+    if !run.record_access {
+        // Live retrieval keeps its existing tie behavior. Previews should not
+        // depend on SQLite insertion order, even when scores are identical.
+        items.sort_by(|a, b| a.id.cmp(&b.id));
+        edges.sort_by(|a, b| {
+            (&a.src_id, &a.dst_id, &a.edge_type).cmp(&(&b.src_id, &b.dst_id, &b.edge_type))
+        });
+    }
+    let graph_support = graph_support_by_memory(&edges);
     #[derive(Clone)]
     struct Candidate {
         item: MemoryItem,
@@ -399,7 +452,7 @@ pub fn retrieve(
         graph_support: f64,
     }
     let mut candidates: Vec<Candidate> = Vec::new();
-    for item in store.list_memories(None)? {
+    for item in items {
         if item.stale && !opts.include_stale {
             continue;
         }
@@ -507,7 +560,7 @@ pub fn retrieve(
     // from pre-boost scores so it can't cascade off its own boosts. Off
     // unless enabled in config.
     let reach = if cfg.spreading_activation && cfg.spreading_factor > 0.0 {
-        apply_spreading_activation(store, cfg, &mut scored)?
+        apply_spreading_activation(&edges, cfg, &mut scored)
     } else {
         HashMap::new()
     };
@@ -541,7 +594,7 @@ pub fn retrieve(
     // Multi-hop subgraph: pull the connective memories (linked to the hits but
     // not themselves top-k) into the result and record the paths. Mutates
     // `scored`, so it runs before the touch loop below.
-    let subgraph = inject_subgraph(store, &mut scored, &reach, cfg)?;
+    let subgraph = inject_subgraph(store, &mut scored, &reach, cfg, !run.record_access)?;
 
     // Gist-first descent: document-anchored hits swap their diluted
     // whole-document text for the one staged chunk that actually matches the
@@ -552,8 +605,10 @@ pub fn retrieve(
     // Retrieval counts as access: it slows future decay-driven cleanup.
     // Near-misses are NOT touched — looking at what almost matched must
     // not rehearse it.
-    for hit in &scored {
-        store.touch_memory(&hit.item.id, now)?;
+    if run.record_access {
+        for hit in &scored {
+            store.touch_memory(&hit.item.id, now)?;
+        }
     }
 
     Ok(ContextPack {
@@ -740,6 +795,7 @@ fn inject_subgraph(
     memories: &mut Vec<RetrievedMemory>,
     reach: &HashMap<String, traverse::Reach>,
     cfg: &Config,
+    stable_order: bool,
 ) -> Result<Option<ContextSubgraph>> {
     if !cfg.spreading.inject_subgraph {
         return Ok(None);
@@ -757,6 +813,13 @@ fn inject_subgraph(
             .len()
             .cmp(&a.path.len())
             .then(b.activation.total_cmp(&a.activation))
+            .then_with(|| {
+                if stable_order {
+                    a.path.cmp(&b.path).then(a.edges.cmp(&b.edges))
+                } else {
+                    std::cmp::Ordering::Equal
+                }
+            })
     });
 
     let max_nodes = cfg.spreading.subgraph_max_nodes;

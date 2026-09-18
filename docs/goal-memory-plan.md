@@ -70,7 +70,12 @@ that goal-aware chat is already working.
   failed SQL or a failed marker write rolls back. In-memory tests enforce foreign
   keys like disk stores. Workspace: 228 tests passed, two skipped; strict Clippy
   passed after clearing the two baseline style warnings.
-- 0b next: deterministic non-mutating retrieval and replay fixtures.
+- 0b implemented: `retrieve::preview_at` uses a supplied scoring clock without
+  updating access/evidence state; stable preview ties cover graph paths as well
+  as candidates. Two synthetic stories cover five replay turns with prefix-only
+  stores and prompt checks. Separate tests cover decay, chunk expiry and live
+  access compatibility. Workspace: 234 tests passed, two skipped; strict Clippy
+  passed. No production chat/inspector caller uses previews yet.
 - Phases 1–5 pending.
 
 ## Implementation decisions
