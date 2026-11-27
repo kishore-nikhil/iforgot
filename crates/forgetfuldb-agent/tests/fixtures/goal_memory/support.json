@@ -1,0 +1,43 @@
+{
+  "name": "support_goal_change",
+  "events": [
+    {
+      "id": "support-goal",
+      "known_at": 1700000000,
+      "text": "Reduce support calls by making refunds self-service.",
+      "memory_type": "semantic"
+    },
+    {
+      "id": "support-failure",
+      "known_at": 1700000100,
+      "text": "Locked accounts could not complete the self-service verification path in the documented refund cases.",
+      "memory_type": "episodic"
+    },
+    {
+      "id": "support-later-outcome",
+      "known_at": 1700000400,
+      "text": "A later synthetic support follow-up reported a satisfaction improvement after specialist assistance.",
+      "memory_type": "episodic"
+    }
+  ],
+  "turns": [
+    {
+      "as_of": 1699999900,
+      "user_text": "Hello",
+      "expected_ids": [],
+      "absent_ids": ["support-goal", "support-failure", "support-later-outcome"]
+    },
+    {
+      "as_of": 1700000200,
+      "user_text": "Now I want to improve satisfaction for locked-out customers; we can use human specialists for refund verification.",
+      "expected_ids": ["support-goal", "support-failure"],
+      "absent_ids": ["support-later-outcome"]
+    },
+    {
+      "as_of": 1700000500,
+      "user_text": "What do we know about the refund support follow-up?",
+      "expected_ids": ["support-goal", "support-failure", "support-later-outcome"],
+      "absent_ids": []
+    }
+  ]
+}

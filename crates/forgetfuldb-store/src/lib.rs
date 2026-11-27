@@ -9,6 +9,9 @@
 
 pub mod pipeline;
 
+#[cfg(test)]
+mod migration_tests;
+
 use anyhow::{Context, Result};
 use forgetfuldb_core::types::{
     EvidenceSource, EvidenceType, InputMode, LinkRelation, MemoryEvidence, MemoryItem, MemoryLink,
@@ -94,6 +97,7 @@ impl Store {
         let store = Store {
             conn: Connection::open_in_memory()?,
         };
+        store.conn.pragma_update(None, "foreign_keys", "ON")?;
         store.migrate()?;
         Ok(store)
     }
@@ -106,24 +110,33 @@ impl Store {
              );",
         )?;
         for (name, sql) in MIGRATIONS {
-            let applied: Option<String> = self
-                .conn
-                .query_row(
-                    "SELECT name FROM schema_migrations WHERE name = ?1",
-                    [name],
-                    |r| r.get(0),
-                )
-                .optional()?;
-            if applied.is_none() {
-                self.conn
-                    .execute_batch(sql)
-                    .with_context(|| format!("applying migration {name}"))?;
-                self.conn.execute(
-                    "INSERT INTO schema_migrations (name, applied_at) VALUES (?1, ?2)",
-                    params![name, forgetfuldb_core::now_unix()],
-                )?;
-            }
+            self.apply_migration(name, sql)
+                .with_context(|| format!("applying migration {name}"))?;
         }
+        Ok(())
+    }
+
+    /// Schema changes and their completion marker must commit together. An
+    /// immediate transaction also serializes two processes opening an old store;
+    /// the second checks the marker only after the first has committed.
+    fn apply_migration(&self, name: &str, sql: &str) -> Result<()> {
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.conn,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        let applied: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE name = ?1)",
+            [name],
+            |r| r.get(0),
+        )?;
+        if !applied {
+            tx.execute_batch(sql)?;
+            tx.execute(
+                "INSERT INTO schema_migrations (name, applied_at) VALUES (?1, ?2)",
+                params![name, forgetfuldb_core::now_unix()],
+            )?;
+        }
+        tx.commit()?;
         Ok(())
     }
 

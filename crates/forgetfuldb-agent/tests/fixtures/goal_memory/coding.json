@@ -1,0 +1,43 @@
+{
+  "name": "coding_repaired_precondition",
+  "events": [
+    {
+      "id": "coding-goal",
+      "known_at": 1700000000,
+      "text": "Restore the local integration tests for the billing service.",
+      "memory_type": "semantic"
+    },
+    {
+      "id": "coding-failure",
+      "known_at": 1700000100,
+      "text": "The billing integration command failed because the local database service was unavailable.",
+      "memory_type": "episodic"
+    },
+    {
+      "id": "coding-recovery",
+      "known_at": 1700000300,
+      "text": "The local database service is now running and its health check passed; the integration tests have not been rerun.",
+      "memory_type": "episodic"
+    },
+    {
+      "id": "coding-later-outcome",
+      "known_at": 1700000500,
+      "text": "A later synthetic test run passed the billing integration checks.",
+      "memory_type": "episodic"
+    }
+  ],
+  "turns": [
+    {
+      "as_of": 1700000200,
+      "user_text": "I already tried the billing integration command. What prerequisite is missing?",
+      "expected_ids": ["coding-goal", "coding-failure"],
+      "absent_ids": ["coding-recovery", "coding-later-outcome"]
+    },
+    {
+      "as_of": 1700000400,
+      "user_text": "The database service is back. Can we reconsider running the integration tests?",
+      "expected_ids": ["coding-goal", "coding-failure", "coding-recovery"],
+      "absent_ids": ["coding-later-outcome"]
+    }
+  ]
+}
